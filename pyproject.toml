@@ -1,0 +1,114 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "korg"
+version = "0.1.0"
+description = "JAX port of Korg.jl - 1D LTE spectral synthesis of stellar atmospheres"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Korg.jl Contributors"}
+]
+keywords = ["spectroscopy", "stellar", "astrophysics", "synthesis", "jax"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy>=1.24",
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+    "scipy>=1.10",
+    "h5py>=3.8",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-xdist>=3.0",
+    "juliacall>=0.9.20",
+    "matplotlib>=3.7",
+]
+dev = [
+    "korg[test]",
+    "ruff>=0.1",
+    "mypy>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ajwheeler/Korg.jl"
+Documentation = "https://ajwheeler.github.io/Korg.jl/"
+Repository = "https://github.com/ajwheeler/Korg.jl"
+Issues = "https://github.com/ajwheeler/Korg.jl/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/korg"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/korg/data" = "korg/data"
+
+[tool.hatch.build.targets.sdist]
+include = ["src/korg/**/*.py", "src/korg/data/**"]
+
+[tool.hatch.build]
+sources = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "-ra",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.coverage.run]
+source = ["korg"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+show_missing = true
+precision = 2
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
