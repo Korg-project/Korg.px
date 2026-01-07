@@ -21,7 +21,7 @@ jobs:
     name: Generate Julia Reference Data
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Set up Julia
         uses: julia-actions/setup-julia@v2
@@ -57,7 +57,7 @@ jobs:
             python-version: "3.10"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Download Julia reference data
         uses: actions/download-artifact@v7
