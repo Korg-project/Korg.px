@@ -101,9 +101,11 @@ def brackett_oscillator_strength(n: int, m: int) -> float:
 
     Returns:
         Oscillator strength
-    """
-    assert n < m, "n must be less than m"
 
+    Note:
+        JAX-compatible version - no assert statement.
+        Behavior is undefined if n >= m.
+    """
     GINF = 0.2027 / n**0.71
     GCA = 0.124 / n
     FKN = 1.9603 * n
@@ -182,6 +184,8 @@ def holtsmark_profile(beta: float, P: float) -> float:
     Adapted from SOFBET in HLINOP by Peterson and Kurucz.
     Draws heavily from Griem 1960.
 
+    JAX-compatible version using jnp.where instead of if/else.
+
     Args:
         beta: Scaled frequency detuning
         P: Shielding parameter
@@ -189,60 +193,64 @@ def holtsmark_profile(beta: float, P: float) -> float:
     Returns:
         Holtsmark profile value
     """
-    if beta > 500:  # Very large β
-        return (1.5 / jnp.sqrt(beta) + 27 / beta**2) / beta**2
+    # Very large β result
+    large_beta_result = (1.5 / jnp.sqrt(beta) + 27 / beta**2) / beta**2
 
     # Determine relevant Debye range
     # Julia: IM = min(Int(floor((5 * P) + 1)), 4) with 1-indexed arrays
     # Python needs 0-indexed conversion
-    IM_julia = int(min(np.floor(5 * P + 1), 4))
-    IM = IM_julia - 1  # Convert from 1-indexed to 0-indexed
+    IM = jnp.clip(jnp.floor(5 * P + 1).astype(jnp.int32) - 1, 0, 3)  # 0-indexed, clipped to [0,3]
     IP = IM + 1
     WTPP = 5 * (P - _HOLTSMARK_PP[IM])
     WTPM = 1 - WTPP
 
-    if beta <= 25.12:
-        # Indices into β_boundaries which bound the value of β
-        # Julia: max(2, findfirst(β .<= _holtsmark_β_knots))
-        # Python: find first index where beta <= knot (0-indexed)
-        # Julia's findfirst returns 1-indexed, max(2, ...) ensures at least 2
-        # In Python (0-indexed), this means at least index 1
-        mask = beta <= _HOLTSMARK_BETA_KNOTS
-        if jnp.any(mask):
-            JP = max(1, int(jnp.argmax(mask)))
-        else:
-            # All False, beta > all knots
-            JP = len(_HOLTSMARK_BETA_KNOTS) - 1
-        JM = JP - 1
+    # === Branch: beta <= 25.12 ===
+    # Indices into β_boundaries which bound the value of β
+    mask = beta <= _HOLTSMARK_BETA_KNOTS
+    # Use jnp.where to avoid if: JP = max(1, argmax(mask)) if any(mask) else len-1
+    JP = jnp.where(jnp.any(mask),
+                   jnp.maximum(1, jnp.argmax(mask)),
+                   len(_HOLTSMARK_BETA_KNOTS) - 1)
+    JM = JP - 1
 
-        # Linear interpolation into PROB7 wrt β_knots
-        WTBP = ((beta - _HOLTSMARK_BETA_KNOTS[JM]) /
-                (_HOLTSMARK_BETA_KNOTS[JP] - _HOLTSMARK_BETA_KNOTS[JM]))
-        WTBM = 1 - WTBP
-        CBP = _HOLTSMARK_PROB7[JP, IP] * WTPP + _HOLTSMARK_PROB7[JP, IM] * WTPM
-        CBM = _HOLTSMARK_PROB7[JM, IP] * WTPP + _HOLTSMARK_PROB7[JM, IM] * WTPM
-        CORR = 1 + CBP * WTBP + CBM * WTBM
+    # Linear interpolation into PROB7 wrt β_knots
+    WTBP = ((beta - _HOLTSMARK_BETA_KNOTS[JM]) /
+            (_HOLTSMARK_BETA_KNOTS[JP] - _HOLTSMARK_BETA_KNOTS[JM]))
+    WTBM = 1 - WTBP
+    CBP = _HOLTSMARK_PROB7[JP, IP] * WTPP + _HOLTSMARK_PROB7[JP, IM] * WTPM
+    CBM = _HOLTSMARK_PROB7[JM, IP] * WTPP + _HOLTSMARK_PROB7[JM, IM] * WTPM
+    CORR_small = 1 + CBP * WTBP + CBM * WTBM
 
-        # Get approximate profile for the inner part
-        WT = max(min(0.5 * (10 - beta), 1), 0)
+    # Get approximate profile for the inner part
+    WT = jnp.clip(0.5 * (10 - beta), 0, 1)
 
-        if beta <= 10:
-            PR1 = 8 / (83 + (2 + 0.95 * beta**2) * beta)
-        else:
-            PR1 = 0.0
+    # PR1: beta <= 10 ? value : 0.0
+    PR1 = jnp.where(beta <= 10,
+                    8 / (83 + (2 + 0.95 * beta**2) * beta),
+                    0.0)
 
-        if beta >= 8:
-            PR2 = (1.5 / jnp.sqrt(beta) + 27 / beta**2) / beta**2
-        else:
-            PR2 = 0.0
+    # PR2: beta >= 8 ? value : 0.0
+    PR2 = jnp.where(beta >= 8,
+                    (1.5 / jnp.sqrt(beta) + 27 / beta**2) / beta**2,
+                    0.0)
 
-        return (PR1 * WT + PR2 * (1 - WT)) * CORR
-    else:
-        # Asymptotic part for medium β's (25.12 < β < 500)
-        CC = _HOLTSMARK_C7[IP] * WTPP + _HOLTSMARK_C7[IM] * WTPM
-        DD = _HOLTSMARK_D7[IP] * WTPP + _HOLTSMARK_D7[IM] * WTPM
-        CORR = 1 + DD / (CC + beta * jnp.sqrt(beta))
-        return (1.5 / jnp.sqrt(beta) + 27 / beta**2) / beta**2 * CORR
+    small_beta_result = (PR1 * WT + PR2 * (1 - WT)) * CORR_small
+
+    # === Branch: 25.12 < beta <= 500 (medium) ===
+    # Asymptotic part for medium β's
+    CC = _HOLTSMARK_C7[IP] * WTPP + _HOLTSMARK_C7[IM] * WTPM
+    DD = _HOLTSMARK_D7[IP] * WTPP + _HOLTSMARK_D7[IM] * WTPM
+    CORR_medium = 1 + DD / (CC + beta * jnp.sqrt(beta))
+    medium_beta_result = (1.5 / jnp.sqrt(beta) + 27 / beta**2) / beta**2 * CORR_medium
+
+    # Select correct branch using nested jnp.where
+    # if beta > 500: large_beta_result
+    # elif beta <= 25.12: small_beta_result
+    # else: medium_beta_result
+    result = jnp.where(beta > 500, large_beta_result,
+             jnp.where(beta <= 25.12, small_beta_result, medium_beta_result))
+
+    return result
 
 
 def hummer_mihalas_w(T: float, n_eff: float, nH: float, nHe: float, ne: float,
@@ -255,6 +263,8 @@ def hummer_mihalas_w(T: float, n_eff: float, nH: float, nHe: float, ne: float,
 
     The expression for w is in equation 4.71 of H&M. K, the QM correction,
     is defined in equation 4.24.
+
+    JAX-compatible version using jnp.where instead of if/else.
 
     Args:
         T: Temperature in K
@@ -275,28 +285,31 @@ def hummer_mihalas_w(T: float, n_eff: float, nH: float, nHe: float, ne: float,
 
     # Contributions from ions (assumed to be all singly ionized, so n_ion = n_e)
     # K is a QM correction defined in H&M '88 equation 4.24
-    if n_eff > 3:
-        # WCALC drops the final factor, which is nearly within 1% of unity for all n
-        K = (16 / 3 * (n_eff / (n_eff + 1))**2 *
-             ((n_eff + 7 / 6) / (n_eff**2 + n_eff + 1 / 2)))
-    else:
-        K = 1.0
+    # Use jnp.where instead of if n_eff > 3
+    K_large = (16 / 3 * (n_eff / (n_eff + 1))**2 *
+               ((n_eff + 7 / 6) / (n_eff**2 + n_eff + 1 / 2)))
+    K = jnp.where(n_eff > 3, K_large, 1.0)
 
     chi = RydbergH_eV / n_eff**2 * eV_to_cgs  # binding energy
     e = electron_charge_cgs
 
-    if use_hubeny_generalization:
-        # Straight line-by-line port from HBOP
-        if (ne > 10) and (T > 10):
-            A = 0.09 * jnp.exp(0.16667 * jnp.log(ne)) / jnp.sqrt(T)
-            X = jnp.exp(3.15 * jnp.log(1 + A))
-            BETAC = 8.3e14 * jnp.exp(-0.66667 * jnp.log(ne)) * K / n_eff**4
-            F = 0.1402 * X * BETAC**3 / (1 + 0.1285 * X * BETAC * jnp.sqrt(BETAC))
-            charged_term = jnp.log(F / (1 + F)) / (-4 * jnp.pi / 3)
-        else:
-            charged_term = 0.0
-    else:
-        charged_term = 16 * ((e**2) / (chi * jnp.sqrt(K)))**3 * ne
+    # Use jnp.where for use_hubeny_generalization branch
+    # Hubeny generalization
+    # Inner condition: (ne > 10) and (T > 10)
+    A = 0.09 * jnp.exp(0.16667 * jnp.log(ne)) / jnp.sqrt(T)
+    X = jnp.exp(3.15 * jnp.log(1 + A))
+    BETAC = 8.3e14 * jnp.exp(-0.66667 * jnp.log(ne)) * K / n_eff**4
+    F = 0.1402 * X * BETAC**3 / (1 + 0.1285 * X * BETAC * jnp.sqrt(BETAC))
+    hubeny_charged_term = jnp.log(F / (1 + F)) / (-4 * jnp.pi / 3)
+
+    # Select between hubeny formula or 0.0 based on (ne > 10) and (T > 10)
+    hubeny_charged_term = jnp.where((ne > 10) & (T > 10), hubeny_charged_term, 0.0)
+
+    # Standard H&M charged term
+    hm_charged_term = 16 * ((e**2) / (chi * jnp.sqrt(K)))**3 * ne
+
+    # Select between Hubeny and H&M based on use_hubeny_generalization
+    charged_term = jnp.where(use_hubeny_generalization, hubeny_charged_term, hm_charged_term)
 
     return jnp.exp(-4 * jnp.pi / 3 * (neutral_term + charged_term))
 
@@ -450,8 +463,6 @@ def bracket_line_interpolator(m: int, λ0: float, T: float, ne: float, xi: float
         - interpolator_function: callable that takes wavelength and returns profile value
         - window: distance from line center at which profile is defined [cm]
     """
-    from scipy.interpolate import interp1d
-
     n = 4  # Brackett lines only
 
     # Get Stark width
@@ -494,10 +505,20 @@ def bracket_line_interpolator(m: int, λ0: float, T: float, ne: float, xi: float
     ϕ_conv = autodiffable_conv(ϕ_impact, ϕ_quasistatic) * step_size
     ϕ_conv = ϕ_conv[start_ind:start_ind + n_wavelength_points]
 
-    # Create linear interpolator
-    itp = interp1d(wls, ϕ_conv, kind='linear', bounds_error=False, fill_value=0.0)
+    # Create linear interpolator using JAX instead of scipy
+    # JAX's jnp.interp requires sorted x values (which wls is) and handles out-of-bounds with constant extrapolation
+    # We'll create a wrapper function that mimics scipy's interp1d behavior
+    def jax_linear_interp(x):
+        """JAX-compatible linear interpolator."""
+        # jnp.interp(x, xp, fp) - x: query points, xp: data x, fp: data y
+        # For out-of-bounds, jnp.interp extrapolates with edge values, but we want 0.0
+        # So we'll use jnp.where to clip to bounds
+        result = jnp.interp(x, wls, ϕ_conv)
+        # Set to 0.0 if out of bounds
+        in_bounds = (x >= wls[0]) & (x <= wls[-1])
+        return jnp.where(in_bounds, result, 0.0)
 
-    return itp, window
+    return jax_linear_interp, window
 
 
 def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
