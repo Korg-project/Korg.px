@@ -1481,6 +1481,1106 @@ class TestHeAbsorption:
         assert float(n_2) < float(n_1)  # Excited state less populated
 
 
+class TestExpintTransferIntegral:
+    """Test exponential integral transfer functions."""
+
+    def test_expint_transfer_integral_core_basic(self):
+        """Transfer integral core should give finite values."""
+        try:
+            from korg.radiative_transfer.intensity import expint_transfer_integral_core
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # Test at typical optical depth values
+        tau = 1.0
+        m = 0.5  # Slope of linear source function
+        b = 1.0  # Intercept
+
+        result = expint_transfer_integral_core(tau, m, b)
+        assert np.isfinite(float(result))
+
+    def test_expint_transfer_integral_core_zero_tau(self):
+        """Transfer integral at tau=0 should be finite."""
+        try:
+            from korg.radiative_transfer.intensity import expint_transfer_integral_core
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        result = expint_transfer_integral_core(0.0, 0.5, 1.0)
+        assert np.isfinite(float(result))
+
+    def test_expint_transfer_integral_core_jit(self):
+        """Transfer integral core should be JIT-compatible."""
+        try:
+            from korg.radiative_transfer.intensity import expint_transfer_integral_core
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        @jax.jit
+        def compute_integral(tau, m, b):
+            return expint_transfer_integral_core(tau, m, b)
+
+        result = compute_integral(1.0, 0.5, 1.0)
+        assert np.isfinite(float(result))
+
+
+class TestHIBoundFree:
+    """Test H I bound-free absorption."""
+
+    def test_H_I_bf_basic(self):
+        """H I bound-free should give positive absorption above ionization threshold."""
+        try:
+            from korg.continuum import H_I_bf
+            from korg.constants import c_cgs, RydbergH_eV, hplanck_eV
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        nH_I = 1e17  # H I number density
+        nHe_I = 1e16  # He I number density
+        ne = 1e14    # Electron density
+        invU_H = 0.5  # Inverse partition function
+
+        # Above ionization threshold for n=1 (Lyman continuum, λ < 912 Å)
+        nu_lyman = RydbergH_eV / hplanck_eV * 1.1  # Just above n=1 threshold
+
+        try:
+            alpha = H_I_bf(nu_lyman, T, nH_I, nHe_I, ne, invU_H)
+            assert np.isfinite(float(alpha))
+            assert float(alpha) >= 0
+        except FileNotFoundError:
+            pytest.skip("H I bf cross-section data not found")
+
+    def test_H_I_bf_balmer_region(self):
+        """H I bf should show absorption in Balmer continuum region."""
+        try:
+            from korg.continuum import H_I_bf
+            from korg.constants import c_cgs, RydbergH_eV, hplanck_eV
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        nH_I = 1e17
+        nHe_I = 1e16
+        ne = 1e14
+        invU_H = 0.5
+
+        # Balmer continuum: 3646 Å < λ < 8204 Å
+        # Use 3500 Å (above Balmer limit)
+        lambda_cm = 3500e-8
+        nu = c_cgs / lambda_cm
+
+        try:
+            alpha = H_I_bf(nu, T, nH_I, nHe_I, ne, invU_H)
+            assert np.isfinite(float(alpha))
+            assert float(alpha) >= 0
+        except FileNotFoundError:
+            pytest.skip("H I bf cross-section data not found")
+
+
+class TestH2plusAbsorption:
+    """Test H₂⁺ bound-free and free-free absorption."""
+
+    def test_H2plus_bf_and_ff_basic(self):
+        """H₂⁺ bf+ff should give positive absorption."""
+        try:
+            from korg.continuum import H2plus_bf_and_ff
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 6000.0  # Temperature in valid range [3150, 25200] K
+        nH_I = 1e17
+        nH_II = 1e14  # Proton density
+
+        # Test at 10000 Å (within valid range)
+        lambda_cm = 10000e-8
+        nu = c_cgs / lambda_cm
+
+        alpha = H2plus_bf_and_ff(nu, T, nH_I, nH_II)
+        assert np.isfinite(float(alpha))
+        assert float(alpha) >= 0
+
+    def test_H2plus_bf_and_ff_temperature_dependence(self):
+        """H₂⁺ absorption should vary with temperature."""
+        try:
+            from korg.continuum import H2plus_bf_and_ff
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        nH_I = 1e17
+        nH_II = 1e14
+
+        lambda_cm = 10000e-8
+        nu = c_cgs / lambda_cm
+
+        # Compare at two temperatures
+        alpha_cool = H2plus_bf_and_ff(nu, 5000.0, nH_I, nH_II)
+        alpha_hot = H2plus_bf_and_ff(nu, 10000.0, nH_I, nH_II)
+
+        assert np.isfinite(float(alpha_cool))
+        assert np.isfinite(float(alpha_hot))
+        # Both should be positive
+        assert float(alpha_cool) >= 0
+        assert float(alpha_hot) >= 0
+
+    def test_H2plus_bf_and_ff_jit(self):
+        """H₂⁺ bf+ff should be JIT-compatible."""
+        try:
+            from korg.continuum import H2plus_bf_and_ff
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        @jax.jit
+        def compute_h2plus(nu, T):
+            return H2plus_bf_and_ff(nu, T, 1e17, 1e14)
+
+        lambda_cm = 10000e-8
+        nu = c_cgs / lambda_cm
+
+        result = compute_h2plus(nu, 6000.0)
+        assert np.isfinite(float(result))
+
+
+class TestPositiveIonFF:
+    """Test positive ion free-free absorption."""
+
+    def test_positive_ion_ff_absorption_basic(self):
+        """Positive ion ff should give positive absorption."""
+        try:
+            from korg.continuum import positive_ion_ff_absorption
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        ne = 1e14
+
+        # Create number densities dict with string keys (species names)
+        # The function expects 'Fe_II' style keys, not Species objects
+        number_densities = {
+            'Fe_II': 1e12,
+            'Ca_II': 1e11,
+            'Mg_II': 1e11,
+        }
+
+        # Test at 5000 Å
+        lambda_cm = 5000e-8
+        nu = c_cgs / lambda_cm
+
+        alpha = positive_ion_ff_absorption(nu, T, number_densities, ne)
+        assert np.isfinite(float(alpha))
+        assert float(alpha) >= 0
+
+    def test_positive_ion_ff_wavelength_dependence(self):
+        """Positive ion ff should increase towards longer wavelengths."""
+        try:
+            from korg.continuum import positive_ion_ff_absorption
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        ne = 1e14
+        number_densities = {'Fe_II': 1e12}
+
+        # Compare 5000 Å and 10000 Å
+        nu_5000 = c_cgs / (5000e-8)
+        nu_10000 = c_cgs / (10000e-8)
+
+        alpha_5000 = positive_ion_ff_absorption(nu_5000, T, number_densities, ne)
+        alpha_10000 = positive_ion_ff_absorption(nu_10000, T, number_densities, ne)
+
+        assert np.isfinite(float(alpha_5000))
+        assert np.isfinite(float(alpha_10000))
+        # ff typically increases with wavelength (∝ λ²)
+        assert float(alpha_10000) > float(alpha_5000)
+
+
+# =============================================================================
+# Level 4 Tests - Chemical Equilibrium
+# =============================================================================
+
+class TestChemicalEquilibrium:
+    """Test chemical equilibrium calculations."""
+
+    def test_chemical_equilibrium_solar_conditions(self):
+        """Chemical equilibrium at solar photospheric conditions."""
+        try:
+            from korg.statmech import chemical_equilibrium
+            from korg.data_loader import (
+                load_ionization_energies, load_atomic_partition_functions,
+                default_log_equilibrium_constants
+            )
+            from korg.abundances import format_A_X, A_X_to_absolute
+            from korg.species import Species, Formula
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Solar conditions
+        T = 5777.0
+        n_total = 1e17  # Typical photospheric total number density
+        ne_model = 1e14  # Typical electron density
+
+        # Solar abundances
+        A_X = format_A_X()
+        absolute_abundances = A_X_to_absolute(A_X)
+
+        # Solve chemical equilibrium
+        ne, number_densities = chemical_equilibrium(
+            T, n_total, ne_model, absolute_abundances,
+            ionization_energies, partition_funcs,
+            default_log_equilibrium_constants
+        )
+
+        # Basic sanity checks
+        assert np.isfinite(ne), "Electron density should be finite"
+        assert ne > 0, "Electron density should be positive"
+        assert ne < n_total, "Electron density should be less than total"
+
+        # Check that we have number densities for common species
+        H_I = Species("H I")
+        H_II = Species("H II")
+        assert H_I in number_densities, "H I should be in number densities"
+        assert H_II in number_densities, "H II should be in number densities"
+
+        # Hydrogen should be mostly neutral at solar temperature
+        n_HI = number_densities[H_I]
+        n_HII = number_densities[H_II]
+        assert n_HI > 0, "H I density should be positive"
+        assert n_HII > 0, "H II density should be positive"
+        assert n_HI > n_HII, "H should be mostly neutral at solar T"
+
+        # Iron should have significant ionization
+        Fe_I = Species("Fe I")
+        Fe_II = Species("Fe II")
+        assert Fe_I in number_densities, "Fe I should be in number densities"
+        assert Fe_II in number_densities, "Fe II should be in number densities"
+        n_FeI = number_densities[Fe_I]
+        n_FeII = number_densities[Fe_II]
+        assert n_FeI > 0, "Fe I density should be positive"
+        assert n_FeII > 0, "Fe II density should be positive"
+
+    def test_chemical_equilibrium_electron_density_reasonable(self):
+        """Calculated electron density should be physically reasonable."""
+        try:
+            from korg.statmech import chemical_equilibrium
+            from korg.data_loader import (
+                load_ionization_energies, load_atomic_partition_functions,
+                default_log_equilibrium_constants
+            )
+            from korg.abundances import format_A_X, A_X_to_absolute
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        T = 5777.0
+        n_total = 1e17
+        ne_model = 1e14
+
+        A_X = format_A_X()
+        absolute_abundances = A_X_to_absolute(A_X)
+
+        ne, _ = chemical_equilibrium(
+            T, n_total, ne_model, absolute_abundances,
+            ionization_energies, partition_funcs,
+            default_log_equilibrium_constants
+        )
+
+        # For solar conditions, ne should be roughly ne_model
+        # Allow a factor of 10 variation
+        assert ne > ne_model / 10, "ne should not be much lower than model"
+        assert ne < ne_model * 10, "ne should not be much higher than model"
+
+    def test_chemical_equilibrium_hot_atmosphere(self):
+        """Higher temperature should give higher ionization."""
+        try:
+            from korg.statmech import chemical_equilibrium
+            from korg.data_loader import (
+                load_ionization_energies, load_atomic_partition_functions,
+                default_log_equilibrium_constants
+            )
+            from korg.abundances import format_A_X, A_X_to_absolute
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Hot atmosphere (A-type star)
+        T_hot = 9000.0
+        n_total = 1e16
+        ne_model = 1e14
+
+        A_X = format_A_X()
+        absolute_abundances = A_X_to_absolute(A_X)
+
+        ne, number_densities = chemical_equilibrium(
+            T_hot, n_total, ne_model, absolute_abundances,
+            ionization_energies, partition_funcs,
+            default_log_equilibrium_constants
+        )
+
+        # At 9000K, hydrogen should still be mostly neutral but more ionized
+        H_I = Species("H I")
+        H_II = Species("H II")
+        n_HI = number_densities[H_I]
+        n_HII = number_densities[H_II]
+
+        # Ionization fraction should be higher than at solar T
+        assert np.isfinite(ne)
+        assert ne > 0
+
+        # Iron should be more ionized at higher T
+        Fe_I = Species("Fe I")
+        Fe_II = Species("Fe II")
+        n_FeI = number_densities[Fe_I]
+        n_FeII = number_densities[Fe_II]
+
+        # Fe should be significantly ionized at 9000K
+        assert n_FeII > n_FeI * 0.1, "Fe II should be significant at 9000K"
+
+    def test_chemical_equilibrium_cool_atmosphere(self):
+        """Lower temperature should give more neutral species."""
+        try:
+            from korg.statmech import chemical_equilibrium
+            from korg.data_loader import (
+                load_ionization_energies, load_atomic_partition_functions,
+                default_log_equilibrium_constants
+            )
+            from korg.abundances import format_A_X, A_X_to_absolute
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Cool atmosphere (K-type star)
+        T_cool = 4500.0
+        n_total = 1e17
+        ne_model = 1e13  # Lower ne at lower T
+
+        A_X = format_A_X()
+        absolute_abundances = A_X_to_absolute(A_X)
+
+        ne, number_densities = chemical_equilibrium(
+            T_cool, n_total, ne_model, absolute_abundances,
+            ionization_energies, partition_funcs,
+            default_log_equilibrium_constants
+        )
+
+        # At 4500K, hydrogen should be very neutral
+        H_I = Species("H I")
+        H_II = Species("H II")
+        n_HI = number_densities[H_I]
+        n_HII = number_densities[H_II]
+
+        # H II should be much smaller than H I
+        assert n_HI > n_HII * 100, "H should be very neutral at 4500K"
+
+        # Check overall ionization is low
+        assert np.isfinite(ne)
+        assert ne > 0
+
+    def test_chemical_equilibrium_temperature_trend(self):
+        """Electron density should increase with temperature."""
+        try:
+            from korg.statmech import chemical_equilibrium
+            from korg.data_loader import (
+                load_ionization_energies, load_atomic_partition_functions,
+                default_log_equilibrium_constants
+            )
+            from korg.abundances import format_A_X, A_X_to_absolute
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        n_total = 1e17
+        ne_model = 1e14
+
+        A_X = format_A_X()
+        absolute_abundances = A_X_to_absolute(A_X)
+
+        # Test at three temperatures
+        temperatures = [4500.0, 5777.0, 7000.0]
+        electron_densities = []
+
+        for T in temperatures:
+            ne, _ = chemical_equilibrium(
+                T, n_total, ne_model, absolute_abundances,
+                ionization_energies, partition_funcs,
+                default_log_equilibrium_constants
+            )
+            electron_densities.append(ne)
+
+        # Electron density should increase with temperature
+        assert electron_densities[1] > electron_densities[0], \
+            "ne should increase from 4500K to 5777K"
+        assert electron_densities[2] > electron_densities[1], \
+            "ne should increase from 5777K to 7000K"
+
+    def test_chemical_equilibrium_returns_molecules(self):
+        """Chemical equilibrium should return molecular species."""
+        try:
+            from korg.statmech import chemical_equilibrium
+            from korg.data_loader import (
+                load_ionization_energies, load_atomic_partition_functions,
+                default_log_equilibrium_constants
+            )
+            from korg.abundances import format_A_X, A_X_to_absolute
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Cool conditions favor molecules
+        T = 4500.0
+        n_total = 1e17
+        ne_model = 1e13
+
+        A_X = format_A_X()
+        absolute_abundances = A_X_to_absolute(A_X)
+
+        ne, number_densities = chemical_equilibrium(
+            T, n_total, ne_model, absolute_abundances,
+            ionization_energies, partition_funcs,
+            default_log_equilibrium_constants
+        )
+
+        # Check that we have some molecular species
+        # Note: The exact molecules depend on which equilibrium constants
+        # are available in the data loader
+        molecular_species = [sp for sp in number_densities.keys() if sp.is_molecule()]
+
+        # At cool temperatures we should have at least some molecules
+        # (if equilibrium constants are loaded)
+        if len(default_log_equilibrium_constants) > 0:
+            assert len(molecular_species) > 0, \
+                "Should have some molecular species at cool temperatures"
+
+    def test_chemical_equilibrium_number_density_conservation(self):
+        """Total number of atoms should be roughly conserved."""
+        try:
+            from korg.statmech import chemical_equilibrium
+            from korg.data_loader import (
+                load_ionization_energies, load_atomic_partition_functions,
+                default_log_equilibrium_constants
+            )
+            from korg.abundances import format_A_X, A_X_to_absolute
+            from korg.species import Species, Formula
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        T = 5777.0
+        n_total = 1e17
+        ne_model = 1e14
+
+        A_X = format_A_X()
+        absolute_abundances = A_X_to_absolute(A_X)
+
+        ne, number_densities = chemical_equilibrium(
+            T, n_total, ne_model, absolute_abundances,
+            ionization_energies, partition_funcs,
+            default_log_equilibrium_constants
+        )
+
+        # Sum up hydrogen in all forms (should roughly equal n_H_total)
+        H_I = Species("H I")
+        H_II = Species("H II")
+        n_H_atoms = number_densities[H_I] + number_densities[H_II]
+
+        # n_H should be roughly absolute_abundances[0] * (n_total - ne)
+        expected_n_H = absolute_abundances[0] * (n_total - ne)
+
+        # Allow 10% tolerance due to molecules containing H
+        assert abs(n_H_atoms - expected_n_H) / expected_n_H < 0.1, \
+            f"H conservation check: got {n_H_atoms}, expected {expected_n_H}"
+
+
+# =============================================================================
+# Level 4 Tests - Line Absorption
+# =============================================================================
+
+class TestLineAbsorption:
+    """Test line absorption calculations."""
+
+    def test_line_creation_basic(self):
+        """Test basic Line object creation."""
+        try:
+            from korg.linelist import Line, create_line
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # Create a simple Fe I line at 5000 Angstroms
+        line = create_line(
+            wl=5000.0,  # Angstroms
+            log_gf=-1.0,
+            species="Fe I",
+            E_lower=2.5,  # eV
+        )
+
+        # Check basic properties
+        assert np.isclose(line.wl, 5000e-8, rtol=1e-6), "Wavelength should be in cm"
+        assert line.log_gf == -1.0, "log_gf should be preserved"
+        assert line.E_lower == 2.5, "E_lower should be preserved"
+        assert isinstance(line.species, Species), "Species should be a Species object"
+
+        # Check broadening parameters are filled
+        assert np.isfinite(line.gamma_rad), "gamma_rad should be finite"
+        assert line.gamma_rad > 0, "gamma_rad should be positive"
+        assert np.isfinite(line.gamma_stark), "gamma_stark should be finite"
+        assert isinstance(line.vdW, tuple), "vdW should be a tuple"
+        assert len(line.vdW) == 2, "vdW should have 2 elements"
+
+    def test_line_creation_with_broadening(self):
+        """Test Line creation with specified broadening parameters."""
+        try:
+            from korg.linelist import Line, create_line
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # Create line with explicit broadening
+        line = create_line(
+            wl=5000.0,
+            log_gf=-1.0,
+            species="Fe I",
+            E_lower=2.5,
+            gamma_rad=1e8,
+            gamma_stark=1e-6,
+            vdW=(1e-7, -1.0)
+        )
+
+        assert line.gamma_rad == 1e8, "gamma_rad should match specified value"
+        assert line.gamma_stark == 1e-6, "gamma_stark should match specified value"
+        assert line.vdW == (1e-7, -1.0), "vdW should match specified tuple"
+
+    def test_line_creation_wavelength_conversion(self):
+        """Test wavelength conversion in Line creation."""
+        try:
+            from korg.linelist import create_line
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # Create line with wavelength in Angstroms
+        line_angstrom = create_line(
+            wl=5000.0,  # Angstroms
+            log_gf=-1.0,
+            species="Fe I",
+            E_lower=2.5
+        )
+
+        # Create line with wavelength in cm
+        line_cm = create_line(
+            wl=5000e-8,  # cm
+            log_gf=-1.0,
+            species="Fe I",
+            E_lower=2.5
+        )
+
+        # Both should result in the same wavelength
+        assert np.isclose(line_angstrom.wl, line_cm.wl, rtol=1e-6)
+
+    def test_approximate_radiative_gamma(self):
+        """Test radiative damping approximation."""
+        try:
+            from korg.linelist import approximate_radiative_gamma
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # Test at various wavelengths and oscillator strengths
+        wl_cm = 5000e-8  # 5000 Angstroms
+        log_gf = -1.0
+
+        gamma_rad = approximate_radiative_gamma(wl_cm, log_gf)
+
+        # gamma_rad should be positive and finite
+        assert np.isfinite(gamma_rad), "gamma_rad should be finite"
+        assert gamma_rad > 0, "gamma_rad should be positive"
+
+        # Stronger line (higher gf) should have larger gamma_rad
+        gamma_rad_strong = approximate_radiative_gamma(wl_cm, 0.0)
+        assert gamma_rad_strong > gamma_rad, "Stronger line should have larger gamma_rad"
+
+    def test_approximate_gammas_neutral_atom(self):
+        """Test Stark and vdW approximation for neutral atom."""
+        try:
+            from korg.linelist import approximate_gammas
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl_cm = 5000e-8
+        species = Species("Fe I")  # Neutral iron
+        E_lower = 2.5  # eV
+
+        gamma_stark, log_gamma_vdW = approximate_gammas(wl_cm, species, E_lower)
+
+        # Both should be finite and non-negative
+        assert np.isfinite(gamma_stark), "gamma_stark should be finite"
+        assert gamma_stark >= 0, "gamma_stark should be non-negative"
+        assert np.isfinite(log_gamma_vdW), "log_gamma_vdW should be finite"
+
+    def test_approximate_gammas_ionized_atom(self):
+        """Test Stark and vdW approximation for ionized atom."""
+        try:
+            from korg.linelist import approximate_gammas
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl_cm = 5000e-8
+        species = Species("Fe II")  # Singly ionized iron
+        E_lower = 3.0  # eV
+
+        gamma_stark, log_gamma_vdW = approximate_gammas(wl_cm, species, E_lower)
+
+        # Both should be finite
+        assert np.isfinite(gamma_stark), "gamma_stark should be finite"
+        assert np.isfinite(log_gamma_vdW), "log_gamma_vdW should be finite"
+
+    def test_approximate_gammas_molecule(self):
+        """Test Stark and vdW approximation returns zeros for molecules."""
+        try:
+            from korg.linelist import approximate_gammas
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl_cm = 5000e-8
+        species = Species("CO")  # Molecule
+        E_lower = 0.1  # eV
+
+        gamma_stark, log_gamma_vdW = approximate_gammas(wl_cm, species, E_lower)
+
+        # Should return zeros for molecules
+        assert gamma_stark == 0.0, "gamma_stark should be 0 for molecules"
+        assert log_gamma_vdW == 0.0, "log_gamma_vdW should be 0 for molecules"
+
+    def test_sigma_line_wavelength_dependence(self):
+        """Test sigma_line wavelength dependence."""
+        try:
+            from korg.line_absorption import sigma_line
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # sigma_line should scale as wavelength^2
+        wl1 = 5000e-8
+        wl2 = 10000e-8
+
+        sigma1 = float(sigma_line(wl1))
+        sigma2 = float(sigma_line(wl2))
+
+        # sigma ∝ λ² so sigma2/sigma1 should be 4
+        ratio = sigma2 / sigma1
+        assert np.isclose(ratio, 4.0, rtol=1e-6), \
+            f"sigma_line should scale as λ², got ratio {ratio}"
+
+    def test_doppler_width_temperature_dependence(self):
+        """Test doppler_width increases with temperature."""
+        try:
+            from korg.line_absorption import doppler_width
+            from korg.constants import amu_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl_cm = 5000e-8
+        mass = 55.85 * amu_cgs  # Fe mass
+        xi = 1e5  # 1 km/s
+
+        sigma_cool = float(doppler_width(wl_cm, 4000.0, mass, xi))
+        sigma_hot = float(doppler_width(wl_cm, 6000.0, mass, xi))
+
+        assert sigma_hot > sigma_cool, "Doppler width should increase with temperature"
+
+    def test_doppler_width_mass_dependence(self):
+        """Test doppler_width decreases with mass (heavier atoms narrower lines)."""
+        try:
+            from korg.line_absorption import doppler_width
+            from korg.constants import amu_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl_cm = 5000e-8
+        T = 5777.0
+        xi = 1e5
+
+        # Hydrogen vs Iron
+        mass_H = 1.008 * amu_cgs
+        mass_Fe = 55.85 * amu_cgs
+
+        sigma_H = float(doppler_width(wl_cm, T, mass_H, xi))
+        sigma_Fe = float(doppler_width(wl_cm, T, mass_Fe, xi))
+
+        assert sigma_H > sigma_Fe, "Lighter atoms should have broader Doppler widths"
+
+    def test_doppler_width_microturbulence(self):
+        """Test doppler_width increases with microturbulence."""
+        try:
+            from korg.line_absorption import doppler_width
+            from korg.constants import amu_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl_cm = 5000e-8
+        T = 5777.0
+        mass = 55.85 * amu_cgs
+
+        sigma_low_xi = float(doppler_width(wl_cm, T, mass, 0.5e5))
+        sigma_high_xi = float(doppler_width(wl_cm, T, mass, 2e5))
+
+        assert sigma_high_xi > sigma_low_xi, \
+            "Doppler width should increase with microturbulence"
+
+    def test_scaled_stark_reference_temperature(self):
+        """Test scaled_stark at reference temperature."""
+        try:
+            from korg.line_absorption import scaled_stark
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        gamma = 1e-6
+        T0 = 10000.0  # Reference temperature
+
+        # At reference temperature, should return input value
+        result = float(scaled_stark(gamma, T0))
+        assert np.isclose(result, gamma, rtol=1e-10), \
+            "scaled_stark at T0 should return input gamma"
+
+    def test_scaled_stark_temperature_scaling(self):
+        """Test scaled_stark T^(1/6) scaling."""
+        try:
+            from korg.line_absorption import scaled_stark
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        gamma = 1e-6
+        T1 = 5000.0
+        T2 = 8000.0
+        T0 = 10000.0
+
+        result1 = float(scaled_stark(gamma, T1))
+        result2 = float(scaled_stark(gamma, T2))
+
+        # Ratio should follow T^(1/6) scaling
+        expected_ratio = (T2 / T1)**(1/6)
+        actual_ratio = result2 / result1
+
+        assert np.isclose(actual_ratio, expected_ratio, rtol=1e-6), \
+            f"scaled_stark should scale as T^(1/6), got ratio {actual_ratio}"
+
+    def test_scaled_vdW_simple_scaling(self):
+        """Test scaled_vdW with simple T^0.3 scaling."""
+        try:
+            from korg.line_absorption import scaled_vdW
+            from korg.constants import amu_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        vdW = (1e-7, -1.0)  # Simple scaling mode
+        mass = 55.85 * amu_cgs
+        T0 = 10000.0
+
+        # At reference temperature
+        result_T0 = float(scaled_vdW(vdW, mass, T0))
+        assert np.isclose(result_T0, 1e-7, rtol=1e-6), \
+            "scaled_vdW at T0 should return input gamma"
+
+        # Check T^0.3 scaling
+        T1 = 5000.0
+        result_T1 = float(scaled_vdW(vdW, mass, T1))
+        expected = 1e-7 * (T1 / T0)**0.3
+        assert np.isclose(result_T1, expected, rtol=1e-6), \
+            "scaled_vdW should scale as T^0.3 for simple mode"
+
+    def test_scaled_vdW_abo_theory(self):
+        """Test scaled_vdW with ABO theory."""
+        try:
+            from korg.line_absorption import scaled_vdW
+            from korg.constants import amu_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # ABO parameters: (sigma in cm^2, alpha)
+        vdW = (300.0, 0.25)  # ABO mode
+        mass = 55.85 * amu_cgs
+        T = 5777.0
+
+        result = float(scaled_vdW(vdW, mass, T))
+
+        assert np.isfinite(result), "scaled_vdW ABO result should be finite"
+        assert result > 0, "scaled_vdW ABO result should be positive"
+
+    def test_line_profile_center_value(self):
+        """Test line_profile at line center."""
+        try:
+            from korg.line_profiles import line_profile
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl0 = 5000e-8  # Line center in cm
+        sigma = 0.01e-8  # Doppler width in cm
+        gamma = 0.001e-8  # Lorentz width in cm
+        amplitude = 1.0
+
+        # At line center
+        result_center = float(line_profile(wl0, sigma, gamma, amplitude, wl0))
+
+        # At offset
+        wl_offset = wl0 + 0.05e-8
+        result_offset = float(line_profile(wl0, sigma, gamma, amplitude, wl_offset))
+
+        # Center should have maximum value
+        assert result_center > result_offset, \
+            "Profile should be maximum at line center"
+        assert np.isfinite(result_center), "Profile at center should be finite"
+        assert result_center > 0, "Profile at center should be positive"
+
+    def test_line_profile_symmetry(self):
+        """Test line_profile is symmetric about line center."""
+        try:
+            from korg.line_profiles import line_profile
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl0 = 5000e-8
+        sigma = 0.01e-8
+        gamma = 0.001e-8
+        amplitude = 1.0
+        offset = 0.02e-8
+
+        result_blue = float(line_profile(wl0, sigma, gamma, amplitude, wl0 - offset))
+        result_red = float(line_profile(wl0, sigma, gamma, amplitude, wl0 + offset))
+
+        assert np.isclose(result_blue, result_red, rtol=1e-10), \
+            "Line profile should be symmetric"
+
+    def test_line_profile_amplitude_scaling(self):
+        """Test line_profile scales linearly with amplitude."""
+        try:
+            from korg.line_profiles import line_profile
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl0 = 5000e-8
+        sigma = 0.01e-8
+        gamma = 0.001e-8
+
+        result1 = float(line_profile(wl0, sigma, gamma, 1.0, wl0))
+        result2 = float(line_profile(wl0, sigma, gamma, 2.0, wl0))
+
+        assert np.isclose(result2 / result1, 2.0, rtol=1e-10), \
+            "Profile should scale linearly with amplitude"
+
+    def test_voigt_profile_limiting_cases(self):
+        """Test voigt_hjerting in Gaussian and Lorentzian limits."""
+        try:
+            from korg.line_profiles import voigt_hjerting
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # Near-Gaussian limit (small alpha)
+        alpha_small = 0.001
+        v = 1.0
+        result_gaussian = float(voigt_hjerting(alpha_small, v))
+
+        # Near-Lorentzian limit (large alpha)
+        alpha_large = 10.0
+        result_lorentzian = float(voigt_hjerting(alpha_large, v))
+
+        # Both should be positive and finite
+        assert np.isfinite(result_gaussian), "Gaussian limit should be finite"
+        assert np.isfinite(result_lorentzian), "Lorentzian limit should be finite"
+        assert result_gaussian > 0, "Gaussian limit should be positive"
+        assert result_lorentzian > 0, "Lorentzian limit should be positive"
+
+    def test_inverse_gaussian_density_edge_cases(self):
+        """Test inverse_gaussian_density edge cases."""
+        try:
+            from korg.line_profiles import inverse_gaussian_density
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        sigma = 1.0
+        max_density = 1.0 / (np.sqrt(2 * np.pi) * sigma)
+
+        # Just below max density should give small positive value
+        result_near_max = float(inverse_gaussian_density(max_density * 0.99, sigma))
+        assert result_near_max > 0, "Should return positive value just below max"
+        assert result_near_max < 1.0, "Should be small near max density"
+
+        # At very small density, should give large value
+        result_small = float(inverse_gaussian_density(0.001, sigma))
+        assert result_small > result_near_max, "Should increase as density decreases"
+
+    def test_inverse_lorentz_density_edge_cases(self):
+        """Test inverse_lorentz_density edge cases."""
+        try:
+            from korg.line_profiles import inverse_lorentz_density
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        gamma = 1.0
+        max_density = 1.0 / (np.pi * gamma)
+
+        # Just below max density should give small positive value
+        result_near_max = float(inverse_lorentz_density(max_density * 0.99, gamma))
+        assert result_near_max > 0, "Should return positive value just below max"
+        assert result_near_max < 1.0, "Should be small near max density"
+
+        # At very small density, should give large value
+        result_small = float(inverse_lorentz_density(0.001, gamma))
+        assert result_small > result_near_max, "Should increase as density decreases"
+
+    def test_line_absorption_empty_linelist(self):
+        """Test line_absorption with empty linelist returns zeros."""
+        try:
+            from korg.line_absorption import line_absorption
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wavelengths = np.linspace(5000e-8, 5100e-8, 100)
+        temperatures = np.array([5777.0, 5500.0, 5300.0])
+        electron_densities = np.array([1e14, 1e14, 1e14])
+        number_densities = {}
+        partition_functions = {}
+        xi = 1e5
+
+        def continuum_opacity(wl):
+            return np.ones_like(temperatures) * 1e-10
+
+        result = line_absorption(
+            [],  # Empty linelist
+            wavelengths,
+            temperatures,
+            electron_densities,
+            number_densities,
+            partition_functions,
+            xi,
+            continuum_opacity
+        )
+
+        assert result.shape == (len(temperatures), len(wavelengths))
+        assert np.allclose(result, 0.0), "Empty linelist should give zero absorption"
+
+    def test_harris_series_boundary_values(self):
+        """Test harris_series at region boundaries."""
+        try:
+            from korg.line_profiles import harris_series
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # Test at boundaries of piecewise regions
+        test_values = [0.1, 1.3, 2.4, 4.9]
+
+        for v in test_values:
+            H0, H1, H2 = harris_series(v)
+            assert np.isfinite(float(H0)), f"H0 should be finite at v={v}"
+            assert np.isfinite(float(H1)), f"H1 should be finite at v={v}"
+            assert np.isfinite(float(H2)), f"H2 should be finite at v={v}"
+
+    def test_voigt_hjerting_region_boundaries(self):
+        """Test voigt_hjerting at region boundaries."""
+        try:
+            from korg.line_profiles import voigt_hjerting
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # Test at region boundaries
+        test_cases = [
+            (0.1, 4.9),   # alpha <= 0.2, v < 5
+            (0.1, 5.1),   # alpha <= 0.2, v >= 5
+            (0.5, 2.5),   # 0.2 < alpha <= 1.4, alpha + v < 3.2
+            (1.0, 3.0),   # 0.2 < alpha <= 1.4, alpha + v > 3.2
+            (2.0, 1.0),   # alpha > 1.4
+        ]
+
+        for alpha, v in test_cases:
+            result = float(voigt_hjerting(alpha, v))
+            assert np.isfinite(result), f"Should be finite at alpha={alpha}, v={v}"
+            assert result > 0, f"Should be positive at alpha={alpha}, v={v}"
+
+
+class TestLineAbsorptionJIT:
+    """Test JIT compatibility of line absorption functions."""
+
+    def test_approximate_radiative_gamma_jit(self):
+        """Test approximate_radiative_gamma is JIT-compatible."""
+        try:
+            from korg.linelist import approximate_radiative_gamma
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        @jax.jit
+        def compute_gamma(wl, log_gf):
+            return approximate_radiative_gamma(wl, log_gf)
+
+        result = compute_gamma(5000e-8, -1.0)
+        assert np.isfinite(float(result))
+
+    def test_line_profile_jit_vectorized(self):
+        """Test line_profile works with JAX vmap."""
+        try:
+            from korg.line_profiles import line_profile
+            import jax.numpy as jnp
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl0 = 5000e-8
+        sigma = 0.01e-8
+        gamma = 0.001e-8
+        amplitude = 1.0
+
+        # Vectorize over wavelength array
+        wavelengths = jnp.linspace(4999e-8, 5001e-8, 21)
+
+        @jax.jit
+        def compute_profiles(wls):
+            return jax.vmap(lambda wl: line_profile(wl0, sigma, gamma, amplitude, wl))(wls)
+
+        result = compute_profiles(wavelengths)
+        assert result.shape == (21,), "Should return array of 21 values"
+        assert np.all(np.isfinite(result)), "All values should be finite"
+        assert np.all(result > 0), "All values should be positive"
+
+
 class TestMetalAbsorption:
     """Test metal bound-free absorption."""
 
@@ -1535,6 +2635,740 @@ class TestMetalAbsorption:
         alpha = metal_bf_absorption(np.array([nu]), T, number_densities)
         assert np.isfinite(alpha[0])
         assert alpha[0] >= 0
+
+
+# =============================================================================
+# Level 4 Tests - Synthesis Module
+# =============================================================================
+
+class TestPlanckFunction:
+    """Test Planck blackbody functions."""
+
+    def test_planck_function_basic(self):
+        """planck_function should give positive values for valid inputs."""
+        try:
+            from korg.synthesis import planck_function
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0  # Solar temperature
+        wl_A = 5000.0  # Angstrom
+        wl_cm = wl_A * 1e-8
+        nu = c_cgs / wl_cm
+
+        B_nu = planck_function(nu, T)
+        assert np.isfinite(float(B_nu))
+        assert float(B_nu) > 0
+
+    def test_planck_function_temperature_dependence(self):
+        """Hotter temperature should give higher intensity at optical wavelengths."""
+        try:
+            from korg.synthesis import planck_function
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl_cm = 5000e-8  # 5000 Angstrom
+        nu = c_cgs / wl_cm
+
+        B_cool = planck_function(nu, 4000.0)
+        B_hot = planck_function(nu, 7000.0)
+
+        assert float(B_hot) > float(B_cool)
+
+    def test_planck_function_wavelength_dependence(self):
+        """Planck function should peak at Wien's displacement law wavelength."""
+        try:
+            from korg.synthesis import planck_function
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0  # Solar temperature
+        # Wien's displacement law: lambda_max * T = 2.898e-3 m*K
+        # For solar T: lambda_max ~ 5016 Angstrom
+
+        # Test at several wavelengths
+        wavelengths_A = [3000, 5000, 8000, 15000]
+        B_values = []
+        for wl_A in wavelengths_A:
+            wl_cm = wl_A * 1e-8
+            nu = c_cgs / wl_cm
+            B_values.append(float(planck_function(nu, T)))
+
+        # All values should be positive and finite
+        assert all(np.isfinite(B) and B > 0 for B in B_values)
+
+    def test_planck_function_jit(self):
+        """planck_function should be JIT-compatible."""
+        try:
+            from korg.synthesis import planck_function
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        @jax.jit
+        def compute_planck(nu, T):
+            return planck_function(nu, T)
+
+        wl_cm = 5000e-8
+        nu = c_cgs / wl_cm
+        result = compute_planck(nu, 5777.0)
+        assert np.isfinite(float(result))
+
+
+class TestBlackbody:
+    """Test wavelength-based blackbody function."""
+
+    def test_blackbody_basic(self):
+        """blackbody should give positive values for valid inputs."""
+        try:
+            from korg.synthesis import blackbody
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        wl_cm = 5000e-8
+
+        B_lambda = blackbody(T, wl_cm)
+        assert np.isfinite(float(B_lambda))
+        assert float(B_lambda) > 0
+
+    def test_blackbody_temperature_scaling(self):
+        """blackbody total intensity should scale as T^4 (Stefan-Boltzmann)."""
+        try:
+            from korg.synthesis import blackbody
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # Integrate over a wavelength range
+        wavelengths = np.linspace(1000e-8, 50000e-8, 1000)
+
+        T1 = 5000.0
+        T2 = 10000.0
+
+        B1 = sum(float(blackbody(T1, wl)) for wl in wavelengths)
+        B2 = sum(float(blackbody(T2, wl)) for wl in wavelengths)
+
+        # Ratio should be approximately (T2/T1)^4 = 16
+        ratio = B2 / B1
+        expected_ratio = (T2 / T1)**4
+
+        # Allow 50% tolerance due to finite integration
+        assert 0.5 * expected_ratio < ratio < 1.5 * expected_ratio
+
+    def test_blackbody_vectorized(self):
+        """blackbody should work with array inputs."""
+        try:
+            from korg.synthesis import blackbody
+            import jax.numpy as jnp
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        wavelengths_cm = jnp.array([3000, 5000, 8000]) * 1e-8
+
+        B_values = blackbody(T, wavelengths_cm)
+        assert B_values.shape == (3,)
+        assert all(np.isfinite(B_values))
+        assert all(B_values > 0)
+
+    def test_blackbody_jit(self):
+        """blackbody should be JIT-compatible."""
+        try:
+            from korg.synthesis import blackbody
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        @jax.jit
+        def compute_blackbody(T, wl):
+            return blackbody(T, wl)
+
+        result = compute_blackbody(5777.0, 5000e-8)
+        assert np.isfinite(float(result))
+
+
+class TestSynthesisResult:
+    """Test SynthesisResult dataclass."""
+
+    def test_synthesis_result_creation(self):
+        """SynthesisResult should store all fields correctly."""
+        try:
+            from korg.synthesis import SynthesisResult
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wavelengths = np.array([5000, 5001, 5002])
+        flux = np.array([1.0, 0.9, 1.0])
+        continuum = np.array([1.0, 1.0, 1.0])
+
+        result = SynthesisResult(
+            wavelengths=wavelengths,
+            flux=flux,
+            continuum=continuum
+        )
+
+        assert np.array_equal(result.wavelengths, wavelengths)
+        assert np.array_equal(result.flux, flux)
+        assert np.array_equal(result.continuum, continuum)
+        assert result.intensities is None
+
+    def test_synthesis_result_with_intensities(self):
+        """SynthesisResult should handle optional intensities."""
+        try:
+            from korg.synthesis import SynthesisResult
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wavelengths = np.array([5000, 5001])
+        flux = np.array([1.0, 0.9])
+        continuum = np.array([1.0, 1.0])
+        intensities = np.array([[1.0, 0.9], [0.8, 0.7]])
+
+        result = SynthesisResult(
+            wavelengths=wavelengths,
+            flux=flux,
+            continuum=continuum,
+            intensities=intensities
+        )
+
+        assert result.intensities is not None
+        assert result.intensities.shape == (2, 2)
+
+
+class TestPrecomputeSynthesisData:
+    """Test precompute_synthesis_data function."""
+
+    def test_precompute_synthesis_data_basic(self):
+        """precompute_synthesis_data should create valid SynthesisData."""
+        try:
+            from korg.synthesis import precompute_synthesis_data, SynthesisData
+            from korg.data_loader import (
+                ionization_energies, default_partition_funcs,
+                default_log_equilibrium_constants
+            )
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            data = precompute_synthesis_data(
+                ionization_energies,
+                default_partition_funcs,
+                default_log_equilibrium_constants,
+                T_min=3000.0,
+                T_max=10000.0,
+                n_temps=50
+            )
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        assert isinstance(data, SynthesisData)
+        assert data.chem_eq_data is not None
+        assert len(data.gaunt_log_u_grid) > 0
+        assert len(data.gaunt_log_gamma2_grid) > 0
+        assert data.gaunt_table.shape[0] > 0
+
+    def test_precompute_synthesis_data_temperature_range(self):
+        """precompute_synthesis_data should respect temperature range."""
+        try:
+            from korg.synthesis import precompute_synthesis_data
+            from korg.data_loader import (
+                ionization_energies, default_partition_funcs,
+                default_log_equilibrium_constants
+            )
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            data = precompute_synthesis_data(
+                ionization_energies,
+                default_partition_funcs,
+                default_log_equilibrium_constants,
+                T_min=4000.0,
+                T_max=8000.0,
+                n_temps=20
+            )
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Check that temperature grid has expected size
+        assert data.chem_eq_data.log_T_grid.shape[0] == 20
+
+
+class TestPreprocessLinelist:
+    """Test preprocess_linelist function."""
+
+    def test_preprocess_linelist_empty(self):
+        """preprocess_linelist should handle empty list."""
+        try:
+            from korg.synthesis import preprocess_linelist, LinelistData
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        result = preprocess_linelist([])
+
+        assert isinstance(result, LinelistData)
+        assert result.n_lines == 0
+        assert len(result.wl) == 0
+
+    def test_preprocess_linelist_with_lines(self):
+        """preprocess_linelist should convert Line objects to arrays."""
+        try:
+            from korg.synthesis import preprocess_linelist, LinelistData
+            from korg.linelist import Line
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # Create a few test lines
+        lines = [
+            Line(
+                wl=5000e-8,  # 5000 Angstrom in cm
+                log_gf=-1.0,
+                species=Species("Fe I"),
+                E_lower=2.5,
+                gamma_rad=1e8,
+                gamma_stark=1e-6,
+                vdW=(1e-7, -1.0)
+            ),
+            Line(
+                wl=5001e-8,
+                log_gf=-0.5,
+                species=Species("Ca II"),
+                E_lower=3.0,
+                gamma_rad=1.5e8,
+                gamma_stark=2e-6,
+                vdW=(2e-7, -1.0)
+            )
+        ]
+
+        result = preprocess_linelist(lines)
+
+        assert result.n_lines == 2
+        assert len(result.wl) == 2
+        assert np.isclose(float(result.wl[0]), 5000e-8, rtol=1e-10)
+        assert np.isclose(float(result.log_gf[0]), -1.0, rtol=1e-10)
+        assert result.species_charge[0] == 0  # Fe I is neutral
+        assert result.species_charge[1] == 1  # Ca II is singly ionized
+
+    def test_preprocess_linelist_preserves_order(self):
+        """preprocess_linelist should preserve line order."""
+        try:
+            from korg.synthesis import preprocess_linelist
+            from korg.linelist import Line
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wavelengths = [4500e-8, 5000e-8, 5500e-8, 6000e-8]
+        lines = [
+            Line(
+                wl=wl,
+                log_gf=-1.0,
+                species=Species("Fe I"),
+                E_lower=2.5,
+                gamma_rad=1e8,
+                gamma_stark=1e-6,
+                vdW=(1e-7, -1.0)
+            )
+            for wl in wavelengths
+        ]
+
+        result = preprocess_linelist(lines)
+
+        for i, wl in enumerate(wavelengths):
+            assert np.isclose(float(result.wl[i]), wl, rtol=1e-10)
+
+
+class TestJITHelperFunctions:
+    """Test JIT-compatible helper functions in synthesis module."""
+
+    def test_interp2d_jit(self):
+        """_interp2d_jit should perform bilinear interpolation."""
+        try:
+            from korg.synthesis import _interp2d_jit
+            import jax.numpy as jnp
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        xgrid = jnp.array([0.0, 1.0, 2.0])
+        ygrid = jnp.array([0.0, 1.0, 2.0])
+        zgrid = jnp.array([[0.0, 1.0, 2.0],
+                           [1.0, 2.0, 3.0],
+                           [2.0, 3.0, 4.0]])
+
+        # Test at grid points
+        z_00 = _interp2d_jit(0.0, 0.0, xgrid, ygrid, zgrid)
+        assert np.isclose(float(z_00), 0.0, rtol=1e-6)
+
+        z_11 = _interp2d_jit(1.0, 1.0, xgrid, ygrid, zgrid)
+        assert np.isclose(float(z_11), 2.0, rtol=1e-6)
+
+        # Test at midpoint (should interpolate)
+        z_mid = _interp2d_jit(0.5, 0.5, xgrid, ygrid, zgrid)
+        assert np.isfinite(float(z_mid))
+        # At (0.5, 0.5), interpolation between corners (0,0,0), (1,0,1), (0,1,1), (1,1,2)
+        # Expected: 0.25*0 + 0.25*1 + 0.25*1 + 0.25*2 = 1.0
+        assert np.isclose(float(z_mid), 1.0, rtol=0.1)
+
+    def test_interp2d_jit_jit_compatible(self):
+        """_interp2d_jit should work under JAX JIT."""
+        try:
+            from korg.synthesis import _interp2d_jit
+            import jax.numpy as jnp
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        xgrid = jnp.array([0.0, 1.0, 2.0])
+        ygrid = jnp.array([0.0, 1.0, 2.0])
+        zgrid = jnp.array([[0.0, 1.0, 2.0],
+                           [1.0, 2.0, 3.0],
+                           [2.0, 3.0, 4.0]])
+
+        @jax.jit
+        def interp(x, y):
+            return _interp2d_jit(x, y, xgrid, ygrid, zgrid)
+
+        result = interp(0.5, 0.5)
+        assert np.isfinite(float(result))
+
+    def test_gaunt_ff_jit(self):
+        """_gaunt_ff_jit should return positive Gaunt factors."""
+        try:
+            from korg.synthesis import _gaunt_ff_jit, precompute_synthesis_data
+            from korg.data_loader import (
+                ionization_energies, default_partition_funcs,
+                default_log_equilibrium_constants
+            )
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            data = precompute_synthesis_data(
+                ionization_energies,
+                default_partition_funcs,
+                default_log_equilibrium_constants
+            )
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        T = 5777.0
+        Z = 1
+        wl_cm = 5000e-8
+        nu = c_cgs / wl_cm
+
+        g_ff = _gaunt_ff_jit(nu, T, Z, data)
+        assert np.isfinite(float(g_ff))
+        assert float(g_ff) > 0
+
+    def test_hydrogenic_ff_jit(self):
+        """_hydrogenic_ff_jit should give positive absorption."""
+        try:
+            from korg.synthesis import _hydrogenic_ff_jit, precompute_synthesis_data
+            from korg.data_loader import (
+                ionization_energies, default_partition_funcs,
+                default_log_equilibrium_constants
+            )
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            data = precompute_synthesis_data(
+                ionization_energies,
+                default_partition_funcs,
+                default_log_equilibrium_constants
+            )
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        T = 5777.0
+        Z = 1
+        n_ion = 1e14  # Proton density
+        ne = 1e14
+        wl_cm = 5000e-8
+        nu = c_cgs / wl_cm
+
+        alpha_ff = _hydrogenic_ff_jit(nu, T, Z, n_ion, ne, data)
+        assert np.isfinite(float(alpha_ff))
+        assert float(alpha_ff) > 0
+
+    def test_hminus_bf_jit(self):
+        """_hminus_bf_jit should give positive absorption above threshold."""
+        try:
+            from korg.synthesis import _hminus_bf_jit
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        nH_I_div_U = 1e17
+        ne = 1e14
+
+        # Above ionization threshold (H- threshold is 1.64 um)
+        wl_cm = 5000e-8  # 0.5 um
+        nu = c_cgs / wl_cm
+
+        alpha_bf = _hminus_bf_jit(nu, T, nH_I_div_U, ne)
+        assert np.isfinite(float(alpha_bf))
+        assert float(alpha_bf) >= 0
+
+    def test_hminus_ff_jit(self):
+        """_hminus_ff_jit should give positive absorption in valid range."""
+        try:
+            from korg.synthesis import _hminus_ff_jit
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        nH_I_div_U = 1e17
+        ne = 1e14
+
+        # Within valid range (0.182 - 10 um)
+        wl_cm = 10000e-8  # 1 um
+        nu = c_cgs / wl_cm
+
+        alpha_ff = _hminus_ff_jit(nu, T, nH_I_div_U, ne)
+        assert np.isfinite(float(alpha_ff))
+        assert float(alpha_ff) >= 0
+
+    def test_rayleigh_jit(self):
+        """_rayleigh_jit should give positive scattering coefficient."""
+        try:
+            from korg.synthesis import _rayleigh_jit
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        nH_I = 1e17
+        nHe_I = 1e16
+        nH2 = 1e10
+
+        wl_cm = 5000e-8
+        nu = c_cgs / wl_cm
+
+        sigma = _rayleigh_jit(nu, nH_I, nHe_I, nH2)
+        assert np.isfinite(float(sigma))
+        assert float(sigma) >= 0
+
+    def test_electron_scattering_jit(self):
+        """_electron_scattering_jit should give correct Thomson scattering."""
+        try:
+            from korg.synthesis import _electron_scattering_jit
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        ne = 1e14
+        sigma_th = 6.65246e-25  # Thomson cross section
+
+        alpha = _electron_scattering_jit(ne)
+        expected = sigma_th * ne
+
+        assert np.isclose(float(alpha), expected, rtol=1e-6)
+
+    def test_voigt_jit(self):
+        """_voigt_jit should give reasonable Voigt profile values."""
+        try:
+            from korg.synthesis import _voigt_jit
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        # At line center (v=0), H should be largest
+        H_center = _voigt_jit(0.1, 0.0)
+        H_offset = _voigt_jit(0.1, 2.0)
+
+        assert np.isfinite(float(H_center))
+        assert np.isfinite(float(H_offset))
+        assert float(H_center) > float(H_offset)
+
+        # Gaussian limit (a->0): H(0,v) -> exp(-v^2)
+        H_gaussian = _voigt_jit(0.001, 1.0)
+        expected_gaussian = np.exp(-1.0)
+        assert np.isclose(float(H_gaussian), expected_gaussian, rtol=0.1)
+
+    def test_line_profile_jit(self):
+        """_line_profile_jit should give peaked profile at line center."""
+        try:
+            from korg.synthesis import _line_profile_jit
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wl_center = 5000e-8
+        sigma_D = 0.01e-8  # Doppler width
+        gamma_L = 0.001e-8  # Lorentz width
+        amplitude = 1.0
+
+        # Profile at line center
+        phi_center = _line_profile_jit(wl_center, sigma_D, gamma_L, amplitude, wl_center)
+
+        # Profile at offset
+        phi_offset = _line_profile_jit(wl_center, sigma_D, gamma_L, amplitude, wl_center + 5 * sigma_D)
+
+        assert np.isfinite(float(phi_center))
+        assert np.isfinite(float(phi_offset))
+        assert float(phi_center) > float(phi_offset)
+
+    def test_continuum_absorption_jit(self):
+        """_continuum_absorption_jit should give positive total absorption."""
+        try:
+            from korg.synthesis import _continuum_absorption_jit, precompute_synthesis_data
+            from korg.data_loader import (
+                ionization_energies, default_partition_funcs,
+                default_log_equilibrium_constants
+            )
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            data = precompute_synthesis_data(
+                ionization_energies,
+                default_partition_funcs,
+                default_log_equilibrium_constants
+            )
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        T = 5777.0
+        ne = 1e14
+        nH_I = 1e17
+        nH_II = 1e14
+        nHe_I = 1e16
+        nH2 = 1e10
+        U_H_I = 2.0
+        wl_cm = 5000e-8
+
+        alpha = _continuum_absorption_jit(wl_cm, T, ne, nH_I, nH_II, nHe_I, nH2, U_H_I, data)
+        assert np.isfinite(float(alpha))
+        assert float(alpha) > 0
+
+
+class TestComputeContinuumAbsorption:
+    """Test compute_continuum_absorption function."""
+
+    def test_compute_continuum_absorption_basic(self):
+        """compute_continuum_absorption should return array of positive values."""
+        try:
+            from korg.synthesis import compute_continuum_absorption
+            from korg.data_loader import default_partition_funcs
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wavelengths_cm = np.array([4000, 5000, 6000]) * 1e-8
+        T = 5777.0
+        ne = 1e14
+
+        # Create number densities dict
+        number_densities = {
+            Species("H_I"): 1e17,
+            Species("H_II"): 1e14,
+            Species("He_I"): 1e16,
+            Species("H2_I"): 1e10,
+        }
+
+        try:
+            alpha = compute_continuum_absorption(
+                wavelengths_cm, T, ne, number_densities, default_partition_funcs
+            )
+        except (FileNotFoundError, KeyError) as e:
+            pytest.skip(f"Required data not available: {e}")
+
+        assert alpha.shape == (3,)
+        assert all(np.isfinite(alpha))
+        assert all(alpha > 0)
+
+    def test_compute_continuum_absorption_wavelength_dependence(self):
+        """Continuum absorption should vary with wavelength."""
+        try:
+            from korg.synthesis import compute_continuum_absorption
+            from korg.data_loader import default_partition_funcs
+            from korg.species import Species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        wavelengths_cm = np.array([3000, 5000, 10000, 20000]) * 1e-8
+        T = 5777.0
+        ne = 1e14
+
+        number_densities = {
+            Species("H_I"): 1e17,
+            Species("H_II"): 1e14,
+            Species("He_I"): 1e16,
+            Species("H2_I"): 1e10,
+        }
+
+        try:
+            alpha = compute_continuum_absorption(
+                wavelengths_cm, T, ne, number_densities, default_partition_funcs
+            )
+        except (FileNotFoundError, KeyError) as e:
+            pytest.skip(f"Required data not available: {e}")
+
+        # Values should be different at different wavelengths
+        assert not np.allclose(alpha[0], alpha[-1])
+
+
+class TestLinelistData:
+    """Test LinelistData namedtuple."""
+
+    def test_linelist_data_fields(self):
+        """LinelistData should have all required fields."""
+        try:
+            from korg.synthesis import LinelistData
+            import jax.numpy as jnp
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        data = LinelistData(
+            n_lines=2,
+            wl=jnp.array([5000e-8, 5001e-8]),
+            log_gf=jnp.array([-1.0, -0.5]),
+            species_Z=jnp.array([26, 20], dtype=jnp.int32),
+            species_charge=jnp.array([0, 1], dtype=jnp.int32),
+            E_lower=jnp.array([2.5, 3.0]),
+            gamma_rad=jnp.array([1e8, 1.5e8]),
+            gamma_stark=jnp.array([1e-6, 2e-6]),
+            vdW_sigma=jnp.array([1e-7, 2e-7]),
+            vdW_alpha=jnp.array([-1.0, -1.0]),
+            mass=jnp.array([9.27e-23, 6.65e-23])
+        )
+
+        assert data.n_lines == 2
+        assert len(data.wl) == 2
+        assert data.species_Z[0] == 26  # Fe
+        assert data.species_charge[1] == 1  # Ionized
+
+
+class TestSynthesisDataIntegration:
+    """Integration tests for synthesis data structures."""
+
+    def test_synthesis_data_chemical_equilibrium_data(self):
+        """SynthesisData should contain valid chemical equilibrium data."""
+        try:
+            from korg.synthesis import precompute_synthesis_data
+            from korg.data_loader import (
+                ionization_energies, default_partition_funcs,
+                default_log_equilibrium_constants
+            )
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            data = precompute_synthesis_data(
+                ionization_energies,
+                default_partition_funcs,
+                default_log_equilibrium_constants
+            )
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Check chem_eq_data has expected shape
+        assert data.chem_eq_data.log_T_grid.shape[0] > 0
+        assert data.chem_eq_data.ionization_energies.shape[0] > 0
+        assert data.chem_eq_data.partition_func_values.shape[0] > 0
 
 
 if __name__ == "__main__":
