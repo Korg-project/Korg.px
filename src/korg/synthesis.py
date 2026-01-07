@@ -1406,6 +1406,10 @@ def synthesize_jit(
 
     def add_line_absorption(alpha):
         """Add line absorption to continuum opacity."""
+        # Handle empty linelist case
+        if n_lines == 0:
+            return alpha
+
         # For each line, add its contribution to all layers and wavelengths
         def process_line(alpha, line_idx):
             wl_center = linelist_data.wl[line_idx]
@@ -1479,12 +1483,8 @@ def synthesize_jit(
         alpha_final, _ = jax.lax.scan(process_line, alpha, jnp.arange(n_lines))
         return alpha_final
 
-    # Add lines if present
-    alpha_total = jnp.where(
-        n_lines > 0,
-        add_line_absorption(alpha_cntm_all),
-        alpha_cntm_all
-    )
+    # Add lines if present (function handles empty linelist internally)
+    alpha_total = add_line_absorption(alpha_cntm_all)
 
     # Solve radiative transfer
     from .radiative_transfer import radiative_transfer_jit
