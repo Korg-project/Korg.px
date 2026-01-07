@@ -508,4 +508,7 @@ def hydrogenic_ff_absorption(ν, T, Z, ni, ne):
     # Compute absorption coefficient with stimulated emission correction
     α = ni * ne * F_ν * (1 - np.exp(-hν_div_kT))
 
+    # Return scalar if input was scalar
+    if α.size == 1:
+        return float(α[0])
     return α

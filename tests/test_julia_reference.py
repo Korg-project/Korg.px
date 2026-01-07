@@ -19,6 +19,7 @@ from pathlib import Path
 import korg
 
 import jax
+from korg.synthesis import precompute_synthesis_data
 import numpy as np
 import pytest
 
@@ -3036,7 +3037,7 @@ class TestJITHelperFunctions:
     def test_gaunt_ff_jit(self):
         """_gaunt_ff_jit should return positive Gaunt factors."""
         try:
-            from korg.synthesis import _gaunt_ff_jit, precompute_synthesis_data
+            from korg.synthesis import _gaunt_ff_jit, load_synthesis_data, precompute_synthesis_data
             from korg.data_loader import (
                 ionization_energies, default_partition_funcs,
                 default_log_equilibrium_constants
@@ -3046,13 +3047,13 @@ class TestJITHelperFunctions:
             pytest.skip(f"Required modules not available: {e}")
 
         try:
+            data = load_synthesis_data()
+        except FileNotFoundError as e:
             data = precompute_synthesis_data(
                 ionization_energies,
                 default_partition_funcs,
                 default_log_equilibrium_constants
             )
-        except FileNotFoundError as e:
-            pytest.skip(f"Data files not found: {e}")
 
         T = 5777.0
         Z = 1
@@ -3066,7 +3067,7 @@ class TestJITHelperFunctions:
     def test_hydrogenic_ff_jit(self):
         """_hydrogenic_ff_jit should give positive absorption."""
         try:
-            from korg.synthesis import _hydrogenic_ff_jit, precompute_synthesis_data
+            from korg.synthesis import _hydrogenic_ff_jit, load_synthesis_data, precompute_synthesis_data
             from korg.data_loader import (
                 ionization_energies, default_partition_funcs,
                 default_log_equilibrium_constants
@@ -3076,13 +3077,13 @@ class TestJITHelperFunctions:
             pytest.skip(f"Required modules not available: {e}")
 
         try:
+            data = load_synthesis_data()
+        except FileNotFoundError as e:
             data = precompute_synthesis_data(
                 ionization_energies,
                 default_partition_funcs,
                 default_log_equilibrium_constants
             )
-        except FileNotFoundError as e:
-            pytest.skip(f"Data files not found: {e}")
 
         T = 5777.0
         Z = 1
@@ -3214,7 +3215,7 @@ class TestJITHelperFunctions:
     def test_continuum_absorption_jit(self):
         """_continuum_absorption_jit should give positive total absorption."""
         try:
-            from korg.synthesis import _continuum_absorption_jit, precompute_synthesis_data
+            from korg.synthesis import _continuum_absorption_jit, load_synthesis_data, precompute_synthesis_data
             from korg.data_loader import (
                 ionization_energies, default_partition_funcs,
                 default_log_equilibrium_constants
@@ -3223,13 +3224,13 @@ class TestJITHelperFunctions:
             pytest.skip(f"Required modules not available: {e}")
 
         try:
+            data = load_synthesis_data()
+        except FileNotFoundError as e:
             data = precompute_synthesis_data(
                 ionization_energies,
                 default_partition_funcs,
                 default_log_equilibrium_constants
             )
-        except FileNotFoundError as e:
-            pytest.skip(f"Data files not found: {e}")
 
         T = 5777.0
         ne = 1e14
@@ -3348,22 +3349,21 @@ class TestSynthesisDataIntegration:
     def test_synthesis_data_chemical_equilibrium_data(self):
         """SynthesisData should contain valid chemical equilibrium data."""
         try:
-            from korg.synthesis import precompute_synthesis_data
+            from korg.synthesis import precompute_synthesis_data, load_synthesis_data
             from korg.data_loader import (
                 ionization_energies, default_partition_funcs,
                 default_log_equilibrium_constants
             )
         except ImportError as e:
             pytest.skip(f"Required modules not available: {e}")
-
         try:
+            data = load_synthesis_data()
+        except FileNotFoundError as e:
             data = precompute_synthesis_data(
                 ionization_energies,
                 default_partition_funcs,
                 default_log_equilibrium_constants
             )
-        except FileNotFoundError as e:
-            pytest.skip(f"Data files not found: {e}")
 
         # Check chem_eq_data has expected shape
         assert data.chem_eq_data.log_T_grid.shape[0] > 0

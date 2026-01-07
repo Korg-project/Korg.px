@@ -26,12 +26,14 @@ from .species import Species, Formula
 
 # These imports may fail if data files are not available
 try:
-    from .synthesis import synthesize
+    from .synthesis import synthesize, load_synthesis_data, save_synthesis_data
     from .marcs_interpolation import interpolate_marcs
 except (ImportError, FileNotFoundError) as e:
     import warnings
     warnings.warn(f"Could not import synthesis functions: {e}")
     synthesize = None
+    load_synthesis_data = None
+    save_synthesis_data = None
     interpolate_marcs = None
 
 # Re-export commonly used constants
@@ -51,6 +53,8 @@ __all__ = [
     "format_A_X",
     "get_solar_abundances",
     "synthesize",
+    "load_synthesis_data",
+    "save_synthesis_data",
     "interpolate_marcs",
     # Key classes
     "Species",

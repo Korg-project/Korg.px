@@ -10,6 +10,7 @@ Reference: Korg.jl synthesize.jl
 import numpy as np
 import jax.numpy as jnp
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Callable, Union
 from scipy.interpolate import interp1d
 
@@ -811,6 +812,71 @@ def precompute_synthesis_data(
         gaunt_log_gamma2_grid=gaunt_log_gamma2_grid,
         gaunt_table=gaunt_table
     )
+
+
+def save_synthesis_data(data: SynthesisData, path: str) -> None:
+    """
+    Save precomputed synthesis data to .npz file.
+
+    Parameters
+    ----------
+    data : SynthesisData
+        Pre-computed synthesis data from precompute_synthesis_data()
+    path : str
+        Path to save the .npz file
+    """
+    np.savez_compressed(
+        path,
+        # ChemicalEquilibriumData
+        log_T_grid=np.asarray(data.chem_eq_data.log_T_grid),
+        ionization_energies=np.asarray(data.chem_eq_data.ionization_energies),
+        partition_func_values=np.asarray(data.chem_eq_data.partition_func_values),
+        n_molecules=data.chem_eq_data.n_molecules,
+        mol_atoms_array=np.asarray(data.chem_eq_data.mol_atoms_array),
+        mol_charges=np.asarray(data.chem_eq_data.mol_charges),
+        mol_n_atoms=np.asarray(data.chem_eq_data.mol_n_atoms),
+        mol_log_K_values=np.asarray(data.chem_eq_data.mol_log_K_values),
+        # Gaunt factor tables
+        gaunt_log_u_grid=np.asarray(data.gaunt_log_u_grid),
+        gaunt_log_gamma2_grid=np.asarray(data.gaunt_log_gamma2_grid),
+        gaunt_table=np.asarray(data.gaunt_table),
+    )
+
+
+def load_synthesis_data(path: Optional[str] = None) -> SynthesisData:
+    """
+    Load precomputed synthesis data from .npz file.
+
+    Parameters
+    ----------
+    path : str, optional
+        Path to the .npz file. If None, loads from package data.
+
+    Returns
+    -------
+    SynthesisData
+        Pre-computed data structure ready for JIT-compiled synthesis.
+    """
+    if path is None:
+        path = Path(__file__).parent / "data" / "synthesis_data.npz"
+
+    with np.load(path) as f:
+        chem_eq_data = ChemicalEquilibriumData(
+            log_T_grid=jnp.array(f['log_T_grid']),
+            ionization_energies=jnp.array(f['ionization_energies']),
+            partition_func_values=jnp.array(f['partition_func_values']),
+            n_molecules=int(f['n_molecules']),
+            mol_atoms_array=jnp.array(f['mol_atoms_array']),
+            mol_charges=jnp.array(f['mol_charges']),
+            mol_n_atoms=jnp.array(f['mol_n_atoms']),
+            mol_log_K_values=jnp.array(f['mol_log_K_values']),
+        )
+        return SynthesisData(
+            chem_eq_data=chem_eq_data,
+            gaunt_log_u_grid=jnp.array(f['gaunt_log_u_grid']),
+            gaunt_log_gamma2_grid=jnp.array(f['gaunt_log_gamma2_grid']),
+            gaunt_table=jnp.array(f['gaunt_table']),
+        )
 
 
 def preprocess_linelist(linelist: List[Line]) -> LinelistData:
