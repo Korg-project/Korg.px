@@ -7,9 +7,10 @@ This module implements hydrogen line absorption including:
 - MHD occupation probabilities
 """
 
+import jax
 import jax.numpy as jnp
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, List
 from jax.scipy.signal import convolve
 
 from .constants import (
@@ -20,6 +21,109 @@ from .constants import (
 from .line_absorption import sigma_line, doppler_width, scaled_vdW
 from .atomic_data import atomic_masses
 from .hydrogen_stark_data import hline_stark_profiles
+
+
+def _interp_linear_2d_jax(x: float, y: float,
+                          x_grid: jnp.ndarray, y_grid: jnp.ndarray,
+                          values: jnp.ndarray) -> float:
+    """
+    JAX-compatible 2D linear interpolation.
+
+    Args:
+        x, y: Query points
+        x_grid: 1D array of x grid points (sorted)
+        y_grid: 1D array of y grid points (sorted)
+        values: 2D array of shape (len(x_grid), len(y_grid))
+
+    Returns:
+        Interpolated value at (x, y)
+    """
+    # Find indices
+    ix = jnp.searchsorted(x_grid, x) - 1
+    iy = jnp.searchsorted(y_grid, y) - 1
+
+    # Clip to valid range
+    ix = jnp.clip(ix, 0, len(x_grid) - 2)
+    iy = jnp.clip(iy, 0, len(y_grid) - 2)
+
+    # Get surrounding grid points
+    x0, x1 = x_grid[ix], x_grid[ix + 1]
+    y0, y1 = y_grid[iy], y_grid[iy + 1]
+
+    # Compute weights
+    wx = (x - x0) / (x1 - x0)
+    wy = (y - y0) / (y1 - y0)
+
+    # Bilinear interpolation
+    v00 = values[ix, iy]
+    v01 = values[ix, iy + 1]
+    v10 = values[ix + 1, iy]
+    v11 = values[ix + 1, iy + 1]
+
+    result = ((1 - wx) * (1 - wy) * v00 +
+              (1 - wx) * wy * v01 +
+              wx * (1 - wy) * v10 +
+              wx * wy * v11)
+
+    return result
+
+
+def _interp_linear_3d_jax(x: float, y: float, z: float,
+                          x_grid: jnp.ndarray, y_grid: jnp.ndarray, z_grid: jnp.ndarray,
+                          values: jnp.ndarray) -> float:
+    """
+    JAX-compatible 3D linear interpolation.
+
+    Args:
+        x, y, z: Query points
+        x_grid: 1D array of x grid points (sorted)
+        y_grid: 1D array of y grid points (sorted)
+        z_grid: 1D array of z grid points (sorted)
+        values: 3D array of shape (len(x_grid), len(y_grid), len(z_grid))
+
+    Returns:
+        Interpolated value at (x, y, z)
+    """
+    # Find indices
+    ix = jnp.searchsorted(x_grid, x) - 1
+    iy = jnp.searchsorted(y_grid, y) - 1
+    iz = jnp.searchsorted(z_grid, z) - 1
+
+    # Clip to valid range
+    ix = jnp.clip(ix, 0, len(x_grid) - 2)
+    iy = jnp.clip(iy, 0, len(y_grid) - 2)
+    iz = jnp.clip(iz, 0, len(z_grid) - 2)
+
+    # Get surrounding grid points
+    x0, x1 = x_grid[ix], x_grid[ix + 1]
+    y0, y1 = y_grid[iy], y_grid[iy + 1]
+    z0, z1 = z_grid[iz], z_grid[iz + 1]
+
+    # Compute weights
+    wx = (x - x0) / (x1 - x0)
+    wy = (y - y0) / (y1 - y0)
+    wz = (z - z0) / (z1 - z0)
+
+    # Trilinear interpolation
+    v000 = values[ix, iy, iz]
+    v001 = values[ix, iy, iz + 1]
+    v010 = values[ix, iy + 1, iz]
+    v011 = values[ix, iy + 1, iz + 1]
+    v100 = values[ix + 1, iy, iz]
+    v101 = values[ix + 1, iy, iz + 1]
+    v110 = values[ix + 1, iy + 1, iz]
+    v111 = values[ix + 1, iy + 1, iz + 1]
+
+    result = ((1 - wx) * (1 - wy) * (1 - wz) * v000 +
+              (1 - wx) * (1 - wy) * wz * v001 +
+              (1 - wx) * wy * (1 - wz) * v010 +
+              (1 - wx) * wy * wz * v011 +
+              wx * (1 - wy) * (1 - wz) * v100 +
+              wx * (1 - wy) * wz * v101 +
+              wx * wy * (1 - wz) * v110 +
+              wx * wy * wz * v111)
+
+    return result
 
 
 def normal_pdf(delta: float, sigma: float) -> float:
@@ -133,6 +237,8 @@ def greim_1960_Knm(n: int, m: int) -> float:
     K_nm = C_nm 2π c / λ² where C_nm F = Δω and F is the ion field.
     See Griem 1960 EQs 7 and 12. This works out to K_nm = λ/F.
 
+    JAX-compatible version using jnp.where.
+
     Args:
         n: Lower level quantum number
         m: Upper level quantum number
@@ -140,13 +246,17 @@ def greim_1960_Knm(n: int, m: int) -> float:
     Returns:
         Knm constant
     """
-    if (m - n <= 3) and (n <= 4):
-        # Julia is 1-indexed, Python is 0-indexed
-        return float(_GREIM_KMN_TABLE[m - n - 1, n - 1])
-    else:
-        # Griem 1960 equation 33 (a=n, b=m, Z=1)
-        # 1 / (1 + 0.13/(m-n)) is probably a Kurucz addition.
-        return 5.5e-5 * n**4 * m**4 / (m**2 - n**2) / (1 + 0.13 / (m - n))
+    # Table lookup value (for m-n <= 3 and n <= 4)
+    # Julia is 1-indexed, Python is 0-indexed
+    table_value = _GREIM_KMN_TABLE[jnp.minimum(m - n - 1, 2), jnp.minimum(n - 1, 3)]
+
+    # Analytical formula (Griem 1960 equation 33)
+    # 1 / (1 + 0.13/(m-n)) is probably a Kurucz addition.
+    analytical_value = 5.5e-5 * n**4 * m**4 / (m**2 - n**2) / (1 + 0.13 / (m - n))
+
+    # Use table if (m - n <= 3) and (n <= 4), otherwise use formula
+    use_table = (m - n <= 3) & (n <= 4)
+    return jnp.where(use_table, table_value, analytical_value)
 
 
 # Holtsmark profile constants
@@ -325,6 +435,8 @@ def brackett_line_stark_profiles(m: int, wavelengths: np.ndarray, wavelength_cen
     Ions and distant electrons have E fields which can be treated quasi-statically,
     leading to Holtsmark broadening.
 
+    JAX-compatible version using vectorized operations and jnp.where.
+
     Args:
         m: Upper level of the transition
         wavelengths: Wavelengths at which to calculate profile [cm]
@@ -347,7 +459,8 @@ def brackett_line_stark_profiles(m: int, wavelengths: np.ndarray, wavelength_cen
 
     Knm = greim_1960_Knm(n, m)
 
-    Y1WHT = 1e14 if m - n <= 3 else 1e13
+    # Use jnp.where for conditional assignment
+    Y1WHT = jnp.where(m - n <= 3, 1e14, 1e13)
     WTY1 = 1 / (1 + ne / Y1WHT)
     Y1B = 2 / (1 + 0.012 / T * jnp.sqrt(ne / T))
     C1CON = Knm / wavelength_center * (m**2 - n**2)**2 / (n**2 * m**2) * 1e-8
@@ -366,35 +479,31 @@ def brackett_line_stark_profiles(m: int, wavelengths: np.ndarray, wavelength_cen
 
     G1 = 6.77 * jnp.sqrt(C1)
 
-    # Calculate impact electron profile (called F in Kurucz)
-    def calc_impact_profile(y1_val, y2_val, beta_val):
-        # Width of the electron impact profile (called GAM in Kurucz)
-        if (y2_val <= 1e-4) and (y1_val <= 1e-5):
-            width = G1 * max(0, 0.2114 + jnp.log(jnp.sqrt(C2) / C1)) * (1 - GCON1 - GCON2)
-        else:
-            GAM = (G1 *
-                   (0.5 * jnp.exp(-min(80, y1_val)) + exponential_integral_1(y1_val) -
-                    0.5 * exponential_integral_1(y2_val)) *
-                   (1 - GCON1 / (1 + (90 * y1_val)**3) - GCON2 / (1 + 2000 * y1_val)))
-            width = 0.0 if GAM <= 1e-20 else GAM
+    # Calculate impact electron profile (called F in Kurucz) - vectorized with jnp.where
+    # Width of the electron impact profile (called GAM in Kurucz)
+    # Branch 1: (y2 <= 1e-4) and (y1 <= 1e-5)
+    width_simple = G1 * jnp.maximum(0, 0.2114 + jnp.log(jnp.sqrt(C2) / C1)) * (1 - GCON1 - GCON2)
 
-        if width > 0:
-            return width / (jnp.pi * (width**2 + beta_val**2))  # Lorentz density
-        else:
-            return 0.0
+    # Branch 2: else
+    GAM = (G1 *
+           (0.5 * jnp.exp(-jnp.minimum(80, y1)) + jax.vmap(exponential_integral_1)(y1) -
+            0.5 * jax.vmap(exponential_integral_1)(y2)) *
+           (1 - GCON1 / (1 + (90 * y1)**3) - GCON2 / (1 + 2000 * y1)))
+    width_complex = jnp.where(GAM <= 1e-20, 0.0, GAM)
 
-    # Vectorized calculation
-    impact_electron_profile = jnp.array([
-        calc_impact_profile(y1[i], y2[i], betas[i])
-        for i in range(len(wavelengths))
-    ])
+    # Select width based on condition
+    width = jnp.where((y2 <= 1e-4) & (y1 <= 1e-5), width_simple, width_complex)
 
-    # Quasistatic ion contribution
+    # Calculate impact profile using jnp.where
+    impact_electron_profile = jnp.where(
+        width > 0,
+        width / (jnp.pi * (width**2 + betas**2)),  # Lorentz density
+        0.0
+    )
+
+    # Quasistatic ion contribution - vectorized
     shielding_parameter = ne_1_6 * 0.08989 / jnp.sqrt(T)  # Called PP in Kurucz
-    quasistatic_ion_contribution = jnp.array([
-        holtsmark_profile(beta, shielding_parameter)
-        for beta in betas
-    ])
+    quasistatic_ion_contribution = jax.vmap(lambda beta: holtsmark_profile(beta, shielding_parameter))(betas)
 
     # Quasistatic electron contribution
     # Fit to (sqrt(π) - 2*gamma(3/2, y1))/sqrt(π) from HLINOP/Kurucz
@@ -402,7 +511,7 @@ def brackett_line_stark_profiles(m: int, wavelengths: np.ndarray, wavelength_cen
     ps = (0.9 * y1)**2
     quasistatic_e_contrib = (ps + 0.03 * jnp.sqrt(y1)) / (ps + 1.0)
     # Fix potential NaNs from 0/0
-    quasistatic_e_contrib = jnp.where(quasistatic_e_contrib == 0, 0.0, quasistatic_e_contrib)
+    quasistatic_e_contrib = jnp.where(jnp.isnan(quasistatic_e_contrib), 0.0, quasistatic_e_contrib)
 
     total_quasistatic_profile = quasistatic_ion_contribution * (1 + quasistatic_e_contrib)
 
@@ -417,15 +526,13 @@ def brackett_line_stark_profiles(m: int, wavelengths: np.ndarray, wavelength_cen
     # The red wing is multiplied by the Boltzmann factor to roughly account
     # for quantum effects (Stehle 1994, A&AS 104, 509 eqn 7)
     # Assume absorption case
-    # Julia: i = findlast(νs .< ν₀); profile[begin:i] .*= exp(...)
-    # Since νs is sorted in descending order, findlast returns the last (rightmost) index
-    # where ν < ν₀. This applies the Boltzmann factor to elements from beginning to that index.
-    i = jnp.where(nus < nu_0)[0]
-    if len(i) > 0:
-        last_red_wing_idx = int(i[-1])  # Last index where nus < nu_0
-        boltzmann_factor = jnp.exp((hplanck_cgs * (nus[:last_red_wing_idx+1] - nu_0)) / kboltz_cgs / T)
-        impact_electron_profile = impact_electron_profile.at[:last_red_wing_idx+1].multiply(boltzmann_factor)
-        total_quasistatic_profile = total_quasistatic_profile.at[:last_red_wing_idx+1].multiply(boltzmann_factor)
+    # Apply Boltzmann factor to red wing (where ν < ν₀) using masking
+    red_wing_mask = nus < nu_0
+    boltzmann_factor = jnp.exp((hplanck_cgs * (nus - nu_0)) / kboltz_cgs / T)
+    boltzmann_factor = jnp.where(red_wing_mask, boltzmann_factor, 1.0)
+
+    impact_electron_profile = impact_electron_profile * boltzmann_factor
+    total_quasistatic_profile = total_quasistatic_profile * boltzmann_factor
 
     # Apply scaling by dβ/dλ
     impact_electron_profile = impact_electron_profile * dβ_dλ
