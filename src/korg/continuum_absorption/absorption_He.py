@@ -15,6 +15,7 @@ Reference: Korg.jl ContinuumAbsorption/absorption_He.jl
 """
 
 import numpy as np
+import jax.numpy as jnp
 from scipy.interpolate import RegularGridInterpolator
 
 from ..constants import c_cgs, kboltz_cgs, kboltz_eV
@@ -54,7 +55,7 @@ def ndens_state_He_I(n: int, nsdens_div_partition: float, T: float) -> float:
     else:
         raise ValueError(f"Unknown excited state properties for He I: n={n}")
 
-    return nsdens_div_partition * g_n * np.exp(-energy_level / (kboltz_eV * T))
+    return nsdens_div_partition * g_n * jnp.exp(-energy_level / (kboltz_eV * T))
 
 
 # OCR'd from John (1994) https://ui.adsabs.harvard.edu/abs/1994MNRAS.269..871J
