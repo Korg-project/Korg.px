@@ -258,10 +258,15 @@ Each function has three checkboxes:
 
 | Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
 |-------|----------|------|-----------|-----------------|--------------|
-| 4 | `hydrogen_line_absorption!(...)` | H line profiles | ✓ | ✓ | |
+| 4 | `hydrogen_line_absorption(...)` | H line profiles (Stehlé + Brackett) | ✓ | ✓ | (partial) |
+| 4 | `brackett_line_stark_profiles(...)` | Brackett Stark profiles | ✓ | ✓ | ✓ |
+| 4 | `bracket_line_interpolator(...)` | Brackett profile interpolator | ✓ | ✓ | ✓ |
 | 4 | `brackett_oscillator_strength(n, m)` | Brackett f-values | ✓ | ✓ | ✓ |
 | 4 | `hummer_mihalas_w(...)` | occupation probability | ✓ | ✓ | ✓ |
 | 4 | `holtsmark_profile(beta, P)` | Holtsmark profile | ✓ | ✓ | ✓ |
+| 4 | `greim_1960_Knm(n, m)` | Griem Knm constants | ✓ | ✓ | ✓ |
+| 4 | `_interp_linear_2d_jax(...)` | 2D linear interpolation | ✓ | ✓ | ✓ |
+| 4 | `_interp_linear_3d_jax(...)` | 3D linear interpolation | ✓ | ✓ | ✓ |
 
 ---
 
@@ -331,9 +336,10 @@ Notes:
 
 ## Test Results Summary
 
-Tests run against Julia reference data (`tests/test_julia_reference.py`, `tests/test_atmosphere.py`, `tests/test_radiative_transfer.py`, and `tests/test_line_absorption_jit.py`):
-- **178 passed** (matching Julia to better than 1e-6 precision, or 1% for E2 approximation)
+Tests run against Julia reference data and JIT compatibility (`tests/test_julia_reference.py`, `tests/test_atmosphere.py`, `tests/test_radiative_transfer.py`, `tests/test_line_absorption_jit.py`, and `tests/test_hydrogen_line_absorption_jit.py`):
+- **188 passed** (matching Julia to better than 1e-6 precision, or 1% for E2 approximation)
   - Includes 20 line_absorption tests with full JIT compatibility testing
+  - Includes 10 new hydrogen_line_absorption tests with full JIT compatibility testing
 - **14 skipped** (3 legacy tests using from_string API, 2 metal bf tests skipped due to missing data file, 1 VALD parser test requires pandas, 6 interpolate_marcs tests skipped due to missing MARCS data, 2 chemical equilibrium reference tests skipped due to solver issues in Julia)
 
 ### Level 0 Passed Tests (all at rtol=1e-6):
