@@ -16,196 +16,291 @@ Each function has three checkboxes:
 ## Level 0: Constants (No Dependencies)
 
 ### Physical Constants (`constants.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `c_cgs` - speed of light in cm/s
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `hplanck_cgs` - Planck constant in erg*s
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `hplanck_eV` - Planck constant in eV*s
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `kboltz_cgs` - Boltzmann constant in erg/K
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `kboltz_eV` - Boltzmann constant in eV/K
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `electron_mass_cgs` - electron mass in g
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `electron_charge_cgs` - electron charge in esu
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `amu_cgs` - atomic mass unit in g
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `Rydberg_eV` - Rydberg energy in eV
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 0 | `c_cgs` | speed of light in cm/s | ✓ | ✓ | ✓ |
+| 0 | `hplanck_cgs` | Planck constant in erg*s | ✓ | ✓ | ✓ |
+| 0 | `hplanck_eV` | Planck constant in eV*s | ✓ | ✓ | ✓ |
+| 0 | `kboltz_cgs` | Boltzmann constant in erg/K | ✓ | ✓ | ✓ |
+| 0 | `kboltz_eV` | Boltzmann constant in eV/K | ✓ | ✓ | ✓ |
+| 0 | `electron_mass_cgs` | electron mass in g | ✓ | ✓ | ✓ |
+| 0 | `electron_charge_cgs` | electron charge in esu | ✓ | ✓ | ✓ |
+| 0 | `amu_cgs` | atomic mass unit in g | ✓ | ✓ | ✓ |
+| 0 | `Rydberg_eV` | Rydberg energy in eV | ✓ | ✓ | ✓ |
 
 ### Atomic Data (`atomic_data.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `atomic_symbols` - Z -> symbol mapping (92 elements)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `atomic_numbers` - symbol -> Z mapping
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `atomic_masses` - Z -> mass mapping (92 elements)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `ionization_energies` - Z -> [χ₁, χ₂, χ₃] in eV (all 92 elements, 3 levels each)
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 0 | `atomic_symbols` | Z -> symbol mapping (92 elements) | ✓ | ✓ | ✓ |
+| 0 | `atomic_numbers` | symbol -> Z mapping | ✓ | ✓ | ✓ |
+| 0 | `atomic_masses` | Z -> mass mapping (92 elements) | ✓ | ✓ | ✓ |
+| 0 | `ionization_energies` | Z -> [χ₁, χ₂, χ₃] in eV (all 92 elements, 3 levels each) | ✓ | ✓ | ✓ |
 
 ### Solar Abundances (`atomic_data.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `grevesse_2007_solar_abundances` (92 elements)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `asplund_2009_solar_abundances` (92 elements)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `asplund_2020_solar_abundances` (92 elements)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `bergemann_2025_solar_abundances` (92 elements)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `default_solar_abundances` (= bergemann_2025)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `magg_2022_solar_abundances` (92 elements)
-- [x] Converted | N/A | N/A | `DEFAULT_ALPHA_ELEMENTS` (in abundances.py) - not exported by Julia, Python uses standard definition
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 0 | `grevesse_2007_solar_abundances` | 92 elements | ✓ | ✓ | ✓ |
+| 0 | `asplund_2009_solar_abundances` | 92 elements | ✓ | ✓ | ✓ |
+| 0 | `asplund_2020_solar_abundances` | 92 elements | ✓ | ✓ | ✓ |
+| 0 | `bergemann_2025_solar_abundances` | 92 elements | ✓ | ✓ | ✓ |
+| 0 | `default_solar_abundances` | = bergemann_2025 | ✓ | ✓ | ✓ |
+| 0 | `magg_2022_solar_abundances` | 92 elements | ✓ | ✓ | ✓ |
+| 0 | `DEFAULT_ALPHA_ELEMENTS` | in abundances.py - not exported by Julia, Python uses standard definition | ✓ | N/A | N/A |
 
 ### Isotopic Data (`isotopic_data.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `isotopic_abundances` (Z=1-92)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `isotopic_nuclear_spin_degeneracies` (Z=1-92)
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 0 | `isotopic_abundances` | Z=1-92 | ✓ | ✓ | ✓ |
+| 0 | `isotopic_nuclear_spin_degeneracies` | Z=1-92 | ✓ | ✓ | ✓ |
 
 ---
 
 ## Level 1: Simple Utility Functions (Constants Only)
 
 ### Wavelength Utilities (`utils.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `air_to_vacuum(λ)` - air to vacuum wavelength
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `vacuum_to_air(λ)` - vacuum to air wavelength
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 1 | `air_to_vacuum(λ)` | air to vacuum wavelength | ✓ | ✓ | ✓ |
+| 1 | `vacuum_to_air(λ)` | vacuum to air wavelength | ✓ | ✓ | ✓ |
 
 ### Scattering (`continuum_absorption/scattering.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `electron_scattering(nₑ)` - Thomson scattering
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 1 | `electron_scattering(nₑ)` | Thomson scattering | ✓ | ✓ | ✓ |
 
 ### Line Physics (`line_absorption.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `sigma_line(λ)` - cross-section factor
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `doppler_width(λ₀, T, m, ξ)` - Doppler broadening σ
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `scaled_stark(γstark, T)` - temperature-scaled Stark
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 1 | `sigma_line(λ)` | cross-section factor | ✓ | ✓ | ✓ |
+| 1 | `doppler_width(λ₀, T, m, ξ)` | Doppler broadening σ | ✓ | ✓ | ✓ |
+| 1 | `scaled_stark(γstark, T)` | temperature-scaled Stark | ✓ | ✓ | ✓ |
 
 ### Exponential Integrals (`radiative_transfer/expint.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `exponential_integral_1(x)` - E₁(x) approximation
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 1 | `exponential_integral_1(x)` | E₁(x) approximation | ✓ | ✓ | ✓ |
 
 ### Statistical Mechanics (`statmech.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `translational_U(m, T)` - translational partition function
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 1 | `translational_U(m, T)` | translational partition function | ✓ | ✓ | ✓ |
 
 ### Interval Utilities (`utils.py`)
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `Interval` class - exclusive interval
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `closed_interval(lo, up)` - inclusive interval
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `contained(value, interval)` - check containment
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `contained_slice(vals, interval)` - slice indices
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 1 | `Interval` class | exclusive interval | ✓ | ✓ | N/A (class) |
+| 1 | `closed_interval(lo, up)` | inclusive interval | ✓ | ✓ | N/A (class) |
+| 1 | `contained(value, interval)` | check containment | ✓ | ✓ | N/A (class) |
+| 1 | `contained_slice(vals, interval)` | slice indices | ✓ | ✓ | N/A (class) |
 
 ### LSF Utilities (`utils.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `normal_pdf(Δ, σ)` - Gaussian PDF
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 1 | `normal_pdf(Δ, σ)` | Gaussian PDF | ✓ | ✓ | ✓ |
 
 ---
 
 ## Level 2: Functions with Simple Dependencies
 
 ### Species and Formula (`species.py`)
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `Formula` class - chemical formula representation
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `Species` class - species with charge
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `n_atoms(species)` - count atoms in molecule
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `get_atoms(formula)` - get atomic numbers
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `get_mass(species)` - get species mass
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `ismolecule(species)` - check if molecule
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 2 | `Formula` class | chemical formula representation | ✓ | ✓ | N/A (class) |
+| 2 | `Species` class | species with charge | ✓ | ✓ | N/A (class) |
+| 2 | `n_atoms(species)` | count atoms in molecule | ✓ | ✓ | N/A (class) |
+| 2 | `get_atoms(formula)` | get atomic numbers | ✓ | ✓ | N/A (class) |
+| 2 | `get_mass(species)` | get species mass | ✓ | ✓ | N/A (class) |
+| 2 | `ismolecule(species)` | check if molecule | ✓ | ✓ | N/A (class) |
 
 ### Voigt Profile (`line_profiles.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `harris_series(v)` - Harris series for Voigt
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `voigt_hjerting(α, v)` - Voigt-Hjerting function
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `line_profile(λ₀, σ, γ, amplitude, λ)` - Voigt profile
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 2 | `harris_series(v)` | Harris series for Voigt | ✓ | ✓ | ✓ |
+| 2 | `voigt_hjerting(α, v)` | Voigt-Hjerting function | ✓ | ✓ | ✓ |
+| 2 | `line_profile(λ₀, σ, γ, amplitude, λ)` | Voigt profile | ✓ | ✓ | ✓ |
 
 ### Line Window Functions (`line_profiles.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `inverse_gaussian_density(ρ, σ)` - inverse Gaussian
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `inverse_lorentz_density(ρ, γ)` - inverse Lorentz
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 2 | `inverse_gaussian_density(ρ, σ)` | inverse Gaussian | ✓ | ✓ | ✓ |
+| 2 | `inverse_lorentz_density(ρ, γ)` | inverse Lorentz | ✓ | ✓ | ✓ |
 
 ### VdW Broadening (`line_absorption.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `scaled_vdW(vdW, m, T)` - van der Waals broadening (both simple and ABO modes)
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 2 | `scaled_vdW(vdW, m, T)` | van der Waals broadening (both simple and ABO modes) | ✓ | ✓ | ✓ |
 
 ### Scattering (`continuum_absorption/scattering.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `rayleigh(νs, nH_I, nHe_I, nH2)` - Rayleigh scattering
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 2 | `rayleigh(νs, nH_I, nHe_I, nH2)` | Rayleigh scattering | ✓ | ✓ | ✓ |
 
 ### Gaunt Factors (`continuum_absorption/hydrogenic_bf_ff.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `gaunt_ff_vanHoof(log_u, log_γ2)` - ff Gaunt factor (scipy version)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `gaunt_ff_vanHoof_jax(...)` - ff Gaunt factor (JAX version)
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 2 | `gaunt_ff_vanHoof(log_u, log_γ2)` | ff Gaunt factor (scipy version) | ✓ | ✓ | ✓ |
+| 2 | `gaunt_ff_vanHoof_jax(...)` | ff Gaunt factor (JAX version) | ✓ | ✓ | ✓ |
 
 ### Hydrogenic Absorption (`continuum_absorption/hydrogenic_bf_ff.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `hydrogenic_ff_absorption(ν, T, Z, ni, ne)` - hydrogenic ff (scipy version)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `hydrogenic_ff_absorption_jax(...)` - hydrogenic ff (JAX version)
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 2 | `hydrogenic_ff_absorption(ν, T, Z, ni, ne)` | hydrogenic ff (scipy version) | ✓ | ✓ | ✓ |
+| 2 | `hydrogenic_ff_absorption_jax(...)` | hydrogenic ff (JAX version) | ✓ | ✓ | ✓ |
 
 ---
 
 ## Level 3: Intermediate Complexity
 
 ### Cubic Splines (`cubic_splines.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `CubicSpline` class - natural cubic spline
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `evaluate(spline, x)` - evaluate spline at x (via __call__)
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 3 | `CubicSpline` class | natural cubic spline | ✓ | ✓ | ✓ |
+| 3 | `evaluate(spline, x)` | evaluate spline at x (via __call__) | ✓ | ✓ | ✓ |
 
 ### Wavelengths (`wavelengths.py`)
-- [x] Converted | [x] Tested (no JIT) | N/A | `Wavelengths` class - wavelength grid handling
-- [x] Converted | [x] Tested (no JIT) | N/A | `eachwindow(wls)` - iterate wavelength windows
-- [x] Converted | [x] Tested (no JIT) | N/A | `eachfreq(wls)` - get frequencies
-- [x] Converted | [x] Tested (no JIT) | N/A | `subspectrum_indices(wls)` - get subspectrum indices
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 3 | `Wavelengths` class | wavelength grid handling | ✓ | ✓ | N/A |
+| 3 | `eachwindow(wls)` | iterate wavelength windows | ✓ | ✓ | N/A |
+| 3 | `eachfreq(wls)` | get frequencies | ✓ | ✓ | N/A |
+| 3 | `subspectrum_indices(wls)` | get subspectrum indices | ✓ | ✓ | N/A |
 
 ### Abundances (`abundances.py`)
-- [x] Converted | [x] Tested (no JIT) | N/A | `format_A_X(metals, alpha, abundances)` - format abundances
-- [x] Converted | [x] Tested (no JIT) | N/A | `get_metals_H(A_X)` - calculate [metals/H]
-- [x] Converted | [x] Tested (no JIT) | N/A | `get_alpha_H(A_X)` - calculate [α/H]
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 3 | `format_A_X(metals, alpha, abundances)` | format abundances | ✓ | ✓ | N/A |
+| 3 | `get_metals_H(A_X)` | calculate [metals/H] | ✓ | ✓ | N/A |
+| 3 | `get_alpha_H(A_X)` | calculate [α/H] | ✓ | ✓ | N/A |
 
 ### Saha Equation (`statmech.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `saha_ion_weights(T, nₑ, atom, ...)` - ionization ratios
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `get_log_nK(mol, T, ...)` - molecular equilibrium constant
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 3 | `saha_ion_weights(T, nₑ, atom, ...)` | ionization ratios | ✓ | ✓ | ✓ |
+| 3 | `get_log_nK(mol, T, ...)` | molecular equilibrium constant | ✓ | ✓ | ✓ |
 
 ### Exponential Integrals (`radiative_transfer/expint.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `exponential_integral_2(x)` - E₂(x) approximation
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `expint_transfer_integral_core(τ, m, b)` - transfer integral
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 3 | `exponential_integral_2(x)` | E₂(x) approximation | ✓ | ✓ | ✓ |
+| 3 | `expint_transfer_integral_core(τ, m, b)` | transfer integral | ✓ | ✓ | ✓ |
 
 ### Continuum Absorption Sources (`continuum_absorption/`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `H_I_bf(...)` - H I bound-free
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `Hminus_bf(...)` - H⁻ bound-free
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `Hminus_ff(...)` - H⁻ free-free
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `H2plus_bf_and_ff(...)` - H₂⁺ absorption
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `Heminus_ff(...)` - He⁻ free-free
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `ndens_state_He_I(...)` - He I level populations
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `positive_ion_ff_absorption!(...)` - metal ff
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `metal_bf_absorption!(...)` - metal bf
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 3 | `H_I_bf(...)` | H I bound-free | ✓ | ✓ | ✓ |
+| 3 | `Hminus_bf(...)` | H⁻ bound-free | ✓ | ✓ | ✓ |
+| 3 | `Hminus_ff(...)` | H⁻ free-free | ✓ | ✓ | ✓ |
+| 3 | `H2plus_bf_and_ff(...)` | H₂⁺ absorption | ✓ | ✓ | ✓ |
+| 3 | `Heminus_ff(...)` | He⁻ free-free | ✓ | ✓ | ✓ |
+| 3 | `ndens_state_He_I(...)` | He I level populations | ✓ | ✓ | ✓ |
+| 3 | `positive_ion_ff_absorption!(...)` | metal ff | ✓ | ✓ | ✓ |
+| 3 | `metal_bf_absorption!(...)` | metal bf | ✓ | ✓ | ✓ |
 
 ---
 
 ## Level 4: High-Level Functions
 
 ### Chemical Equilibrium (`statmech.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `chemical_equilibrium(T, nₜ, nₑ, ...)` - solve equilibrium (JIT via chemical_equilibrium_jit)
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 4 | `chemical_equilibrium(T, nₜ, nₑ, ...)` | solve equilibrium (JIT via chemical_equilibrium_jit) | ✓ | ✓ | ✓ |
 
 ### Total Continuum (`continuum.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `total_continuum_absorption(νs, T, nₑ, ...)` - total α
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 4 | `total_continuum_absorption(νs, T, nₑ, ...)` | total α | ✓ | ✓ | ✓ |
 
 ### Line Absorption (`line_absorption.py`)
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `line_absorption(linelist, λs, ...)` - compute line opacity
-  - **Implementation**: Fully JIT-compatible via `line_absorption_core()` with `use_jit=True` by default
-  - **Key features**: Uses `jax.lax.fori_loop` for line iteration, masking instead of dynamic slicing
-  - **Helper functions**: All JIT-compatible (`doppler_width`, `scaled_stark`, `scaled_vdW`, `line_profile`, etc.)
-  - **Testing**: 20 tests pass including end-to-end synthesis-like JIT compilation test
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 4 | `line_absorption(linelist, λs, ...)` | compute line opacity. Implementation: Fully JIT-compatible via `line_absorption_core()` with `use_jit=True` by default. Key features: Uses `jax.lax.fori_loop` for line iteration, masking instead of dynamic slicing. Helper functions: All JIT-compatible (`doppler_width`, `scaled_stark`, `scaled_vdW`, `line_profile`, etc.). Testing: 20 tests pass including end-to-end synthesis-like JIT compilation test | ✓ | ✓ | ✓ |
 
 ### Radiative Transfer (`radiative_transfer/`)
-- [x] Converted | [x] Tested (no JIT) | N/A (numpy) | `generate_mu_grid(n_points)` - μ quadrature grid
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `calculate_rays(μ_grid, spatial, spherical)` - ray geometry
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `compute_tau_anchored!(...)` - optical depth calculation
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `compute_I_linear!(...)` - intensity integration
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `compute_I_linear_flux_only(...)` - flux-only intensity
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `compute_F_flux_only_expint(...)` - flux with E₂
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `radiative_transfer(atm, α, S, ...)` - formal solution
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 4 | `generate_mu_grid(n_points)` | μ quadrature grid | ✓ | ✓ | N/A (numpy) |
+| 4 | `calculate_rays(μ_grid, spatial, spherical)` | ray geometry | ✓ | | |
+| 4 | `compute_tau_anchored!(...)` | optical depth calculation | ✓ | | |
+| 4 | `compute_I_linear!(...)` | intensity integration | ✓ | ✓ | ✓ |
+| 4 | `compute_I_linear_flux_only(...)` | flux-only intensity | ✓ | ✓ | ✓ |
+| 4 | `compute_F_flux_only_expint(...)` | flux with E₂ | ✓ | ✓ | ✓ |
+| 4 | `radiative_transfer(atm, α, S, ...)` | formal solution | ✓ | ✓ | ✓ |
 
 ### Hydrogen Lines (`hydrogen_line_absorption.py`)
-- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `hydrogen_line_absorption!(...)` - H line profiles
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `brackett_oscillator_strength(n, m)` - Brackett f-values
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `hummer_mihalas_w(...)` - occupation probability
-- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `holtsmark_profile(beta, P)` - Holtsmark profile
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 4 | `hydrogen_line_absorption!(...)` | H line profiles | ✓ | ✓ | |
+| 4 | `brackett_oscillator_strength(n, m)` | Brackett f-values | ✓ | ✓ | ✓ |
+| 4 | `hummer_mihalas_w(...)` | occupation probability | ✓ | ✓ | ✓ |
+| 4 | `holtsmark_profile(beta, P)` | Holtsmark profile | ✓ | ✓ | ✓ |
 
 ---
 
 ## Level 5: Top-Level API
 
 ### Atmosphere (`atmosphere.py`)
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `PlanarAtmosphere` class
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `ShellAtmosphere` class
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `read_model_atmosphere(filename)` - parse atmosphere file (not implemented)
-- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `interpolate_marcs(Teff, logg, A_X)` - MARCS interpolation (skipped: requires MARCS data)
-- [x] Converted | [x] Tested (no JIT) | N/A | `create_simple_atmosphere(T, log_tau, ...)` - create test atmospheres
-- [x] Converted | [x] Tested (no JIT) | N/A | `create_solar_test_atmosphere()` - create solar atmosphere
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 5 | `PlanarAtmosphere` class |  | ✓ | ✓ | N/A (class) |
+| 5 | `ShellAtmosphere` class |  | ✓ | ✓ | N/A (class) |
+| 5 | `read_model_atmosphere(filename)` | parse atmosphere file (not implemented) | ✓ | | |
+| 5 | `interpolate_marcs(Teff, logg, A_X)` | MARCS interpolation (skipped: requires MARCS data) | ✓ | ✓ | |
+| 5 | `create_simple_atmosphere(T, log_tau, ...)` | create test atmospheres | ✓ | ✓ | N/A |
+| 5 | `create_solar_test_atmosphere()` | create solar atmosphere | ✓ | ✓ | N/A |
 
 ### Linelist (`linelist.py`)
-- [x] Converted | [x] Tested (no JIT) | N/A (class) | `Line` class - spectral line representation
-- [x] Converted | [x] Tested (no JIT) | N/A | `read_linelist(filename)` - parse linelist file
-- [x] Converted | [ ] Tested (no JIT) | N/A | `get_VALD_solar_linelist()` - built-in VALD list (requires data file)
-- [x] Converted | [ ] Tested (no JIT) | N/A | `get_GALAH_DR3_linelist()` - built-in GALAH list (requires data file)
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 5 | `Line` class | spectral line representation | ✓ | ✓ | N/A (class) |
+| 5 | `read_linelist(filename)` | parse linelist file | ✓ | ✓ | N/A |
+| 5 | `get_VALD_solar_linelist()` | built-in VALD list (requires data file) | ✓ | | N/A |
+| 5 | `get_GALAH_DR3_linelist()` | built-in GALAH list (requires data file) | ✓ | | N/A |
 
 ### Synthesis (`synthesis.py`)
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `synthesize(atm, linelist, A_X, wl_ranges)` - full synthesis
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `synth(...)` - high-level convenience wrapper
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 5 | `synthesize(atm, linelist, A_X, wl_ranges)` | full synthesis | ✓ | | |
+| 5 | `synth(...)` | high-level convenience wrapper | ✓ | | |
 
 ### Post-Processing (`utils.py`)
-- [x] Converted | [x] Tested (no JIT) | N/A | `apply_LSF(flux, wls, R)` - Gaussian LSF
-- [x] Converted | [x] Tested (no JIT) | N/A | `apply_rotation(flux, wls, vsini)` - rotational broadening
-- [x] Converted | [x] Tested (no JIT) | N/A | `compute_LSF_matrix(synth_wls, obs_wls, R)` - LSF matrix
+
+| Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
+|-------|----------|------|-----------|-----------------|--------------|
+| 5 | `apply_LSF(flux, wls, R)` | Gaussian LSF | ✓ | ✓ | N/A |
+| 5 | `apply_rotation(flux, wls, vsini)` | rotational broadening | ✓ | ✓ | N/A |
+| 5 | `compute_LSF_matrix(synth_wls, obs_wls, R)` | LSF matrix | ✓ | ✓ | N/A |
 
 ---
 

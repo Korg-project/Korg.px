@@ -60,25 +60,31 @@ def exponential_integral_1(x: float) -> float:
     This is a rough approximation lifted from Kurucz's VCSE1F.
     Used in brackett_line_stark_profiles.
 
+    JAX-compatible version using jnp.where instead of if/elif/else.
+
     Args:
         x: Input value
 
     Returns:
         E1(x) approximation
     """
-    if x < 0:
-        return 0.0
-    elif x <= 0.01:
-        return -jnp.log(x) - 0.577215 + x
-    elif x <= 1.0:
-        return (-jnp.log(x) - 0.57721566 +
-                x * (0.99999193 + x * (-0.24991055 +
-                     x * (0.05519968 + x * (-0.00976004 + x * 0.00107857)))))
-    elif x <= 30.0:
-        return ((x * (x + 2.334733) + 0.25062) /
-                (x * (x + 3.330657) + 1.681534) / x * jnp.exp(-x))
-    else:
-        return 0.0
+    # Compute all branches
+    branch_neg = 0.0
+    branch_tiny = -jnp.log(jnp.maximum(x, 1e-10)) - 0.577215 + x  # Avoid log(0)
+    branch_small = (-jnp.log(x) - 0.57721566 +
+                    x * (0.99999193 + x * (-0.24991055 +
+                         x * (0.05519968 + x * (-0.00976004 + x * 0.00107857)))))
+    branch_mid = ((x * (x + 2.334733) + 0.25062) /
+                  (x * (x + 3.330657) + 1.681534) / x * jnp.exp(-x))
+    branch_large = 0.0
+
+    # Use jnp.where to select the correct branch
+    result = jnp.where(x < 0, branch_neg,
+             jnp.where(x <= 0.01, branch_tiny,
+             jnp.where(x <= 1.0, branch_small,
+             jnp.where(x <= 30.0, branch_mid, branch_large))))
+
+    return result
 
 
 def brackett_oscillator_strength(n: int, m: int) -> float:
