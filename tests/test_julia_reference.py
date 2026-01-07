@@ -2332,6 +2332,187 @@ class TestChemicalEquilibrium:
         assert abs(n_H_atoms - expected_n_H) / expected_n_H < 0.1, \
             f"H conservation check: got {n_H_atoms}, expected {expected_n_H}"
 
+    def test_chemical_equilibrium_jit_basic(self):
+        """JIT version of chemical equilibrium should work and match regular version."""
+        try:
+            from korg.statmech import (
+                chemical_equilibrium, chemical_equilibrium_jit,
+                precompute_chemical_equilibrium_data
+            )
+            from korg.data_loader import (
+                load_ionization_energies, load_atomic_partition_functions,
+                default_log_equilibrium_constants
+            )
+            from korg.abundances import format_A_X, A_X_to_absolute
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Solar conditions
+        T = 5777.0
+        n_total = 1e17
+        ne_model = 1e14
+
+        # Solar abundances
+        A_X = format_A_X()
+        absolute_abundances_dict = A_X_to_absolute(A_X)
+
+        # Test regular version
+        ne_regular, number_densities = chemical_equilibrium(
+            T, n_total, ne_model, absolute_abundances_dict,
+            ionization_energies, partition_funcs,
+            default_log_equilibrium_constants
+        )
+
+        # Precompute data for JIT version
+        data = precompute_chemical_equilibrium_data(
+            ionization_energies, partition_funcs,
+            default_log_equilibrium_constants
+        )
+
+        # Convert abundances to array format for JIT version
+        absolute_abundances_array = jnp.zeros(92)
+        for Z in range(1, 93):
+            if Z in absolute_abundances_dict:
+                absolute_abundances_array = absolute_abundances_array.at[Z-1].set(
+                    absolute_abundances_dict[Z]
+                )
+
+        # Test JIT version
+        ne_jit, neutral_fractions = chemical_equilibrium_jit(
+            T, n_total, ne_model, absolute_abundances_array, data
+        )
+
+        # Results should match closely
+        assert np.isfinite(ne_jit), "JIT electron density should be finite"
+        assert ne_jit > 0, "JIT electron density should be positive"
+
+        # JIT and regular versions should agree within 1%
+        assert np.isclose(ne_jit, ne_regular, rtol=0.01), \
+            f"JIT ne={ne_jit:.3e} should match regular ne={ne_regular:.3e}"
+
+    def test_chemical_equilibrium_jit_truly_jittable(self):
+        """Verify chemical_equilibrium_jit can actually be JIT-compiled."""
+        try:
+            from korg.statmech import (
+                chemical_equilibrium_jit,
+                precompute_chemical_equilibrium_data
+            )
+            from korg.data_loader import (
+                load_ionization_energies, load_atomic_partition_functions,
+                default_log_equilibrium_constants
+            )
+            from korg.abundances import format_A_X, A_X_to_absolute
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Precompute data
+        data = precompute_chemical_equilibrium_data(
+            ionization_energies, partition_funcs,
+            default_log_equilibrium_constants
+        )
+
+        # Solar abundances as array
+        A_X = format_A_X()
+        absolute_abundances_dict = A_X_to_absolute(A_X)
+        absolute_abundances_array = jnp.zeros(92)
+        for Z in range(1, 93):
+            if Z in absolute_abundances_dict:
+                absolute_abundances_array = absolute_abundances_array.at[Z-1].set(
+                    absolute_abundances_dict[Z]
+                )
+
+        # The function is already decorated with @jax.jit, but we can also wrap it
+        # This verifies it can be called multiple times efficiently
+        T = 5777.0
+        n_total = 1e17
+        ne_model = 1e14
+
+        # First call (triggers JIT compilation)
+        ne_1, neutral_fractions_1 = chemical_equilibrium_jit(
+            T, n_total, ne_model, absolute_abundances_array, data
+        )
+
+        # Second call (should use compiled version)
+        ne_2, neutral_fractions_2 = chemical_equilibrium_jit(
+            T, n_total, ne_model, absolute_abundances_array, data
+        )
+
+        # Results should be identical
+        assert np.isclose(ne_1, ne_2, rtol=1e-10), "JIT should be deterministic"
+        assert np.allclose(neutral_fractions_1, neutral_fractions_2, rtol=1e-10), \
+            "JIT neutral fractions should be deterministic"
+
+    def test_chemical_equilibrium_jit_multiple_temperatures(self):
+        """JIT version should work correctly at different temperatures."""
+        try:
+            from korg.statmech import (
+                chemical_equilibrium_jit,
+                precompute_chemical_equilibrium_data
+            )
+            from korg.data_loader import (
+                load_ionization_energies, load_atomic_partition_functions,
+                default_log_equilibrium_constants
+            )
+            from korg.abundances import format_A_X, A_X_to_absolute
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Precompute data
+        data = precompute_chemical_equilibrium_data(
+            ionization_energies, partition_funcs,
+            default_log_equilibrium_constants,
+            T_min=1000.0, T_max=50000.0
+        )
+
+        # Solar abundances as array
+        A_X = format_A_X()
+        absolute_abundances_dict = A_X_to_absolute(A_X)
+        absolute_abundances_array = jnp.zeros(92)
+        for Z in range(1, 93):
+            if Z in absolute_abundances_dict:
+                absolute_abundances_array = absolute_abundances_array.at[Z-1].set(
+                    absolute_abundances_dict[Z]
+                )
+
+        n_total = 1e17
+        ne_model = 1e14
+
+        # Test at multiple temperatures
+        temperatures = [4000.0, 5777.0, 8000.0, 15000.0]
+        ne_values = []
+
+        for T in temperatures:
+            ne, _ = chemical_equilibrium_jit(
+                T, n_total, ne_model, absolute_abundances_array, data
+            )
+            ne_values.append(ne)
+
+            assert np.isfinite(ne), f"ne should be finite at T={T}"
+            assert ne > 0, f"ne should be positive at T={T}"
+
+        # Electron density should increase with temperature
+        assert ne_values[1] > ne_values[0], "ne should increase from 4000K to 5777K"
+        assert ne_values[2] > ne_values[1], "ne should increase from 5777K to 8000K"
+        assert ne_values[3] > ne_values[2], "ne should increase from 8000K to 15000K"
+
 
 # =============================================================================
 # Level 4 Tests - Line Absorption

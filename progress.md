@@ -153,7 +153,7 @@ Each function has three checkboxes:
 ## Level 4: High-Level Functions
 
 ### Chemical Equilibrium (`statmech.py`)
-- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `chemical_equilibrium(T, nₜ, nₑ, ...)` - solve equilibrium
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `chemical_equilibrium(T, nₜ, nₑ, ...)` - solve equilibrium (JIT via chemical_equilibrium_jit)
 
 ### Total Continuum (`continuum_absorption/__init__.py`)
 - [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `total_continuum_absorption(νs, T, nₑ, ...)` - total α
@@ -213,9 +213,9 @@ Each function has three checkboxes:
 | 1     | 13    | 13        | 13              | 9            |
 | 2     | 17    | 17        | 17              | 11           |
 | 3     | 22    | 21        | 20              | 14           |
-| 4     | 14    | 14        | 11              | 7            |
+| 4     | 14    | 14        | 11              | 8            |
 | 5     | 15    | 15        | 10              | 0            |
-| **Total** | **103** | **102** | **92** | **62** |
+| **Total** | **103** | **102** | **92** | **63** |
 
 Notes:
 - Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
