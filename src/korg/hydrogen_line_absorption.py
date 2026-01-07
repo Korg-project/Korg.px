@@ -10,7 +10,7 @@ This module implements hydrogen line absorption including:
 import jax.numpy as jnp
 import numpy as np
 from typing import Tuple, Optional
-from scipy.signal import convolve
+from jax.scipy.signal import convolve
 
 from .constants import (
     c_cgs, kboltz_cgs, kboltz_eV, hplanck_cgs, hplanck_eV,
@@ -36,13 +36,12 @@ def normal_pdf(delta: float, sigma: float) -> float:
     return jnp.exp(-0.5 * delta**2 / sigma**2) / jnp.sqrt(2 * jnp.pi) / sigma
 
 
-def autodiffable_conv(f: np.ndarray, g: np.ndarray) -> np.ndarray:
+def autodiffable_conv(f: jnp.ndarray, g: jnp.ndarray) -> jnp.ndarray:
     """
     Compute the convolution of two vectors.
 
-    This is a simple wrapper around scipy.signal.convolve that uses 'full' mode
-    (equivalent to Julia's DSP.conv). For JAX autodiff compatibility, we use
-    numpy arrays and scipy's implementation.
+    This is a simple wrapper around jax.scipy.signal.convolve that uses 'full' mode
+    (equivalent to Julia's DSP.conv).
 
     Args:
         f: First array
@@ -51,11 +50,7 @@ def autodiffable_conv(f: np.ndarray, g: np.ndarray) -> np.ndarray:
     Returns:
         Convolution of f and g
     """
-    # Convert JAX arrays to numpy for scipy compatibility
-    f_np = np.asarray(f)
-    g_np = np.asarray(g)
-    result = convolve(f_np, g_np, mode='full')
-    return jnp.array(result)
+    return convolve(f, g, mode='full')
 
 
 def exponential_integral_1(x: float) -> float:
