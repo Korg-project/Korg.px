@@ -1958,6 +1958,45 @@ class TestPositiveIonFF:
         # ff typically increases with wavelength (∝ λ²)
         assert float(alpha_10000) > float(alpha_5000)
 
+    def test_positive_ion_ff_absorption_jit(self):
+        """positive_ion_ff_absorption should work under JIT."""
+        try:
+            from korg.continuum import positive_ion_ff_absorption
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        @jax.jit
+        def compute_positive_ion_ff(nu, T, ne):
+            """JIT-compiled wrapper for positive_ion_ff_absorption."""
+            # Note: number_densities dict must be static for JIT
+            # We'll use a fixed dict structure
+            number_densities = {
+                'Fe_II': 1e12,
+                'Ca_II': 1e11,
+                'Mg_II': 1e11,
+            }
+            return positive_ion_ff_absorption(nu, T, number_densities, ne)
+
+        T = 5777.0
+        ne = 1e14
+        lambda_cm = 5000e-8
+        nu = c_cgs / lambda_cm
+
+        # Test JIT compilation
+        alpha_jit = compute_positive_ion_ff(nu, T, ne)
+        assert np.isfinite(float(alpha_jit))
+        assert float(alpha_jit) >= 0
+
+        # Verify it matches non-JIT version
+        number_densities = {
+            'Fe_II': 1e12,
+            'Ca_II': 1e11,
+            'Mg_II': 1e11,
+        }
+        alpha_nojit = positive_ion_ff_absorption(nu, T, number_densities, ne)
+        assert np.isclose(float(alpha_jit), float(alpha_nojit), rtol=1e-10)
+
 
 # =============================================================================
 # Level 4 Tests - Chemical Equilibrium
