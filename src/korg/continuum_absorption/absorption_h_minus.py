@@ -22,10 +22,27 @@ from ..constants import hplanck_cgs, hplanck_eV, kboltz_cgs, kboltz_eV, c_cgs
 # H⁻ ionization energy from McLaughlin+ 2017
 H_MINUS_ION_ENERGY_EV = 0.754204  # eV
 
-# Module-level cache for interpolators
-_Hminus_bf_interpolator = None
-_Hminus_bf_min_nu = None
-_Hminus_ff_interpolator = None
+# Module-level cache for Hminus_bf data (JAX arrays)
+_HMINUS_BF_NU = None
+_HMINUS_BF_SIGMA = None
+_HMINUS_BF_MIN_NU = None
+
+
+def _initialize_Hminus_bf_jax_data():
+    """Initialize H⁻ bound-free data as JAX arrays."""
+    global _HMINUS_BF_NU, _HMINUS_BF_SIGMA, _HMINUS_BF_MIN_NU
+
+    if _HMINUS_BF_NU is not None:
+        return
+
+    try:
+        nu, sigma = _load_Hminus_bf_data()
+        _HMINUS_BF_NU = jnp.array(nu)
+        _HMINUS_BF_SIGMA = jnp.array(sigma)
+        _HMINUS_BF_MIN_NU = float(nu[0])
+    except FileNotFoundError:
+        # Data file not found - will be handled at runtime
+        pass
 
 
 def _load_Hminus_bf_data(fname=None):
@@ -66,27 +83,6 @@ def _load_Hminus_bf_data(fname=None):
     return nu, sigma
 
 
-def _initialize_Hminus_bf_interpolator():
-    """Initialize H⁻ bound-free cross-section interpolator."""
-    global _Hminus_bf_interpolator, _Hminus_bf_min_nu
-
-    if _Hminus_bf_interpolator is not None:
-        return _Hminus_bf_interpolator, _Hminus_bf_min_nu
-
-    nu, sigma = _load_Hminus_bf_data()
-
-    # Create linear interpolator
-    _Hminus_bf_interpolator = RegularGridInterpolator(
-        (nu,),
-        sigma,
-        method='linear',
-        bounds_error=True
-    )
-    _Hminus_bf_min_nu = nu[0]
-
-    return _Hminus_bf_interpolator, _Hminus_bf_min_nu
-
-
 def _ndens_Hminus(nH_I_div_partition, ne, T, ion_energy=H_MINUS_ION_ENERGY_EV):
     """
     Compute number density of H⁻ using Saha equation.
@@ -121,10 +117,10 @@ def _ndens_Hminus(nH_I_div_partition, ne, T, ion_energy=H_MINUS_ION_ENERGY_EV):
           (Boltzmann factor is 1, degeneracy is 2)
         - coef = (h²/(2πm))^1.5 ≈ 3.31283018e-22 cm³·eV^1.5
         - β = 1/(k_B T) in eV^-1
-    """
-    if T < 1000:
-        raise ValueError(f"Temperature {T} K is unexpectedly low for H⁻ calculation")
 
+    Warning: For JIT compatibility, temperature validation is removed.
+    Users should ensure T > 1000 K for physical results.
+    """
     # Ground state H I number density: Boltzmann factor = 1, degeneracy = 2
     nHI_groundstate = 2 * nH_I_div_partition
 
@@ -134,12 +130,12 @@ def _ndens_Hminus(nH_I_div_partition, ne, T, ion_energy=H_MINUS_ION_ENERGY_EV):
     # Inverse temperature in eV
     beta = 1.0 / (kboltz_eV * T)
 
-    return 0.25 * nHI_groundstate * ne * coef * beta**1.5 * np.exp(ion_energy * beta)
+    return 0.25 * nHI_groundstate * ne * coef * beta**1.5 * jnp.exp(ion_energy * beta)
 
 
 def _Hminus_bf_cross_section(nu):
     """
-    Get H⁻ bound-free cross-section at given frequency.
+    Get H⁻ bound-free cross-section at given frequency (JAX-compatible).
 
     Parameters
     ----------
@@ -156,41 +152,45 @@ def _Hminus_bf_cross_section(nu):
     Uses McLaughlin+ 2017 data for tabulated range.
     Below minimum tabulated frequency, uses scaling: σ ∝ (ν - ν_ion)^1.5
     Below ionization threshold, returns 0.
+
+    This version is JAX-compatible using jnp.interp and jnp.where.
     """
-    # Initialize interpolator if needed
-    interpolator, min_nu = _initialize_Hminus_bf_interpolator()
+    # Initialize data if needed
+    _initialize_Hminus_bf_jax_data()
+
+    if _HMINUS_BF_NU is None:
+        raise FileNotFoundError("H⁻ bound-free data file not found")
 
     # Ionization frequency
     nu_ion = H_MINUS_ION_ENERGY_EV / hplanck_eV
 
-    # Handle scalar and array inputs
-    nu = np.atleast_1d(nu)
-    sigma = np.zeros_like(nu, dtype=float)
-
     # Below ionization threshold: σ = 0
-    above_threshold = nu > nu_ion
+    # Between nu_ion and min_nu: power-law extrapolation
+    # Above min_nu: linear interpolation
 
-    if not np.any(above_threshold):
-        return sigma if sigma.size > 1 else 0.0
+    # Get scaling coefficient from first tabulated point
+    sigma_min = _HMINUS_BF_SIGMA[0]
+    coef = sigma_min / (_HMINUS_BF_MIN_NU - nu_ion)**1.5
 
-    # Below minimum tabulated frequency: use power-law scaling
-    # McLaughlin+ 2017 notes that for E < 0.7678 eV, σ = 460.8*(E - E₀)^1.5 Mb
-    # We use the same scaling in terms of frequency
-    below_min = above_threshold & (nu < min_nu)
-    if np.any(below_min):
-        # Get scaling coefficient from first tabulated point
-        sigma_min = interpolator((min_nu,))[0]
-        coef = sigma_min / (min_nu - nu_ion)**1.5
-        sigma[below_min] = coef * (nu[below_min] - nu_ion)**1.5
+    # Calculate sigma for all three regions using jnp.where
+    # Region 1: nu <= nu_ion → sigma = 0
+    # Region 2: nu_ion < nu < min_nu → power-law: coef * (nu - nu_ion)^1.5
+    # Region 3: nu >= min_nu → interpolate from table
 
-    # In tabulated range: interpolate
-    in_range = nu >= min_nu
-    if np.any(in_range):
-        sigma[in_range] = interpolator(nu[in_range])
+    sigma_powerlaw = coef * (nu - nu_ion)**1.5
+    sigma_interp = jnp.interp(nu, _HMINUS_BF_NU, _HMINUS_BF_SIGMA)
 
-    # Return scalar if input was scalar
-    if sigma.size == 1:
-        return float(sigma[0])
+    # Use jnp.where for conditional logic (JAX-compatible)
+    sigma = jnp.where(
+        nu <= nu_ion,
+        0.0,
+        jnp.where(
+            nu < _HMINUS_BF_MIN_NU,
+            sigma_powerlaw,
+            sigma_interp
+        )
+    )
+
     return sigma
 
 
@@ -241,15 +241,11 @@ def Hminus_bf(nu, T, nH_I_div_partition, ne):
     n_Hminus = _ndens_Hminus(nH_I_div_partition, ne, T)
 
     # Stimulated emission correction
-    nu = np.atleast_1d(nu)
-    stimulated = 1 - np.exp(-hplanck_cgs * nu / (kboltz_cgs * T))
+    stimulated = 1 - jnp.exp(-hplanck_cgs * nu / (kboltz_cgs * T))
 
     # Absorption coefficient
     alpha = n_Hminus * cross_section * stimulated
 
-    # Return scalar if input was scalar
-    if alpha.size == 1:
-        return float(alpha[0])
     return alpha
 
 

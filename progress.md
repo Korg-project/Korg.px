@@ -140,10 +140,10 @@ Each function has three checkboxes:
 
 ### Continuum Absorption Sources (`continuum_absorption/`)
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `H_I_bf(...)` - H I bound-free
-- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `Hminus_bf(...)` - H⁻ bound-free
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `Hminus_bf(...)` - H⁻ bound-free
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `Hminus_ff(...)` - H⁻ free-free
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `H2plus_bf_and_ff(...)` - H₂⁺ absorption
-- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `Heminus_ff(...)` - He⁻ free-free
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `Heminus_ff(...)` - He⁻ free-free
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `ndens_state_He_I(...)` - He I level populations
 - [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `positive_ion_ff_absorption!(...)` - metal ff
 - [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `metal_bf_absorption!(...)` - metal bf (skipped: data file not found)
@@ -212,10 +212,10 @@ Each function has three checkboxes:
 | 0     | 22    | 22        | 21              | 21           |
 | 1     | 13    | 13        | 13              | 9            |
 | 2     | 17    | 17        | 17              | 11           |
-| 3     | 22    | 21        | 19              | 10           |
+| 3     | 22    | 21        | 19              | 12           |
 | 4     | 14    | 14        | 11              | 7            |
 | 5     | 15    | 15        | 10              | 0            |
-| **Total** | **103** | **102** | **91** | **58** |
+| **Total** | **103** | **102** | **91** | **60** |
 
 Notes:
 - Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.

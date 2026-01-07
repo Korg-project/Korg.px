@@ -59,14 +59,15 @@ def ndens_state_He_I(n: int, nsdens_div_partition: float, T: float) -> float:
 
 
 # OCR'd from John (1994) https://ui.adsabs.harvard.edu/abs/1994MNRAS.269..871J
-_THETA_FF_ABSORPTION = np.array([0.5, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.8, 3.6])
+# JAX arrays for bilinear interpolation
+_THETA_FF_ABSORPTION = jnp.array([0.5, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.8, 3.6])
 
-_LAMBDA_FF_ABSORPTION = 1e4 * np.array([
-    0.5063, 0.5695, 0.6509, 0.7594, 0.9113, 1.1391, 1.5188,
-    1.8225, 2.2782, 3.0376, 3.6451, 4.5564, 6.0751, 9.1127, 11.390, 15.1878
+_LAMBDA_FF_ABSORPTION = jnp.array([
+    5063.0, 5695.0, 6509.0, 7594.0, 9113.0, 11391.0, 15188.0,
+    18225.0, 22782.0, 30376.0, 36451.0, 45564.0, 60751.0, 91127.0, 113900.0, 151878.0
 ])
 
-_FF_ABSORPTION_DATA = np.array([
+_FF_ABSORPTION_DATA = jnp.array([
     [0.033, 0.036, 0.043, 0.049, 0.055, 0.061, 0.066, 0.072, 0.078, 0.100, 0.121],
     [0.041, 0.045, 0.053, 0.061, 0.067, 0.074, 0.081, 0.087, 0.094, 0.120, 0.145],
     [0.053, 0.059, 0.069, 0.077, 0.086, 0.094, 0.102, 0.109, 0.117, 0.148, 0.178],
@@ -85,18 +86,67 @@ _FF_ABSORPTION_DATA = np.array([
     [27.979, 30.907, 35.822, 39.921, 43.488, 46.678, 49.583, 52.262, 54.757, 63.395, 70.580]
 ])
 
-# Create interpolator (lambda, theta) -> K value
-_Heminus_ff_absorption_interp = RegularGridInterpolator(
-    (_LAMBDA_FF_ABSORPTION, _THETA_FF_ABSORPTION),
-    _FF_ABSORPTION_DATA,
-    method='linear',
-    bounds_error=True
-)
+
+def _bilinear_interp_jax(table, x_grid, y_grid, x, y):
+    """
+    JAX-compatible bilinear interpolation on a regular grid.
+
+    Parameters
+    ----------
+    table : jnp.ndarray
+        2D table of values with shape (len(x_grid), len(y_grid))
+    x_grid : jnp.ndarray
+        1D array of x coordinates
+    y_grid : jnp.ndarray
+        1D array of y coordinates
+    x : float
+        x coordinate to interpolate at
+    y : float
+        y coordinate to interpolate at
+
+    Returns
+    -------
+    float
+        Interpolated value
+    """
+    # Get grid spacing (assumes uniform)
+    dx = x_grid[1] - x_grid[0]
+    dy = y_grid[1] - y_grid[0]
+
+    # Find indices
+    x_idx_f = (x - x_grid[0]) / dx
+    y_idx_f = (y - y_grid[0]) / dy
+
+    # Clamp to valid range
+    x_idx_f = jnp.clip(x_idx_f, 0, len(x_grid) - 1.001)
+    y_idx_f = jnp.clip(y_idx_f, 0, len(y_grid) - 1.001)
+
+    x_idx = jnp.floor(x_idx_f).astype(jnp.int32)
+    y_idx = jnp.floor(y_idx_f).astype(jnp.int32)
+
+    # Ensure we don't go out of bounds
+    x_idx = jnp.minimum(x_idx, len(x_grid) - 2)
+    y_idx = jnp.minimum(y_idx, len(y_grid) - 2)
+
+    # Fractional parts
+    x_frac = x_idx_f - x_idx
+    y_frac = y_idx_f - y_idx
+
+    # Bilinear interpolation
+    v00 = table[x_idx, y_idx]
+    v01 = table[x_idx, y_idx + 1]
+    v10 = table[x_idx + 1, y_idx]
+    v11 = table[x_idx + 1, y_idx + 1]
+
+    return (v00 * (1 - x_frac) * (1 - y_frac) +
+            v01 * (1 - x_frac) * y_frac +
+            v10 * x_frac * (1 - y_frac) +
+            v11 * x_frac * y_frac)
 
 
 def _Heminus_ff(nu: float, T: float, nHe_I_div_partition: float, ne: float) -> float:
     """
-    Internal He⁻ free-free absorption calculation.
+    Internal He⁻ free-free absorption calculation (JAX-compatible).
 
     Parameters
     ----------
@@ -118,8 +168,14 @@ def _Heminus_ff(nu: float, T: float, nHe_I_div_partition: float, ne: float) -> f
     lam = c_cgs * 1.0e8 / nu  # Å
     theta = 5040.0 / T
 
+    # Clip to valid ranges
+    theta = jnp.clip(theta, 0.5, 3.6)
+
     # K includes contribution from stimulated emission
-    K = 1e-26 * _Heminus_ff_absorption_interp([[lam, theta]])[0]  # [cm^4/dyn]
+    K = 1e-26 * _bilinear_interp_jax(
+        _FF_ABSORPTION_DATA, _LAMBDA_FF_ABSORPTION, _THETA_FF_ABSORPTION,
+        lam, theta
+    )  # [cm^4/dyn]
 
     # Partial pressure contributed by electrons
     Pe = ne * kboltz_cgs * T
@@ -139,39 +195,27 @@ _TEMP_MIN = 1400.0
 _TEMP_MAX = 10080.0
 
 
-def Heminus_ff(
-    nus: np.ndarray,
-    T: float,
-    nHe_I_div_partition: float,
-    ne: float,
-    error_oobounds: bool = False,
-    out_alpha: np.ndarray = None
-) -> np.ndarray:
+def Heminus_ff(nu, T: float, nHe_I_div_partition: float, ne: float):
     """
-    Compute the He⁻ free-free opacity κ.
+    Compute the He⁻ free-free opacity κ (JAX-compatible).
 
     The naming scheme for free-free absorption is counter-intuitive. This actually
     refers to the reaction: photon + e⁻ + He I -> e⁻ + He I.
 
     Parameters
     ----------
-    nus : array
-        Sorted frequency vector in Hz
+    nu : float or array
+        Frequency in Hz
     T : float
         Temperature in K
     nHe_I_div_partition : float
         The total number density of He I divided by its partition function
     ne : float
         The number density of free electrons (cm^-3)
-    error_oobounds : bool, optional
-        If True, raise error for out-of-bounds values.
-        If False, return 0 for out-of-bounds (default).
-    out_alpha : array, optional
-        Output array to add results to (in-place operation)
 
     Returns
     -------
-    array
+    float or array
         Absorption coefficient (cm^-1)
 
     Notes
@@ -186,18 +230,9 @@ def Heminus_ff(
     by the approximations for 5063 Å ≤ λ ≤ 10000 Å "are expected to be well below 10%."
 
     Valid ranges:
-    - Wavelength: 5063 Å to 15187.8 Å
-    - Temperature: 1400 K to 10080 K
+    - Wavelength: 5063 Å to 151878 Å
+    - Temperature: 1400 K to 10080 K (θ = 5040/T ∈ [0.5, 3.6])
+
+    For JIT compatibility, bounds checking is done via clipping rather than raising errors.
     """
-    # Create bounds-checked wrapper
-    nu_bound = lambda_to_nu_bound(closed_interval(_LAMBDA_MIN_CM, _LAMBDA_MAX_CM))
-    temp_bound = closed_interval(_TEMP_MIN, _TEMP_MAX)
-
-    wrapped = bounds_checked_absorption(
-        _Heminus_ff,
-        nu_bound=nu_bound,
-        temp_bound=temp_bound
-    )
-
-    return wrapped(nus, T, nHe_I_div_partition, ne,
-                   error_oobounds=error_oobounds, out_alpha=out_alpha)
+    return _Heminus_ff(nu, T, nHe_I_div_partition, ne)

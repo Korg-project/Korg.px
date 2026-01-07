@@ -1578,6 +1578,28 @@ class TestHminusAbsorption:
         except FileNotFoundError:
             pytest.skip("H⁻ data file not found")
 
+    def test_Hminus_bf_jit(self):
+        """Hminus_bf should be JIT-compatible."""
+        try:
+            from korg.continuum_absorption.absorption_h_minus import Hminus_bf
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        @jax.jit
+        def compute_Hminus_bf(nu, T):
+            return Hminus_bf(nu, T, 1e17, 1e14)
+
+        # Test at 5000 Å (well above threshold)
+        nu = c_cgs / (5000e-8)
+
+        try:
+            result = compute_Hminus_bf(nu, 5777.0)
+            assert np.isfinite(float(result))
+            assert float(result) > 0
+        except FileNotFoundError:
+            pytest.skip("H⁻ data file not found")
+
     def test_Hminus_ff_basic(self):
         """H⁻ free-free absorption should be positive."""
         try:
@@ -1654,13 +1676,31 @@ class TestHeAbsorption:
         nHe_I_div_U = 1e16  # He I number density / partition function
         ne = 1e14
 
-        # Test at 10000 Å (in valid range 5063-15188 Å)
+        # Test at 10000 Å (in valid range 5063-151878 Å)
         lambda_cm = 10000e-8
-        nus = np.array([c_cgs / lambda_cm])
+        nu = c_cgs / lambda_cm
 
-        alpha = Heminus_ff(nus, T, nHe_I_div_U, ne)
-        assert np.isfinite(float(alpha[0]))
-        assert float(alpha[0]) >= 0  # Should be non-negative
+        alpha = Heminus_ff(nu, T, nHe_I_div_U, ne)
+        assert np.isfinite(float(alpha))
+        assert float(alpha) >= 0  # Should be non-negative
+
+    def test_Heminus_ff_jit(self):
+        """Heminus_ff should be JIT-compatible."""
+        try:
+            from korg.continuum_absorption.absorption_He import Heminus_ff
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        @jax.jit
+        def compute_Heminus_ff(nu, T):
+            return Heminus_ff(nu, T, 1e16, 1e14)
+
+        # Test at 10000 Å
+        nu = c_cgs / (10000e-8)
+        result = compute_Heminus_ff(nu, 6000.0)
+        assert np.isfinite(float(result))
+        assert float(result) >= 0
 
     def test_ndens_state_He_I(self):
         """He I level population should be physical."""
