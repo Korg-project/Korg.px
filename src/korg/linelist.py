@@ -266,3 +266,206 @@ def vacuum_to_air(wl_vac: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     for _ in range(5):
         wl_air = wl_vac / (air_to_vacuum(wl_air) / wl_air)
     return wl_air
+
+
+def read_vald_linelist(filename: str) -> list:
+    """
+    Read a VALD linelist file.
+
+    Args:
+        filename: Path to VALD linelist file
+
+    Returns:
+        List of Line objects
+
+    Notes:
+        This is a simplified parser that handles the standard VALD "extract stellar"
+        format. It may not handle all VALD variants.
+    """
+    import re
+
+    lines = []
+
+    with open(filename, 'r') as f:
+        # Skip header lines until we find the data section
+        for line in f:
+            if line.startswith("'"):
+                # This is a data line
+                # VALD format (extract stellar):
+                # 'Element', lambda_air, log(gf), E_low, J_low, E_upp, J_upp, lower_lande, upper_lande, mean_lande,
+                # Rad, Stark, Waals, Reference
+
+                # Parse the line
+                parts = line.strip().split(',')
+                if len(parts) < 14:
+                    continue
+
+                try:
+                    # Extract species name (in quotes)
+                    species_str = parts[0].strip("' ")
+                    # Parse species name (e.g., "Fe 1" -> "Fe_I", "Ca 2" -> "Ca_II")
+                    species_match = re.match(r'(\w+)\s+(\d+)', species_str)
+                    if not species_match:
+                        continue
+                    element = species_match.group(1)
+                    ion_stage = int(species_match.group(2))
+                    roman_numerals = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X']
+                    species = Species(f"{element}_{roman_numerals[ion_stage-1]}")
+
+                    # Wavelength in air (Angstroms)
+                    wl_air = float(parts[1].strip())
+                    # Convert to vacuum
+                    wl_vac = air_to_vacuum(wl_air)
+
+                    # log(gf)
+                    log_gf = float(parts[2].strip())
+
+                    # Lower level energy (eV)
+                    E_lower = float(parts[3].strip())
+
+                    # Broadening parameters
+                    # Radiative damping (log scale in VALD)
+                    rad_str = parts[10].strip()
+                    gamma_rad = 10**float(rad_str) if rad_str else None
+
+                    # Stark damping (log scale in VALD)
+                    stark_str = parts[11].strip()
+                    gamma_stark = 10**float(stark_str) if stark_str else None
+
+                    # van der Waals damping (log scale in VALD)
+                    vdw_str = parts[12].strip()
+                    vdW = float(vdw_str) if vdw_str else None
+
+                    # Create line
+                    line_obj = create_line(wl_vac, log_gf, species, E_lower,
+                                          gamma_rad, gamma_stark, vdW)
+                    lines.append(line_obj)
+
+                except (ValueError, IndexError) as e:
+                    # Skip malformed lines
+                    continue
+
+    return lines
+
+
+def get_VALD_solar_linelist() -> list:
+    """
+    Get a VALD "extract stellar" linelist produced at solar parameters.
+
+    This linelist was downloaded with the "threshold" value set to 0.01.
+    It is intended to be used for quick tests only.
+
+    Returns:
+        List of Line objects
+
+    Notes:
+        If you use this in a paper, please cite VALD appropriately:
+        https://www.astro.uu.se/valdwiki/Acknowledgement
+    """
+    import os
+    from .data_loader import _DATA_DIR
+
+    filename = os.path.join(_DATA_DIR, "linelists",
+                           "vald_extract_stellar_solar_threshold001.vald")
+    return read_vald_linelist(filename)
+
+
+def get_GALAH_DR3_linelist() -> list:
+    """
+    Get the GALAH DR3 linelist.
+
+    The GALAH DR 3 linelist (also used for DR 4) ranges from roughly
+    4,675 Å to 7,930 Å. This linelist is based on, but distinct from
+    Heiter 2021 (https://ui.adsabs.harvard.edu/abs/2021A%26A...645A.106H/).
+
+    Returns:
+        List of Line objects
+
+    References:
+        Buder et al. 2021: https://ui.adsabs.harvard.edu/abs/2021MNRAS.506..150B
+
+    Notes:
+        Hydrogen lines are filtered out from this linelist.
+    """
+    import os
+    import h5py
+    from .data_loader import _DATA_DIR
+
+    filename = os.path.join(_DATA_DIR, "linelists", "GALAH_DR3",
+                           "galah_dr3_linelist.h5")
+
+    lines = []
+
+    with h5py.File(filename, 'r') as f:
+        # Read data arrays
+        wls = f['wl'][:]  # Wavelengths in Angstroms
+        log_gfs = f['log_gf'][:]
+        E_los = f['E_lo'][:]  # Lower energy levels in eV
+
+        # Read species data
+        # Formula is stored as array of atomic numbers (up to 3 atoms)
+        formulas = f['formula'][:]  # Shape: (n_lines, 3)
+        ionizations = f['ionization'][:]  # Ionization stage (1 for neutral, 2 for singly ionized, etc.)
+
+        # Read broadening parameters
+        gamma_rads = f['gamma_rad'][:]  # log10 values or special markers
+        gamma_starks = f['gamma_stark'][:]
+        vdWs = f['vdW'][:]
+
+        # Helper to convert special GALAH values
+        def convert_or_none(val):
+            """Convert GALAH special values to None or actual value."""
+            if np.isnan(val) or val == -999 or val == 0:
+                return None
+            # GALAH stores log10 values, convert to linear
+            return 10**val
+
+        def vdw_or_none(val):
+            """Convert GALAH vdW values."""
+            if np.isnan(val) or val == -999:
+                return None
+            return val
+
+        # Parse each line
+        for i in range(len(wls)):
+            # Parse species from formula and ionization
+            atoms = formulas[i]
+            ion = ionizations[i]
+
+            # Get non-zero atoms
+            non_zero = [int(a) for a in atoms if a != 0]
+
+            if len(non_zero) == 0:
+                continue
+
+            # Convert to Species
+            # For atoms: use atomic number directly
+            # For molecules: would need to handle multiple atoms
+            if len(non_zero) == 1:
+                # Atomic species
+                from .atomic_data import atomic_symbols
+                element = atomic_symbols[non_zero[0]]
+                roman_numerals = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X']
+                species = Species(f"{element}_{roman_numerals[ion-1]}")
+            else:
+                # Molecular species - would need more complex handling
+                # For now, skip molecules
+                continue
+
+            # Filter out hydrogen lines
+            if species.charge == 0 and non_zero[0] == 1:  # H I
+                continue
+
+            # Create line
+            wl = wls[i]
+            log_gf = log_gfs[i]
+            E_lower = E_los[i]
+            gamma_rad = convert_or_none(gamma_rads[i])
+            gamma_stark = convert_or_none(gamma_starks[i])
+            vdW = vdw_or_none(vdWs[i])
+
+            line = create_line(wl, log_gf, species, E_lower,
+                             gamma_rad, gamma_stark, vdW)
+            lines.append(line)
+
+    return lines

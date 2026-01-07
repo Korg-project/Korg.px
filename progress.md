@@ -155,8 +155,8 @@ Each function has three checkboxes:
 ### Chemical Equilibrium (`statmech.py`)
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `chemical_equilibrium(T, nₜ, nₑ, ...)` - solve equilibrium (JIT via chemical_equilibrium_jit)
 
-### Total Continuum (`continuum_absorption/__init__.py`)
-- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `total_continuum_absorption(νs, T, nₑ, ...)` - total α
+### Total Continuum (`continuum.py`)
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `total_continuum_absorption(νs, T, nₑ, ...)` - total α
 
 ### Line Absorption (`line_absorption.py`)
 - [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `line_absorption!(α, linelist, λs, ...)` - compute line opacity

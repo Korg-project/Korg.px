@@ -4146,6 +4146,268 @@ class TestLSFAndRotationReference:
         assert depth_high_vsini < depth_low_vsini, "Higher vsini should reduce depth more"
 
 
+class TestLSFAndRotationJITCompatibility:
+    """Test JIT compatibility of LSF and rotation utilities."""
+
+    def test_normal_pdf_used_in_lsf_jit(self):
+        """normal_pdf (used in LSF) should be JIT-compatible."""
+        from korg.utils import normal_pdf
+
+        @jax.jit
+        def compute_pdf(delta, sigma):
+            return normal_pdf(delta, sigma)
+
+        result = compute_pdf(1.0, 2.0)
+        expected = normal_pdf(1.0, 2.0)
+
+        assert np.allclose(result, expected, rtol=1e-10)
+        assert np.isfinite(float(result))
+
+    def test_compute_lsf_matrix_returns_array(self):
+        """compute_LSF_matrix should return a numpy/jax-compatible array."""
+        from korg.utils import compute_LSF_matrix
+
+        synth_wls = (5000, 5050, 0.1)
+        obs_wls = np.linspace(5010, 5040, 31)
+
+        lsf_matrix = compute_LSF_matrix(synth_wls, obs_wls, R=5000, verbose=False)
+
+        # Should return a numpy array
+        assert isinstance(lsf_matrix, np.ndarray)
+        # Should be 2D
+        assert lsf_matrix.ndim == 2
+        # Should have correct shape
+        assert lsf_matrix.shape == (31, 501)
+
+    def test_lsf_matrix_multiplication_jit(self):
+        """Matrix multiplication with LSF matrix should be JIT-compatible."""
+        from korg.utils import compute_LSF_matrix
+        import jax.numpy as jnp
+
+        synth_wls = (5000, 5050, 0.1)  # 501 points
+        obs_wls = np.linspace(5010, 5040, 31)  # 31 points
+
+        lsf_matrix = compute_LSF_matrix(synth_wls, obs_wls, R=5000, verbose=False)
+
+        # Convert to JAX array
+        lsf_matrix_jax = jnp.array(lsf_matrix)
+
+        @jax.jit
+        def apply_lsf_via_matrix(flux, matrix):
+            return matrix @ flux
+
+        # Create test flux
+        flux = jnp.ones(501)
+        flux = flux.at[250].set(0.5)  # Add absorption feature
+
+        # Apply LSF via JIT-compiled function
+        result_jit = apply_lsf_via_matrix(flux, lsf_matrix_jax)
+
+        # Apply LSF via normal numpy
+        result_normal = lsf_matrix @ np.array(flux)
+
+        assert np.allclose(result_jit, result_normal, rtol=1e-10)
+        assert result_jit.shape == (31,)
+
+    def test_apply_lsf_basic_functionality(self):
+        """apply_LSF should work with simple inputs."""
+        from korg.utils import apply_LSF
+
+        # Create simple test spectrum
+        n_points = 201
+        flux = np.ones(n_points)
+        flux[100] = 0.5  # Absorption line at center
+
+        wls = (5000, 5020, 0.1)  # 0.1 Å steps
+
+        # Apply LSF
+        result = apply_LSF(flux, wls, R=5000)
+
+        # Should return array of same length
+        assert len(result) == len(flux)
+        # Should have broadened the line (center should be less deep)
+        assert result[100] > flux[100]
+        # But still below continuum
+        assert result[100] < 1.0
+
+    def test_apply_lsf_callable_R(self):
+        """apply_LSF should work with callable R."""
+        from korg.utils import apply_LSF
+
+        # Create R as function of wavelength (in Angstroms)
+        def R_func(wavelength_angstrom):
+            # Constant R for simplicity
+            return 10000.0
+
+        flux = np.ones(201)
+        flux[100] = 0.8
+        wls = (5000, 5020, 0.1)
+
+        result = apply_LSF(flux, wls, R=R_func)
+
+        assert len(result) == len(flux)
+        assert np.isfinite(result).all()
+
+    def test_apply_lsf_matches_matrix_method(self):
+        """apply_LSF should match compute_LSF_matrix result for same grid."""
+        from korg.utils import apply_LSF, compute_LSF_matrix
+
+        # Create test spectrum
+        synth_wls = (5000, 5050, 0.1)  # 501 points
+        flux = np.ones(501)
+        flux[200:210] = 0.7  # Absorption feature
+
+        R = 8000
+
+        # Method 1: apply_LSF
+        result_direct = apply_LSF(flux, synth_wls, R=R)
+
+        # Method 2: compute_LSF_matrix with same wavelengths
+        # For same grid, obs_wls = synth_wls
+        from korg.wavelengths import Wavelengths
+        synth_wls_obj = Wavelengths(synth_wls)
+        obs_wls = synth_wls_obj.all_wls
+
+        lsf_matrix = compute_LSF_matrix(synth_wls, obs_wls, R=R, verbose=False)
+        result_matrix = lsf_matrix @ flux
+
+        # Should give similar results (may differ slightly at boundaries)
+        assert np.allclose(result_direct, result_matrix, rtol=1e-3, atol=1e-6)
+
+    def test_apply_rotation_basic_functionality(self):
+        """apply_rotation should work with simple inputs."""
+        from korg.utils import apply_rotation
+
+        # Create test spectrum
+        n_points = 301
+        flux = np.ones(n_points)
+        flux[150] = 0.6  # Absorption line
+
+        wls = (5000, 5030, 0.1)  # 0.1 Å steps
+        vsini = 20.0  # km/s
+
+        # Apply rotation
+        result = apply_rotation(flux, wls, vsini=vsini)
+
+        # Should return array of same length
+        assert len(result) == len(flux)
+        # Should have broadened the line
+        assert result[150] > flux[150]
+        # But still below continuum
+        assert result[150] < 1.0
+
+    def test_apply_rotation_custom_epsilon(self):
+        """apply_rotation should work with custom limb-darkening coefficient."""
+        from korg.utils import apply_rotation
+
+        flux = np.ones(201)
+        flux[100] = 0.8
+        wls = (5000, 5020, 0.1)
+
+        # Test with different epsilon values
+        result_eps_0 = apply_rotation(flux, wls, vsini=15.0, epsilon=0.0)
+        result_eps_06 = apply_rotation(flux, wls, vsini=15.0, epsilon=0.6)
+        result_eps_1 = apply_rotation(flux, wls, vsini=15.0, epsilon=1.0)
+
+        # All should produce valid results
+        assert np.isfinite(result_eps_0).all()
+        assert np.isfinite(result_eps_06).all()
+        assert np.isfinite(result_eps_1).all()
+
+        # Results should differ with different epsilon
+        assert not np.allclose(result_eps_0, result_eps_1, rtol=1e-6)
+
+    def test_apply_rotation_multiple_ranges(self):
+        """apply_rotation should work with multiple wavelength ranges."""
+        from korg.utils import apply_rotation
+
+        # Create flux for two ranges
+        n1 = 101
+        n2 = 51
+        flux = np.ones(n1 + n2)
+        flux[50] = 0.7  # Feature in first range
+        flux[n1 + 25] = 0.7  # Feature in second range
+
+        # Two wavelength ranges
+        wls = [(5000, 5010, 0.1), (5100, 5105, 0.1)]
+
+        result = apply_rotation(flux, wls, vsini=10.0)
+
+        assert len(result) == len(flux)
+        assert np.isfinite(result).all()
+
+    def test_lsf_and_rotation_preserves_continuum(self):
+        """LSF and rotation should preserve continuum level."""
+        from korg.utils import apply_LSF, apply_rotation
+
+        # Flat continuum
+        flux = np.ones(201)
+        wls = (5000, 5020, 0.1)
+
+        result_lsf = apply_LSF(flux, wls, R=5000)
+        result_rotation = apply_rotation(flux, wls, vsini=10.0)
+
+        # Should preserve continuum (all 1s)
+        assert np.allclose(result_lsf, 1.0, rtol=1e-6)
+        assert np.allclose(result_rotation, 1.0, rtol=1e-6)
+
+    def test_lsf_and_rotation_combined(self):
+        """LSF and rotation can be applied sequentially."""
+        from korg.utils import apply_LSF, apply_rotation
+
+        # Create test spectrum
+        flux = np.ones(301)
+        flux[150] = 0.6
+        wls = (5000, 5030, 0.1)
+
+        # Apply both operations
+        result_lsf_first = apply_LSF(flux, wls, R=8000)
+        result_both = apply_rotation(result_lsf_first, wls, vsini=15.0)
+
+        # Should produce valid result
+        assert len(result_both) == len(flux)
+        assert np.isfinite(result_both).all()
+        # Line should be broadened more than with either alone
+        assert result_both[150] > result_lsf_first[150]
+
+    def test_lsf_matrix_sparsity_structure(self):
+        """LSF matrix should have reasonable sparsity structure."""
+        from korg.utils import compute_LSF_matrix
+
+        synth_wls = (5000, 5100, 0.01)  # 10001 points
+        obs_wls = np.linspace(5020, 5080, 61)  # 61 points
+
+        lsf_matrix = compute_LSF_matrix(synth_wls, obs_wls, R=10000, verbose=False)
+
+        # Most elements should be zero (sparse structure)
+        n_nonzero = np.count_nonzero(lsf_matrix > 1e-10)
+        n_total = lsf_matrix.size
+
+        # Should be less than 5% non-zero for high R
+        assert n_nonzero < 0.05 * n_total, f"Matrix too dense: {n_nonzero}/{n_total} nonzero"
+
+        # Each row should sum to approximately 1 (normalized)
+        row_sums = np.sum(lsf_matrix, axis=1)
+        assert np.allclose(row_sums, 1.0, rtol=1e-3, atol=1e-6)
+
+    def test_lsf_matrix_wavelength_units(self):
+        """compute_LSF_matrix should handle Angstrom and cm correctly."""
+        from korg.utils import compute_LSF_matrix
+
+        synth_wls = (5000, 5050, 0.1)  # Angstroms
+
+        # obs_wls in Angstroms (>= 1)
+        obs_wls_angstrom = np.linspace(5010, 5040, 31)
+        lsf_1 = compute_LSF_matrix(synth_wls, obs_wls_angstrom, R=5000, verbose=False)
+
+        # obs_wls in cm (< 1)
+        obs_wls_cm = obs_wls_angstrom / 1e8
+        lsf_2 = compute_LSF_matrix(synth_wls, obs_wls_cm, R=5000, verbose=False)
+
+        # Should produce identical results
+        assert np.allclose(lsf_1, lsf_2, rtol=1e-10)
+
+
 # =============================================================================
 # Level 3 Julia Reference Tests - H I bf, H2+ bf/ff, expint_transfer_integral_core
 # =============================================================================
@@ -4770,6 +5032,167 @@ class TestTotalContinuumAbsorptionReference:
                     f"Continuum absorption mismatch at {wl_A}A: Python={py_alpha}, Julia={julia_alpha}"
             except (FileNotFoundError, KeyError) as e:
                 pytest.skip(f"Required data not available: {e}")
+
+    def test_total_continuum_absorption_basic(self):
+        """total_continuum_absorption should work with basic inputs."""
+        try:
+            from korg.continuum import total_continuum_absorption
+            from korg.data_loader import load_atomic_partition_functions
+            import jax.numpy as jnp
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Solar photosphere conditions
+        T = 5777.0  # K
+        ne = 1e14  # cm^-3
+
+        # Number densities (solar photosphere approximation)
+        from korg.species import Species
+        number_densities = {
+            'H_I': 1e17,
+            'H_II': 1e11,
+            'He_I': 1e16,
+            'He_II': 1e10,
+            'H2': 1e10,
+            'Fe_I': 1e11,
+            'Ca_I': 1e10,
+        }
+
+        # Test at visible wavelength (5000 Angstroms)
+        nu = 6e14  # Hz (~5000 Angstroms)
+
+        alpha = total_continuum_absorption(nu, T, ne, number_densities, partition_funcs)
+
+        # Basic sanity checks
+        assert jnp.isfinite(alpha), "Absorption should be finite"
+        assert alpha > 0, "Absorption should be positive"
+        assert alpha < 1e-5, "Absorption should be reasonable for photosphere"
+        assert alpha > 1e-15, "Absorption should not be too small"
+
+    def test_total_continuum_absorption_array(self):
+        """total_continuum_absorption should work with array inputs."""
+        try:
+            from korg.continuum import total_continuum_absorption
+            from korg.data_loader import load_atomic_partition_functions
+            import jax.numpy as jnp
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        T = 5777.0
+        ne = 1e14
+
+        from korg.species import Species
+        number_densities = {
+            'H_I': 1e17,
+            'H_II': 1e11,
+            'He_I': 1e16,
+            'He_II': 1e10,
+            'H2': 1e10,
+        }
+
+        # Test with array of frequencies
+        nus = jnp.array([5e14, 6e14, 7e14])  # Hz
+        alphas = total_continuum_absorption(nus, T, ne, number_densities, partition_funcs)
+
+        assert alphas.shape == (3,), "Should return array of same length"
+        assert jnp.all(jnp.isfinite(alphas)), "All values should be finite"
+        assert jnp.all(alphas > 0), "All values should be positive"
+
+    def test_total_continuum_absorption_jit(self):
+        """total_continuum_absorption should work under JIT."""
+        try:
+            from korg.continuum import total_continuum_absorption
+            from korg.data_loader import load_atomic_partition_functions
+            import jax
+            import jax.numpy as jnp
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        # Define JIT-compiled version
+        @jax.jit
+        def compute_alpha_jit(nu, T, ne):
+            number_densities = {
+                'H_I': 1e17,
+                'H_II': 1e11,
+                'He_I': 1e16,
+                'He_II': 1e10,
+                'H2': 1e10,
+            }
+            return total_continuum_absorption(nu, T, ne, number_densities, partition_funcs)
+
+        # Test parameters
+        nu = 6e14  # Hz
+        T = 5777.0  # K
+        ne = 1e14  # cm^-3
+
+        # Compute with and without JIT
+        alpha_nojit = total_continuum_absorption(
+            nu, T, ne,
+            {'H_I': 1e17, 'H_II': 1e11, 'He_I': 1e16, 'He_II': 1e10, 'H2': 1e10},
+            partition_funcs
+        )
+        alpha_jit = compute_alpha_jit(nu, T, ne)
+
+        # Should produce same results
+        assert jnp.isclose(alpha_jit, alpha_nojit, rtol=1e-10), \
+            f"JIT and non-JIT should match: JIT={alpha_jit}, non-JIT={alpha_nojit}"
+
+        # Call JIT version again to ensure it's truly compiled and reusable
+        alpha_jit_2 = compute_alpha_jit(nu, T, ne)
+        assert jnp.isclose(alpha_jit_2, alpha_jit, rtol=1e-15), \
+            "JIT should be deterministic"
+
+    def test_total_continuum_absorption_temperature_dependence(self):
+        """total_continuum_absorption should vary with temperature."""
+        try:
+            from korg.continuum import total_continuum_absorption
+            from korg.data_loader import load_atomic_partition_functions
+            import jax.numpy as jnp
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        nu = 6e14
+        ne = 1e14
+        number_densities = {
+            'H_I': 1e17,
+            'H_II': 1e11,
+            'He_I': 1e16,
+            'He_II': 1e10,
+            'H2': 1e10,
+        }
+
+        # Test at different temperatures
+        T_cool = 4000.0
+        T_hot = 8000.0
+
+        alpha_cool = total_continuum_absorption(nu, T_cool, ne, number_densities, partition_funcs)
+        alpha_hot = total_continuum_absorption(nu, T_hot, ne, number_densities, partition_funcs)
+
+        # Absorption should be different at different temperatures
+        assert not jnp.isclose(alpha_cool, alpha_hot, rtol=0.01), \
+            "Absorption should depend on temperature"
+        assert jnp.isfinite(alpha_cool) and jnp.isfinite(alpha_hot), \
+            "Both should be finite"
 
 
 # =============================================================================

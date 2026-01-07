@@ -1334,3 +1334,93 @@ def metal_bf_absorption(nu, T, number_densities):
         alpha_total += jnp.where(is_finite, jnp.exp(log_alpha), 0.0)
 
     return alpha_total
+
+
+def total_continuum_absorption(nu, T, ne, number_densities, partition_funcs):
+    """
+    Total continuum linear absorption coefficient at given frequencies.
+
+    Combines all continuum opacity sources including H, He, metal bound-free/free-free
+    and scattering contributions.
+
+    Parameters
+    ----------
+    nu : float or array
+        Frequencies in Hz (should be sorted for efficiency)
+    T : float
+        Temperature in K
+    ne : float
+        Electron number density in cm⁻³
+    number_densities : dict
+        Dictionary mapping species names (e.g., 'H_I', 'He_I', 'Fe_I') to number
+        densities in cm⁻³. Should include at least 'H_I', 'H_II', 'He_I', 'H2'.
+    partition_funcs : dict
+        Dictionary mapping species names to partition function values at this
+        temperature.
+
+    Returns
+    -------
+    float or array
+        Linear absorption coefficient α in cm⁻¹
+
+    Notes
+    -----
+    This function combines absorption from:
+    - H I bound-free (with MHD level dissolution)
+    - H⁻ bound-free and free-free
+    - H₂⁺ bound-free and free-free
+    - He⁻ free-free
+    - Positive ion free-free (H II, He II, metals)
+    - Metal bound-free (TOPBase/NORAD)
+    - Electron scattering (Thomson)
+    - Rayleigh scattering (H I, He I, H₂)
+
+    The function is JAX-compatible and can be used with jax.jit.
+
+    References
+    ----------
+    Korg.jl ContinuumAbsorption/ContinuumAbsorption.jl
+    """
+    # Convert to JAX arrays
+    nu = jnp.asarray(nu)
+
+    # Initialize total absorption
+    alpha = jnp.zeros_like(nu)
+
+    # Get commonly used number densities
+    nH_I = number_densities.get('H_I', 0.0)
+    nH_II = number_densities.get('H_II', 0.0)
+    nHe_I = number_densities.get('He_I', 0.0)
+    nH2 = number_densities.get('H2', 0.0)
+
+    # Get partition function values by calling with log(T)
+    # Partition functions are CubicSpline objects that take log(T) as input
+    log_T = jnp.log(T)
+    U_H_I = partition_funcs.get('H_I', lambda x: 1.0)(log_T)
+    U_He_I = partition_funcs.get('He_I', lambda x: 1.0)(log_T)
+
+    # Compute number density divided by partition function
+    nH_I_div_U = nH_I / U_H_I
+    nHe_I_div_U = nHe_I / U_He_I
+
+    # Hydrogen continuum absorption
+    # Note: inclusion of He I density is NOT a typo - it's used for MHD level dissolution
+    alpha += H_I_bf(nu, T, nH_I, nHe_I, ne, 1.0 / U_H_I)
+    alpha += Hminus_bf(nu, T, nH_I_div_U, ne)
+    alpha += Hminus_ff(nu, T, nH_I_div_U, ne)
+    alpha += H2plus_bf_and_ff(nu, T, nH_I, nH_II)
+
+    # Helium continuum absorption
+    alpha += Heminus_ff(nu, T, nHe_I_div_U, ne)
+
+    # Free-free absorption from positive ions (H II, He II, metals)
+    alpha += positive_ion_ff_absorption(nu, T, number_densities, ne)
+
+    # Bound-free absorption by metals from TOPBase and NORAD
+    alpha += metal_bf_absorption(nu, T, number_densities)
+
+    # Scattering
+    alpha += electron_scattering(ne)
+    alpha += rayleigh(nu, nH_I, nHe_I, nH2)
+
+    return alpha
