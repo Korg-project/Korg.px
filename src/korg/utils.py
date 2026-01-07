@@ -488,6 +488,87 @@ def _apply_rotation_core(flux: np.ndarray, wl_range: tuple,
     return new_flux
 
 
+def compute_LSF_matrix(synth_wls, obs_wls, R: Union[float, Callable],
+                      window_size: float = 4, verbose: bool = True):
+    """
+    Compute a matrix to apply an LSF to synthesis spectra.
+
+    Given synthesis wavelengths `synth_wls` and observation wavelengths `obs_wls`,
+    compute a matrix `LSF` such that `LSF @ flux` convolves the synthetic spectrum
+    with a Gaussian LSF of resolving power R.
+
+    This is more efficient than apply_LSF when you need to convolve many spectra
+    on the same wavelength grid.
+
+    Parameters
+    ----------
+    synth_wls : tuple, list of tuples, array, or Wavelengths
+        Synthesis wavelengths in any format accepted by Wavelengths class.
+    obs_wls : array
+        Observation wavelengths. If values >= 1, assumed to be in Angstroms
+        and will be converted to cm.
+    R : float or callable
+        The resolving power R = λ/Δλ. Can be a constant or a function
+        of wavelength (in Å).
+    window_size : float, optional
+        How far to extend the convolution kernel in units of sigma
+        (not HWHM). Default: 4.
+    verbose : bool, optional
+        Whether to emit warnings. Default: True.
+
+    Returns
+    -------
+    array
+        LSF matrix with shape (n_obs, n_synth). Apply with: convolved = LSF @ flux
+
+    Notes
+    -----
+    The returned matrix is sparse in Julia but dense in Python/JAX for JIT compatibility.
+    For best results, synthesis wavelengths should extend a couple Δλ outside
+    the observation range.
+
+    Examples
+    --------
+    >>> lsf_matrix = compute_LSF_matrix((5000, 5100, 0.01), obs_wls, R=50000)
+    >>> convolved_flux = lsf_matrix @ flux
+    """
+    # Convert obs_wls to cm if in Angstroms
+    obs_wls = np.asarray(obs_wls)
+    if obs_wls[0] >= 1:
+        obs_wls = obs_wls / 1e8  # Å to cm
+
+    synth_wls = Wavelengths(synth_wls)
+
+    # Warn if synthesis wavelengths don't cover observation range
+    if verbose:
+        synth_first = synth_wls.all_wls[0]
+        synth_last = synth_wls.all_wls[-1]
+        obs_first = obs_wls[0]
+        obs_last = obs_wls[-1]
+        margin = 0.01  # cm (~1000 Å)
+
+        if not ((synth_first - margin) <= obs_first <= obs_last <= (synth_last + margin)):
+            import warnings
+            warnings.warn(
+                f"Synthesis wavelengths ({synth_first*1e8:.1f} Å—{synth_last*1e8:.1f} Å) "
+                f"are not superset of observation wavelengths "
+                f"({obs_first*1e8:.1f} Å—{obs_last*1e8:.1f} Å) in LSF matrix."
+            )
+
+    # Build the LSF matrix
+    n_synth = len(synth_wls)
+    n_obs = len(obs_wls)
+    LSF = np.zeros((n_synth, n_obs), dtype=np.float64)
+
+    for i in range(n_obs):
+        lambda0 = obs_wls[i]
+        lb, ub, normalized_phi = _lsf_bounds_and_kernel(synth_wls, lambda0, R, window_size)
+        LSF[lb:ub + 1, i] += normalized_phi
+
+    # Transpose to get (n_obs, n_synth) for left multiplication
+    return LSF.T
+
+
 def apply_rotation(flux: np.ndarray, wls, vsini: float,
                    epsilon: float = 0.6) -> np.ndarray:
     """

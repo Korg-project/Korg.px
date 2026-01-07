@@ -618,9 +618,16 @@ def load_exomol_partition_functions(filename=None):
                 # Convert from physics to astrophysics convention
                 Us_astro = Us / total_g_ns
 
+                # Filter out zero or negative temperatures (shouldn't happen but be safe)
+                valid_mask = Ts > 0
+                if not np.all(valid_mask):
+                    Ts = Ts[valid_mask]
+                    Us_astro = Us_astro[valid_mask]
+
                 # Create lazy interpolator over log(T)
                 # The spline is only built when first called
-                partition_funcs[species] = LazyPartitionFunction(np.log(Ts), Us_astro)
+                if len(Ts) > 0:
+                    partition_funcs[species] = LazyPartitionFunction(np.log(Ts), Us_astro)
             except Exception:
                 # Skip species that can't be loaded
                 continue

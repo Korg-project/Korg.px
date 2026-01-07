@@ -11,14 +11,14 @@ import numpy as np
 import jax.numpy as jnp
 import h5py
 import os
+import warnings
 from typing import Tuple, List, Optional
+from pathlib import Path
 
 from .atmosphere import PlanarAtmosphere, PlanarAtmosphereLayer
 from .atmosphere import ShellAtmosphere, ShellAtmosphereLayer
 from .constants import G_cgs
-
-# Path to MARCS atmosphere grid
-_MARCS_PATH = os.path.join(os.path.dirname(__file__), 'data', 'SDSS_MARCS_atmospheres.h5')
+from .artifacts import get_artifact_path, is_placeholder_file, ARTIFACTS
 
 
 class AtmosphereInterpolationError(Exception):
@@ -156,14 +156,98 @@ def lazy_multilinear_interpolation(
     return structure[final_idx]
 
 
-def load_marcs_grid(path: Optional[str] = None) -> Tuple[List[jnp.ndarray], jnp.ndarray]:
+def get_marcs_grid_path(
+    grid_type: str = 'standard',
+    auto_download: bool = True
+) -> Optional[Path]:
+    """
+    Get path to MARCS atmosphere grid, downloading if necessary.
+
+    Parameters
+    ----------
+    grid_type : str, optional
+        Type of grid: 'standard', 'low_Z', or 'cool_dwarfs' (default: 'standard')
+    auto_download : bool, optional
+        Automatically download if not present (default: True)
+
+    Returns
+    -------
+    Path or None
+        Path to HDF5 file, or None if not available
+
+    Raises
+    ------
+    ValueError
+        If grid_type is invalid
+    FileNotFoundError
+        If grid not found and auto_download is False
+    """
+    artifact_map = {
+        'standard': ('SDSS_MARCS_atmospheres_v2', 'SDSS_MARCS_atmospheres.h5'),
+        'low_Z': ('MARCS_metal_poor_atmospheres', 'MARCS_metal_poor_atmospheres.h5'),
+        'cool_dwarfs': ('resampled_cool_dwarf_atmospheres', 'resampled_cool_dwarf_atmospheres.h5')
+    }
+
+    if grid_type not in artifact_map:
+        raise ValueError(f"Invalid grid_type: {grid_type}. "
+                        f"Must be one of {list(artifact_map.keys())}")
+
+    artifact_name, h5_filename = artifact_map[grid_type]
+
+    # Get artifact path (downloads if needed)
+    artifact_dir = get_artifact_path(artifact_name, auto_download=auto_download)
+
+    if artifact_dir is None:
+        raise FileNotFoundError(
+            f"MARCS {grid_type} grid not found. "
+            "Set auto_download=True or run download_artifact manually."
+        )
+
+    # Construct full path to HDF5 file
+    extract_dir = artifact_dir / ARTIFACTS[artifact_name]['extract_dir']
+    h5_path = extract_dir / h5_filename
+
+    # Check if it's a placeholder
+    if is_placeholder_file(h5_path):
+        if os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS'):
+            warnings.warn(
+                f"Using placeholder for {artifact_name} in CI. "
+                "MARCS interpolation will not work.",
+                UserWarning
+            )
+            return None
+        else:
+            raise FileNotFoundError(
+                f"MARCS grid file {h5_path} is a placeholder. "
+                "Please download the full artifact."
+            )
+
+    if not h5_path.exists():
+        raise FileNotFoundError(
+            f"MARCS grid file not found at {h5_path}. "
+            "The artifact may be corrupted."
+        )
+
+    return h5_path
+
+
+def load_marcs_grid(
+    path: Optional[str] = None,
+    grid_type: str = 'standard'
+) -> Tuple[List[jnp.ndarray], jnp.ndarray]:
     """
     Load MARCS atmosphere grid from HDF5 file.
+
+    If path is not provided, automatically downloads the grid from AWS S3
+    if it's not already cached locally.
 
     Parameters
     ----------
     path : str, optional
-        Path to HDF5 file. If None, uses default MARCS path.
+        Path to HDF5 file. If None, downloads/uses cached grid.
+    grid_type : str, optional
+        Type of grid: 'standard', 'low_Z', or 'cool_dwarfs' (default: 'standard')
+        Only used if path is None.
 
     Returns
     -------
@@ -172,31 +256,48 @@ def load_marcs_grid(path: Optional[str] = None) -> Tuple[List[jnp.ndarray], jnp.
     grid : jnp.ndarray
         Atmosphere grid, shape (n_layers, 5, n_Teff, n_logg, n_MH, n_alpha, n_C)
         Quantities: [T, log_ne, log_n, tau_ref, asinh_z]
+
+    Raises
+    ------
+    FileNotFoundError
+        If grid cannot be found or downloaded
+    RuntimeError
+        If download or file reading fails
     """
     if path is None:
-        path = _MARCS_PATH
+        h5_path = get_marcs_grid_path(grid_type=grid_type, auto_download=True)
+        if h5_path is None:
+            # Placeholder in CI - return dummy data
+            warnings.warn(
+                "Returning dummy MARCS grid data (CI placeholder mode)",
+                UserWarning
+            )
+            # Return minimal valid structure for import testing
+            nodes = [jnp.array([5000.0]), jnp.array([4.0]), jnp.array([0.0]),
+                    jnp.array([0.0]), jnp.array([0.0])]
+            grid = jnp.zeros((1, 5, 1, 1, 1, 1, 1))
+            return nodes, grid
+        path = str(h5_path)
 
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"MARCS atmosphere grid not found at {path}. "
-            "Make sure the symlink to the Julia artifact is created."
-        )
+    try:
+        with h5py.File(path, 'r') as f:
+            # Load grid node values
+            # Parameter order: Teff, logg, M_H, alpha, C
+            nodes = []
+            for i in range(1, 6):  # 5 parameters
+                nodes.append(jnp.array(f[f'grid_values/{i}'][:]))
 
-    with h5py.File(path, 'r') as f:
-        # Load grid node values
-        # Parameter order: Teff, logg, M_H, alpha, C
-        nodes = []
-        for i in range(1, 6):  # 5 parameters
-            nodes.append(jnp.array(f[f'grid_values/{i}'][:]))
+            # Load atmosphere grid
+            # HDF5 storage: (C, alpha, M_H, logg, Teff, quantities, layers)
+            # We need: (layers, quantities, Teff, logg, M_H, alpha, C)
+            # Permutation: (6, 5, 4, 3, 2, 1, 0)
+            grid_raw = jnp.array(f['grid'][:])
+            grid = jnp.transpose(grid_raw, (6, 5, 4, 3, 2, 1, 0))
 
-        # Load atmosphere grid
-        # HDF5 storage: (C, alpha, M_H, logg, Teff, quantities, layers)
-        # We need: (layers, quantities, Teff, logg, M_H, alpha, C)
-        # Permutation: (6, 5, 4, 3, 2, 1, 0)
-        grid_raw = jnp.array(f['grid'][:])
-        grid = jnp.transpose(grid_raw, (6, 5, 4, 3, 2, 1, 0))
+        return nodes, grid
 
-    return nodes, grid
+    except Exception as e:
+        raise RuntimeError(f"Failed to load MARCS grid from {path}: {e}") from e
 
 
 def interpolate_marcs(
@@ -212,7 +313,9 @@ def interpolate_marcs(
     Interpolate a MARCS model atmosphere.
 
     Returns a model atmosphere computed by interpolating models from MARCS
-    (Gustafsson+ 2008) using multilinear interpolation.
+    (Gustafsson+ 2008) using multilinear interpolation. The MARCS atmosphere
+    grid is automatically downloaded from AWS S3 on first use and cached in
+    ~/.korg/ (or $KORG_DATA_DIR if set).
 
     Parameters
     ----------
@@ -248,9 +351,14 @@ def interpolate_marcs(
 
     Reference wavelength is 5000 Å (5e-5 cm) for MARCS models.
 
+    On first call, this function will download the MARCS atmosphere grid
+    (~380 MB) from AWS S3. The download is cached in ~/.korg/ so subsequent
+    calls are fast. Set the KORG_DATA_DIR environment variable to use a
+    different cache directory.
+
     Examples
     --------
-    >>> # Solar-type star
+    >>> # Solar-type star (downloads grid on first use)
     >>> atm = interpolate_marcs(5777, 4.44, 0.0, 0.0, 0.0)
     >>> atm.n_layers
     56

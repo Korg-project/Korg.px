@@ -24,6 +24,15 @@ from . import atomic_data
 from .abundances import format_A_X, get_solar_abundances
 from .species import Species, Formula
 
+# Import artifact system (always available)
+from .artifacts import (
+    download_artifact,
+    get_artifact_path,
+    list_artifacts,
+    create_placeholder_artifact,
+    get_korg_data_dir
+)
+
 # These imports may fail if data files are not available
 try:
     from .synthesis import synthesize, load_synthesis_data, save_synthesis_data
@@ -56,6 +65,12 @@ __all__ = [
     "load_synthesis_data",
     "save_synthesis_data",
     "interpolate_marcs",
+    # Artifact system
+    "download_artifact",
+    "get_artifact_path",
+    "list_artifacts",
+    "create_placeholder_artifact",
+    "get_korg_data_dir",
     # Key classes
     "Species",
     "Formula",
