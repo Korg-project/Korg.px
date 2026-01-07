@@ -82,13 +82,12 @@ jobs:
       - name: Run tests with coverage
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         run: |
-          pytest tests/ -v --tb=short --cov=korg --cov-report=xml
+          pip install coveralls
+          pytest tests/ -v --tb=short --cov=korg --cov-report=lcov
 
-      - name: Upload coverage to Codecov
+      - name: Upload coverage to Coveralls
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        uses: codecov/codecov-action@v5
+        uses: coverallsapp/github-action@v2
         with:
-          files: coverage.xml
-          flags: python
-          name: python-coverage
-          fail_ci_if_error: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: coverage.lcov

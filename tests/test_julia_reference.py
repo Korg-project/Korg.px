@@ -378,6 +378,194 @@ class TestIsotopicDataReference:
                     f"Nuclear spin mismatch for Z={Z}, A={A}: Python={py_val}, Julia={julia_val}"
 
 
+class TestWavelengthUtilsReference:
+    """Compare wavelength conversion functions with Julia reference values."""
+
+    def test_air_to_vacuum(self, reference_data):
+        """air_to_vacuum should match Julia."""
+        from korg.utils import air_to_vacuum
+
+        ref = reference_data["wavelength_utils"]
+        for wl_str, julia_val in ref["air_to_vacuum"].items():
+            wl = float(wl_str)
+            py_val = air_to_vacuum(wl)
+            assert np.isclose(py_val, julia_val, rtol=1e-14), \
+                f"Mismatch at wl={wl}: Python={py_val}, Julia={julia_val}"
+
+    def test_vacuum_to_air(self, reference_data):
+        """vacuum_to_air should match Julia."""
+        from korg.utils import vacuum_to_air
+
+        ref = reference_data["wavelength_utils"]
+        for wl_str, julia_val in ref["vacuum_to_air"].items():
+            wl = float(wl_str)
+            py_val = vacuum_to_air(wl)
+            assert np.isclose(py_val, julia_val, rtol=1e-14), \
+                f"Mismatch at wl={wl}: Python={py_val}, Julia={julia_val}"
+
+
+class TestLinePhysicsReference:
+    """Compare line physics functions with Julia reference values."""
+
+    def test_sigma_line(self, reference_data):
+        """sigma_line (cross-section factor) should match Julia."""
+        from korg.line_absorption import sigma_line
+
+        ref = reference_data["line_physics"]["sigma_line"]
+        for wl_str, julia_val in ref["outputs"].items():
+            wl_A = float(wl_str)
+            wl_cm = wl_A * 1e-8
+            py_val = float(sigma_line(wl_cm))
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Mismatch at wl={wl_A}A: Python={py_val}, Julia={julia_val}"
+
+    def test_doppler_width(self, reference_data):
+        """doppler_width should match Julia."""
+        from korg.line_absorption import doppler_width
+        from korg.constants import amu_cgs
+
+        ref = reference_data["line_physics"]["doppler_width"]
+        for key, julia_val in ref["outputs"].items():
+            parts = key.split("_")
+            wl_A = float(parts[0])
+            T = float(parts[1])
+            mass_amu = float(parts[2])
+            xi_kms = float(parts[3])
+
+            wl_cm = wl_A * 1e-8
+            mass_g = mass_amu * amu_cgs
+            xi_cgs = xi_kms * 1e5
+
+            py_val = float(doppler_width(wl_cm, T, mass_g, xi_cgs))
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Mismatch for {key}: Python={py_val}, Julia={julia_val}"
+
+    def test_scaled_stark(self, reference_data):
+        """scaled_stark should match Julia."""
+        from korg.line_absorption import scaled_stark
+
+        ref = reference_data["line_physics"]["scaled_stark"]
+        for key, julia_val in ref["outputs"].items():
+            parts = key.split("_")
+            gamma = float(parts[0])
+            T = float(parts[1])
+
+            py_val = float(scaled_stark(gamma, T))
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Mismatch for gamma={gamma}, T={T}: Python={py_val}, Julia={julia_val}"
+
+
+class TestNormalPDFReference:
+    """Compare normal_pdf with Julia reference values."""
+
+    def test_normal_pdf(self, reference_data):
+        """normal_pdf should match Julia."""
+        from korg.utils import normal_pdf
+
+        ref = reference_data["normal_pdf"]
+        for key, julia_val in ref["outputs"].items():
+            parts = key.split("_")
+            delta = float(parts[0])
+            sigma = float(parts[1])
+
+            py_val = float(normal_pdf(delta, sigma))
+            assert np.isclose(py_val, julia_val, rtol=1e-10), \
+                f"Mismatch for delta={delta}, sigma={sigma}: Python={py_val}, Julia={julia_val}"
+
+
+class TestExponentialIntegral1Reference:
+    """Test exponential_integral_1 against Julia reference data."""
+
+    def test_exponential_integral_1(self, reference_data):
+        """exponential_integral_1 should match Julia."""
+        from korg.radiative_transfer.expint import exponential_integral_1
+
+        ref = reference_data["exponential_integral_1"]
+        for x_str, julia_val in ref["outputs"].items():
+            x = float(x_str)
+            py_val = float(exponential_integral_1(x))
+
+            # Allow slightly higher tolerance for x > 30 (both return 0)
+            if x > 30:
+                assert py_val == 0.0, f"For x={x} > 30, expected 0.0, got {py_val}"
+            else:
+                assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                    f"Mismatch for x={x}: Python={py_val}, Julia={julia_val}"
+
+
+class TestIntervalUtilsReference:
+    """Test Interval utilities against Julia reference data."""
+
+    def test_contained_exclusive(self, reference_data):
+        """contained() with exclusive interval should match Julia."""
+        from korg.utils import Interval, contained
+
+        ref = reference_data["interval_utils"]["contained"]
+        for key, julia_result in ref["outputs"].items():
+            parts = key.split("_")
+            value = float(parts[0])
+            lower = float(parts[1])
+            upper = float(parts[2])
+
+            interval = Interval(lower, upper)
+            py_result = contained(value, interval)
+
+            assert py_result == julia_result, \
+                f"Mismatch for contained({value}, Interval({lower}, {upper})): " \
+                f"Python={py_result}, Julia={julia_result}"
+
+    def test_closed_interval_contained(self, reference_data):
+        """contained() with closed_interval should match Julia."""
+        from korg.utils import closed_interval, contained
+
+        ref = reference_data["interval_utils"]["closed_interval_contained"]
+        for key, julia_result in ref["outputs"].items():
+            parts = key.split("_")
+            value = float(parts[0])
+            lower = float(parts[1])
+            upper = float(parts[2])
+
+            interval = closed_interval(lower, upper)
+            py_result = contained(value, interval)
+
+            assert py_result == julia_result, \
+                f"Mismatch for contained({value}, closed_interval({lower}, {upper})): " \
+                f"Python={py_result}, Julia={julia_result}"
+
+    def test_contained_slice(self, reference_data):
+        """contained_slice should match Julia."""
+        from korg.utils import Interval, closed_interval, contained_slice
+
+        ref = reference_data["interval_utils"]["contained_slice"]
+        test_vals = ref["test_vals"]
+
+        # Test exclusive interval
+        exclusive_ref = ref["outputs"]["exclusive_3_10"]
+        interval_exclusive = Interval(3.0, 10.0)
+        start, end = contained_slice(test_vals, interval_exclusive)
+
+        # Julia uses 1-based indexing, Python uses 0-based
+        # Julia's first:last is inclusive, Python's start:end is exclusive on end
+        julia_first = exclusive_ref["first"]  # 1-based
+        julia_last = exclusive_ref["last"]    # 1-based
+        julia_values = exclusive_ref["values"]
+
+        # Convert Julia indices to Python slice
+        py_values = test_vals[start:end]
+        assert list(py_values) == list(julia_values), \
+            f"Exclusive slice mismatch: Python got {py_values}, Julia got {julia_values}"
+
+        # Test closed interval
+        closed_ref = ref["outputs"]["closed_3_10"]
+        interval_closed = closed_interval(3.0, 10.0)
+        start, end = contained_slice(test_vals, interval_closed)
+
+        julia_values = closed_ref["values"]
+        py_values = test_vals[start:end]
+        assert list(py_values) == list(julia_values), \
+            f"Closed slice mismatch: Python got {py_values}, Julia got {julia_values}"
+
+
 class TestJITCompatibility:
     """Test that functions work with JAX JIT."""
 
@@ -415,6 +603,96 @@ class TestJITCompatibility:
         nu = jnp.array([6e14])  # ~5000 Angstrom
         result = rayleigh(nu, 1e15, 1e14, 1e10)
         assert np.isfinite(float(result[0]))
+
+    def test_sigma_line_jit(self):
+        """sigma_line should be JIT-compatible."""
+        from korg.line_absorption import sigma_line
+
+        @jax.jit
+        def compute_sigma(wl):
+            return sigma_line(wl)
+
+        wl_cm = 5000.0 * 1e-8
+        result = compute_sigma(wl_cm)
+        assert np.isfinite(float(result))
+
+    def test_doppler_width_jit(self):
+        """doppler_width should be JIT-compatible."""
+        from korg.line_absorption import doppler_width
+        from korg.constants import amu_cgs
+
+        @jax.jit
+        def compute_doppler(wl, T, mass, xi):
+            return doppler_width(wl, T, mass, xi)
+
+        wl_cm = 5000.0 * 1e-8
+        T = 5777.0
+        mass = 55.85 * amu_cgs
+        xi = 1e5  # 1 km/s
+        result = compute_doppler(wl_cm, T, mass, xi)
+        assert np.isfinite(float(result))
+
+    def test_scaled_stark_jit(self):
+        """scaled_stark should be JIT-compatible."""
+        from korg.line_absorption import scaled_stark
+
+        @jax.jit
+        def compute_stark(gamma, T):
+            return scaled_stark(gamma, T)
+
+        result = compute_stark(1e-6, 5777.0)
+        assert np.isfinite(float(result))
+
+    def test_normal_pdf_jit(self):
+        """normal_pdf should be JIT-compatible."""
+        from korg.utils import normal_pdf
+
+        @jax.jit
+        def compute_pdf(delta, sigma):
+            return normal_pdf(delta, sigma)
+
+        result = compute_pdf(1.0, 1.0)
+        assert np.isfinite(float(result))
+
+    def test_air_to_vacuum_jit(self):
+        """air_to_vacuum should be JIT-compatible."""
+        from korg.utils import air_to_vacuum
+
+        # Wrap in jax.jit
+        air_to_vacuum_jit = jax.jit(air_to_vacuum)
+
+        result = air_to_vacuum_jit(5000.0)
+        assert np.isfinite(float(result))
+        # Verify the result is reasonable (vacuum wavelength > air wavelength)
+        assert float(result) > 5000.0
+
+    def test_vacuum_to_air_jit(self):
+        """vacuum_to_air should be JIT-compatible."""
+        from korg.utils import vacuum_to_air
+
+        # Wrap in jax.jit
+        vacuum_to_air_jit = jax.jit(vacuum_to_air)
+
+        result = vacuum_to_air_jit(5000.0)
+        assert np.isfinite(float(result))
+        # Verify the result is reasonable (air wavelength < vacuum wavelength)
+        assert float(result) < 5000.0
+
+    def test_exponential_integral_1_jit(self):
+        """exponential_integral_1 should be JIT-compatible."""
+        from korg.radiative_transfer.expint import exponential_integral_1
+
+        # Already has @jit decorator, but test it works
+        result = exponential_integral_1(1.0)
+        assert np.isfinite(float(result))
+
+        # Test with a new JIT wrapper to verify
+        @jax.jit
+        def compute_e1(x):
+            return exponential_integral_1(x)
+
+        result2 = compute_e1(2.0)
+        assert np.isfinite(float(result2))
 
 
 if __name__ == "__main__":

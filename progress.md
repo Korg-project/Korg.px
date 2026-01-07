@@ -50,29 +50,31 @@ Each function has three checkboxes:
 ## Level 1: Simple Utility Functions (Constants Only)
 
 ### Wavelength Utilities (`utils.py`)
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `air_to_vacuum(λ)` - air to vacuum wavelength
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `vacuum_to_air(λ)` - vacuum to air wavelength
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `air_to_vacuum(λ)` - air to vacuum wavelength
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `vacuum_to_air(λ)` - vacuum to air wavelength
 
 ### Scattering (`continuum_absorption/scattering.py`)
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `electron_scattering(nₑ)` - Thomson scattering
 
 ### Line Physics (`line_absorption.py`)
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `sigma_line(λ)` - cross-section factor
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `doppler_width(λ₀, T, m, ξ)` - Doppler broadening σ
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `scaled_stark(γstark, T)` - temperature-scaled Stark
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `exponential_integral_1(x)` - E₁(x) approximation
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `sigma_line(λ)` - cross-section factor
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `doppler_width(λ₀, T, m, ξ)` - Doppler broadening σ
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `scaled_stark(γstark, T)` - temperature-scaled Stark
+
+### Exponential Integrals (`radiative_transfer/expint.py`)
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `exponential_integral_1(x)` - E₁(x) approximation
 
 ### Statistical Mechanics (`statmech.py`)
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `translational_U(m, T)` - translational partition function
 
 ### Interval Utilities (`utils.py`)
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `Interval` class - exclusive interval
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `closed_interval(lo, up)` - inclusive interval
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `contained(value, interval)` - check containment
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `contained_slice(vals, interval)` - slice indices
+- [x] Converted | [x] Tested (no JIT) | N/A (class) | `Interval` class - exclusive interval
+- [x] Converted | [x] Tested (no JIT) | N/A (class) | `closed_interval(lo, up)` - inclusive interval
+- [x] Converted | [x] Tested (no JIT) | N/A (class) | `contained(value, interval)` - check containment
+- [x] Converted | [x] Tested (no JIT) | N/A (class) | `contained_slice(vals, interval)` - slice indices
 
 ### LSF Utilities (`utils.py`)
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `normal_pdf(Δ, σ)` - Gaussian PDF
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `normal_pdf(Δ, σ)` - Gaussian PDF
 
 ---
 
@@ -200,19 +202,21 @@ Each function has three checkboxes:
 | Level | Total | Converted | Tested (no JIT) | Tested (JIT) |
 |-------|-------|-----------|-----------------|--------------|
 | 0     | 22    | 22        | 21              | 21           |
-| 1     | 12    | 2         | 2               | 2            |
+| 1     | 13    | 13        | 13              | 9            |
 | 2     | 14    | 9         | 3               | 0            |
 | 3     | 21    | 18        | 0               | 0            |
 | 4     | 12    | 12        | 0               | 0            |
 | 5     | 12    | 10        | 0               | 0            |
-| **Total** | **93** | **73** | **26** | **23** |
+| **Total** | **94** | **84** | **37** | **30** |
+
+Note: Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
 
 ---
 
 ## Test Results Summary
 
 Tests run against Julia reference data (`tests/test_julia_reference.py`):
-- **26 passed** (matching Julia to better than 1e-6 precision)
+- **43 passed** (matching Julia to better than 1e-6 precision)
 - **3 skipped** (missing implementations)
 
 ### Level 0 Passed Tests (all at rtol=1e-6):
@@ -224,15 +228,23 @@ Tests run against Julia reference data (`tests/test_julia_reference.py`):
 6. **Isotopic abundances (1)**: All elements Z=1-92 with all isotope mass numbers match
 7. **Isotopic nuclear spin degeneracies (1)**: All elements Z=1-92 with all isotope mass numbers match
 
-### Level 1-2 Passed Tests:
-8. **Electron scattering (1)**: All 5 test cases pass at rtol=1e-6
-9. **Rayleigh scattering (1)**: All 7 wavelengths pass at rtol=1e-6
-10. **Translational U (1)**: All 10 temperatures pass at rtol=1e-6
-11. **Gaunt factor (1)**: All 7 (log_u, log_γ2) combinations pass at rtol=1e-5
-12. **Hydrogenic ff (1)**: All 6 wavelengths pass at rtol=1e-5
+### Level 1 Passed Tests:
+8. **Wavelength utilities (2)**: air_to_vacuum, vacuum_to_air (11 wavelengths each)
+9. **Line physics (3)**: sigma_line (6 wavelengths), doppler_width (5 test cases), scaled_stark (4 test cases)
+10. **Normal PDF (1)**: All 8 (delta, sigma) combinations pass
+11. **Exponential integral E1 (1)**: All 13 test values across all branches pass
+12. **Interval utilities (3)**: contained (exclusive), closed_interval contained, contained_slice
 
-### JIT Compatibility Tests (3):
-- electron_scattering, translational_U, rayleigh
+### Level 2 Passed Tests:
+13. **Electron scattering (1)**: All 5 test cases pass at rtol=1e-6
+14. **Rayleigh scattering (1)**: All 7 wavelengths pass at rtol=1e-6
+15. **Translational U (1)**: All 10 temperatures pass at rtol=1e-6
+16. **Gaunt factor (1)**: All 7 (log_u, log_γ2) combinations pass at rtol=1e-5
+17. **Hydrogenic ff (1)**: All 6 wavelengths pass at rtol=1e-5
+
+### JIT Compatibility Tests (12):
+- Level 1: air_to_vacuum, vacuum_to_air, sigma_line, doppler_width, scaled_stark, normal_pdf, exponential_integral_1
+- Level 2: electron_scattering, translational_U, rayleigh (partial - uses assert)
 
 ### Skipped Tests (3):
 1. `Species.from_string` - Uses constructor with string parsing instead
@@ -243,3 +255,4 @@ Tests run against Julia reference data (`tests/test_julia_reference.py`):
 - `rayleigh()` uses Python `assert` which is not JIT-compatible; function works but cannot be fully JIT'd
 - Species and Formula classes work but have different API than Julia (constructor-based vs from_string)
 - `DEFAULT_ALPHA_ELEMENTS` is not exported from Julia Korg but is implemented in Python as [8, 10, 12, 14, 16, 18, 20, 22]
+- Interval utilities use Python classes and are not JIT-compatible (marked N/A)

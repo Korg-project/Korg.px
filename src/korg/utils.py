@@ -17,6 +17,60 @@ from .constants import kboltz_cgs, hplanck_cgs, c_cgs
 from .wavelengths import Wavelengths
 
 
+def air_to_vacuum(wavelength_air: float) -> float:
+    """
+    Convert wavelength from air to vacuum.
+
+    Formula from Birch and Downs (1994) via the VALD website.
+    Valid for wavelengths > 2000 Å.
+
+    Parameters
+    ----------
+    wavelength_air : float
+        Wavelength in air, in Angstroms.
+
+    Returns
+    -------
+    float
+        Wavelength in vacuum, in Angstroms.
+
+    See Also
+    --------
+    vacuum_to_air : The inverse conversion.
+    """
+    s = 1e4 / wavelength_air
+    n = (1 + 0.00008336624212083
+         + 0.02408926869968 / (130.1065924522 - s**2)
+         + 0.0001599740894897 / (38.92568793293 - s**2))
+    return wavelength_air * n
+
+
+def vacuum_to_air(wavelength_vacuum: float) -> float:
+    """
+    Convert wavelength from vacuum to air.
+
+    Formula from Birch and Downs (1994) via the VALD website.
+    Valid for wavelengths > 2000 Å.
+
+    Parameters
+    ----------
+    wavelength_vacuum : float
+        Wavelength in vacuum, in Angstroms.
+
+    Returns
+    -------
+    float
+        Wavelength in air, in Angstroms.
+
+    See Also
+    --------
+    air_to_vacuum : The inverse conversion.
+    """
+    s = 1e4 / wavelength_vacuum
+    n = 1 + 0.0000834254 + 0.02406147 / (130 - s**2) + 0.00015998 / (38.9 - s**2)
+    return wavelength_vacuum / n
+
+
 def normal_pdf(delta, sigma):
     """
     Probability density function of a normal distribution.
@@ -60,6 +114,173 @@ def translational_U(m, T):
     The formula is: (2πmkT/h²)^(3/2)
     """
     return (2 * jnp.pi * m * kboltz_cgs * T / hplanck_cgs**2)**1.5
+
+
+# =============================================================================
+# Interval utilities (for bounds checking in continuum absorption)
+# =============================================================================
+
+def _nextfloat_skipsubnorm(v):
+    """
+    Return the next floating point value after v, skipping subnormals.
+
+    Matches Julia's behavior for interval boundary handling.
+    """
+    floatmin = np.finfo(np.float64).tiny  # smallest positive normalized float
+    if -floatmin <= v < 0:
+        return 0.0
+    elif 0 <= v < floatmin:
+        return floatmin
+    else:
+        return np.nextafter(v, np.inf)
+
+
+def _prevfloat_skipsubnorm(v):
+    """
+    Return the previous floating point value before v, skipping subnormals.
+
+    Matches Julia's behavior for interval boundary handling.
+    """
+    floatmin = np.finfo(np.float64).tiny  # smallest positive normalized float
+    if -floatmin < v <= 0:
+        return -floatmin
+    elif 0 < v <= floatmin:
+        return 0.0
+    else:
+        return np.nextafter(v, -np.inf)
+
+
+class Interval:
+    """
+    Represents an interval with configurable exclusive/inclusive bounds.
+
+    By default, both bounds are exclusive (open interval).
+    Use closed_interval() for inclusive bounds.
+
+    Parameters
+    ----------
+    lower : float
+        Lower bound of the interval.
+    upper : float
+        Upper bound of the interval.
+    exclusive_lower : bool, optional
+        If True (default), the lower bound is exclusive.
+    exclusive_upper : bool, optional
+        If True (default), the upper bound is exclusive.
+
+    Examples
+    --------
+    >>> interval = Interval(3.0, 10.0)  # exclusive: (3, 10)
+    >>> contained(5.0, interval)
+    True
+    >>> contained(3.0, interval)
+    False
+    """
+
+    def __init__(self, lower, upper, exclusive_lower=True, exclusive_upper=True):
+        if not lower < upper:
+            raise ValueError("the upper bound must exceed the lower bound")
+
+        lower, upper = float(lower), float(upper)
+
+        # Adjust bounds for inclusive intervals (matching Julia exactly)
+        if exclusive_lower or np.isinf(lower):
+            self.lower = lower
+        else:
+            self.lower = _prevfloat_skipsubnorm(lower)
+
+        if exclusive_upper or np.isinf(upper):
+            self.upper = upper
+        else:
+            self.upper = _nextfloat_skipsubnorm(upper)
+
+
+def closed_interval(lo, up):
+    """
+    Create an interval where both bounds are inclusive.
+
+    Parameters
+    ----------
+    lo : float
+        Lower bound (inclusive).
+    up : float
+        Upper bound (inclusive).
+
+    Returns
+    -------
+    Interval
+        An interval [lo, up] (closed on both ends).
+
+    Examples
+    --------
+    >>> interval = closed_interval(3.0, 10.0)  # inclusive: [3, 10]
+    >>> contained(3.0, interval)
+    True
+    >>> contained(10.0, interval)
+    True
+    """
+    return Interval(lo, up, exclusive_lower=False, exclusive_upper=False)
+
+
+def contained(value, interval):
+    """
+    Check whether a value is contained within an interval.
+
+    Parameters
+    ----------
+    value : float
+        The value to check.
+    interval : Interval
+        The interval to check against.
+
+    Returns
+    -------
+    bool
+        True if the value is within the interval bounds.
+
+    Examples
+    --------
+    >>> contained(5.0, Interval(1.0, 10.0))
+    True
+    >>> contained(0.5, Interval(1.0, 10.0))
+    False
+    """
+    return interval.lower < value < interval.upper
+
+
+def contained_slice(vals, interval):
+    """
+    Get the slice indices for values contained in an interval.
+
+    Returns a tuple (start, end) denoting the indices of elements in `vals`
+    (assumed to be sorted in increasing order) that are contained by the
+    interval. When no entries are contained, returns an empty range.
+
+    Parameters
+    ----------
+    vals : array-like
+        Sorted array of values.
+    interval : Interval
+        The interval to check against.
+
+    Returns
+    -------
+    tuple
+        (start_index, end_index) for slicing. Use vals[start:end] to get
+        the contained values.
+
+    Examples
+    --------
+    >>> vals = [1.0, 2.0, 5.0, 8.0, 12.0]
+    >>> interval = Interval(3.0, 10.0)
+    >>> start, end = contained_slice(vals, interval)
+    >>> vals[start:end]
+    [5.0, 8.0]
+    """
+    # Use bisect to find indices - matches Julia's searchsortedfirst/searchsortedlast
+    start = bisect_right(vals, interval.lower)  # First index > lower bound
+    end = bisect_left(vals, interval.upper)  # First index >= upper bound
+    return start, end
 
 
 def _resolve_R(R: Union[float, Callable], lambda0: float) -> float:

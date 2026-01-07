@@ -211,6 +211,204 @@ reference_data["solar_abundances"] = Dict(
 )
 
 # =============================================================================
+# Level 1: Wavelength Utilities
+# =============================================================================
+println("  - Wavelength utilities...")
+wavelengths_A = [3000.0, 4000.0, 4500.0, 5000.0, 5500.0, 6000.0, 7000.0, 8000.0, 10000.0, 15000.0, 20000.0]
+
+air_to_vacuum_results = Dict{String, Float64}()
+vacuum_to_air_results = Dict{String, Float64}()
+for wl in wavelengths_A
+    air_to_vacuum_results[string(wl)] = Korg.air_to_vacuum(wl)
+    vacuum_to_air_results[string(wl)] = Korg.vacuum_to_air(wl)
+end
+reference_data["wavelength_utils"] = Dict(
+    "inputs" => Dict("wavelengths_angstrom" => wavelengths_A),
+    "air_to_vacuum" => air_to_vacuum_results,
+    "vacuum_to_air" => vacuum_to_air_results,
+)
+
+# =============================================================================
+# Level 1: Line Physics Functions
+# =============================================================================
+println("  - Line physics functions...")
+
+# sigma_line: cross-section factor
+sigma_line_wavelengths_A = [3000.0, 4000.0, 5000.0, 6000.0, 8000.0, 10000.0]
+sigma_line_results = Dict{String, Float64}()
+for wl_A in sigma_line_wavelengths_A
+    wl_cm = wl_A * 1e-8
+    sigma_line_results[string(wl_A)] = Korg.sigma_line(wl_cm)
+end
+
+# doppler_width: Doppler broadening parameter
+# Test at different temperatures, masses, microturbulence values
+doppler_test_cases = [
+    # (wl_A, T, mass_amu, xi_km/s) -> result
+    (5000.0, 5777.0, 55.85, 1.0),   # Fe at solar temp
+    (5000.0, 10000.0, 55.85, 1.0),  # Fe at hot temp
+    (5000.0, 5777.0, 55.85, 2.0),   # Fe with higher xi
+    (5000.0, 5777.0, 1.008, 1.0),   # H at solar temp
+    (4000.0, 5777.0, 55.85, 1.0),   # Fe at different wavelength
+]
+doppler_results = Dict{String, Float64}()
+for (wl_A, T, mass_amu, xi_kms) in doppler_test_cases
+    wl_cm = wl_A * 1e-8
+    mass_g = mass_amu * Korg.amu_cgs
+    xi_cgs = xi_kms * 1e5
+    result = Korg.doppler_width(wl_cm, T, mass_g, xi_cgs)
+    key = "$(wl_A)_$(T)_$(mass_amu)_$(xi_kms)"
+    doppler_results[key] = result
+end
+
+# scaled_stark: Stark broadening temperature scaling
+stark_test_cases = [
+    # (gamma_stark, T) -> result
+    (1e-6, 5777.0),
+    (1e-6, 10000.0),
+    (1e-5, 5777.0),
+    (1e-5, 10000.0),
+]
+scaled_stark_results = Dict{String, Float64}()
+for (gamma, T) in stark_test_cases
+    result = Korg.scaled_stark(gamma, T)
+    key = "$(gamma)_$(T)"
+    scaled_stark_results[key] = result
+end
+
+reference_data["line_physics"] = Dict(
+    "sigma_line" => Dict(
+        "inputs" => Dict("wavelengths_angstrom" => sigma_line_wavelengths_A),
+        "outputs" => sigma_line_results,
+    ),
+    "doppler_width" => Dict(
+        "inputs" => doppler_test_cases,
+        "outputs" => doppler_results,
+    ),
+    "scaled_stark" => Dict(
+        "inputs" => stark_test_cases,
+        "outputs" => scaled_stark_results,
+    ),
+)
+
+# =============================================================================
+# Level 1: normal_pdf (LSF utility)
+# =============================================================================
+println("  - Normal PDF...")
+normal_pdf_test_cases = [
+    # (delta, sigma) -> result
+    (0.0, 1.0),
+    (0.5, 1.0),
+    (1.0, 1.0),
+    (2.0, 1.0),
+    (0.0, 0.5),
+    (0.5, 0.5),
+    (0.0, 2.0),
+    (1.0, 2.0),
+]
+normal_pdf_results = Dict{String, Float64}()
+for (delta, sigma) in normal_pdf_test_cases
+    # Julia uses Distributions.Normal, but the PDF is 1/(σ√(2π)) * exp(-Δ²/(2σ²))
+    result = exp(-0.5 * delta^2 / sigma^2) / sqrt(2 * pi) / sigma
+    key = "$(delta)_$(sigma)"
+    normal_pdf_results[key] = result
+end
+reference_data["normal_pdf"] = Dict(
+    "inputs" => normal_pdf_test_cases,
+    "outputs" => normal_pdf_results,
+)
+
+# =============================================================================
+# Level 1: exponential_integral_1 (E1)
+# =============================================================================
+println("  - Exponential integral E1...")
+# Test at various x values covering all branches of the piecewise approximation
+e1_test_values = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 35.0]
+e1_results = Dict{String, Float64}()
+for x in e1_test_values
+    result = Korg.exponential_integral_1(x)
+    e1_results[string(x)] = result
+end
+reference_data["exponential_integral_1"] = Dict(
+    "inputs" => Dict("test_values" => e1_test_values),
+    "outputs" => e1_results,
+)
+
+# =============================================================================
+# Level 1: Interval utilities
+# =============================================================================
+println("  - Interval utilities...")
+
+# Test contained() function with exclusive interval
+interval_test_cases = [
+    # (value, lower, upper, expected_result)
+    (5.0, 3.0, 10.0, true),   # value inside
+    (3.0, 3.0, 10.0, false),  # value at lower bound (exclusive)
+    (10.0, 3.0, 10.0, false), # value at upper bound (exclusive)
+    (2.0, 3.0, 10.0, false),  # value below lower bound
+    (11.0, 3.0, 10.0, false), # value above upper bound
+]
+contained_results = Dict{String, Bool}()
+for (value, lower, upper, _) in interval_test_cases
+    interval = Korg.Interval(lower, upper)
+    result = Korg.contained(value, interval)
+    key = "$(value)_$(lower)_$(upper)"
+    contained_results[key] = result
+end
+
+# Test closed_interval (inclusive bounds)
+closed_interval_test_cases = [
+    # (value, lower, upper, expected_result)
+    (3.0, 3.0, 10.0, true),   # value at lower bound (inclusive)
+    (10.0, 3.0, 10.0, true),  # value at upper bound (inclusive)
+    (5.0, 3.0, 10.0, true),   # value inside
+    (2.0, 3.0, 10.0, false),  # value below lower bound
+    (11.0, 3.0, 10.0, false), # value above upper bound
+]
+closed_contained_results = Dict{String, Bool}()
+for (value, lower, upper, _) in closed_interval_test_cases
+    interval = Korg.closed_interval(lower, upper)
+    result = Korg.contained(value, interval)
+    key = "$(value)_$(lower)_$(upper)"
+    closed_contained_results[key] = result
+end
+
+# Test contained_slice
+contained_slice_test_vals = [1.0, 2.0, 4.0, 5.0, 6.0, 8.0, 9.0, 12.0]
+contained_slice_results = Dict{String, Any}()
+# Exclusive interval (3, 10)
+interval_exclusive = Korg.Interval(3.0, 10.0)
+slice_exclusive = Korg.contained_slice(contained_slice_test_vals, interval_exclusive)
+contained_slice_results["exclusive_3_10"] = Dict(
+    "first" => first(slice_exclusive),
+    "last" => last(slice_exclusive),
+    "values" => contained_slice_test_vals[slice_exclusive]
+)
+# Closed interval [3, 10]
+interval_closed = Korg.closed_interval(3.0, 10.0)
+slice_closed = Korg.contained_slice(contained_slice_test_vals, interval_closed)
+contained_slice_results["closed_3_10"] = Dict(
+    "first" => first(slice_closed),
+    "last" => last(slice_closed),
+    "values" => contained_slice_test_vals[slice_closed]
+)
+
+reference_data["interval_utils"] = Dict(
+    "contained" => Dict(
+        "inputs" => interval_test_cases,
+        "outputs" => contained_results,
+    ),
+    "closed_interval_contained" => Dict(
+        "inputs" => closed_interval_test_cases,
+        "outputs" => closed_contained_results,
+    ),
+    "contained_slice" => Dict(
+        "test_vals" => contained_slice_test_vals,
+        "outputs" => contained_slice_results,
+    ),
+)
+
+# =============================================================================
 # Isotopic Data
 # =============================================================================
 println("  - Isotopic data...")

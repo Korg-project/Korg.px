@@ -1,18 +1,95 @@
 """
 Exponential integral approximations for radiative transfer.
 
-Implements E2(x) = ∫₁^∞ exp(-x*t) / t² dt using piecewise polynomial
-approximations that are accurate within ~1% for all x > 0.
+Implements E1(x) and E2(x) exponential integrals using piecewise polynomial
+approximations.
 
-This is a direct port of the Julia implementation from Korg.jl's
-RadiativeTransfer module, using the same polynomial coefficients
-and breakpoints.
+This is a direct port of the Julia implementation from Korg.jl,
+using the same polynomial coefficients and breakpoints.
 
-Reference: Korg.jl RadiativeTransfer module (Julia implementation)
+Reference: Korg.jl RadiativeTransfer module and line_absorption.jl (Julia implementation)
 """
 
 import jax.numpy as jnp
 from jax import jit
+
+
+@jit
+def exponential_integral_1(x):
+    """
+    Compute the first exponential integral E1(x).
+
+    E1(x) = ∫₁^∞ exp(-x*t) / t dt
+
+    This is a rough approximation lifted from Kurucz's VCSE1F.
+    Used in hydrogen line profile calculations (brackett_line_profile).
+
+    Parameters
+    ----------
+    x : float or array
+        Argument
+
+    Returns
+    -------
+    float or array
+        E1(x)
+
+    Notes
+    -----
+    This matches the Julia implementation exactly:
+    - For x < 0: returns 0.0
+    - For x <= 0.01: -log(x) - 0.577215 + x
+    - For x <= 1.0: polynomial approximation
+    - For x <= 30.0: rational approximation
+    - For x > 30: returns 0.0
+
+    Examples
+    --------
+    >>> exponential_integral_1(0.5)  # doctest: +SKIP
+    0.5597...
+    >>> exponential_integral_1(1.0)  # doctest: +SKIP
+    0.2193...
+    """
+    # Euler-Mascheroni constant (used in small x approximations)
+    euler_short = 0.577215
+    euler_long = 0.57721566
+
+    def _e1_tiny(x):
+        # For x <= 0.01: -log(x) - 0.577215 + x
+        return -jnp.log(x) - euler_short + x
+
+    def _e1_small(x):
+        # For 0.01 < x <= 1.0: polynomial approximation
+        return (-jnp.log(x) - euler_long +
+                x * (0.99999193 +
+                     x * (-0.24991055 +
+                          x * (0.05519968 +
+                               x * (-0.00976004 +
+                                    x * 0.00107857)))))
+
+    def _e1_medium(x):
+        # For 1.0 < x <= 30.0: rational approximation
+        return ((x * (x + 2.334733) + 0.25062) /
+                (x * (x + 3.330657) + 1.681534) / x * jnp.exp(-x))
+
+    # Piecewise function using nested jnp.where
+    return jnp.where(
+        x < 0,
+        0.0,
+        jnp.where(
+            x <= 0.01,
+            _e1_tiny(x),
+            jnp.where(
+                x <= 1.0,
+                _e1_small(x),
+                jnp.where(
+                    x <= 30.0,
+                    _e1_medium(x),
+                    0.0
+                )
+            )
+        )
+    )
 
 
 @jit
