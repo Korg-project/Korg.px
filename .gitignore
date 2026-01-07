@@ -50,6 +50,12 @@ Thumbs.db
 # juliacall
 .julia/
 
+Manifest.toml
+
 # Project specific
 results_*.json
 results_*.json.tmp
+
+# CLOD
+.claude
+CLAUDE.md
