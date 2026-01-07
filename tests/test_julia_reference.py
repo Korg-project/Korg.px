@@ -566,6 +566,187 @@ class TestIntervalUtilsReference:
             f"Closed slice mismatch: Python got {py_values}, Julia got {julia_values}"
 
 
+# =============================================================================
+# Level 2 Tests
+# =============================================================================
+
+class TestHarrisSeriesReference:
+    """Test harris_series against Julia reference data."""
+
+    def test_harris_series(self, reference_data):
+        """harris_series should match Julia."""
+        from korg.line_profiles import harris_series
+
+        ref = reference_data["harris_series"]
+        for v_str, julia_vals in ref["outputs"].items():
+            v = float(v_str)
+            H0, H1, H2 = harris_series(v)
+
+            assert np.isclose(float(H0), julia_vals["H0"], rtol=1e-6), \
+                f"H0 mismatch for v={v}: Python={H0}, Julia={julia_vals['H0']}"
+            assert np.isclose(float(H1), julia_vals["H1"], rtol=1e-6), \
+                f"H1 mismatch for v={v}: Python={H1}, Julia={julia_vals['H1']}"
+            assert np.isclose(float(H2), julia_vals["H2"], rtol=1e-6), \
+                f"H2 mismatch for v={v}: Python={H2}, Julia={julia_vals['H2']}"
+
+
+class TestVoigtHjertingReference:
+    """Test voigt_hjerting against Julia reference data."""
+
+    def test_voigt_hjerting(self, reference_data):
+        """voigt_hjerting should match Julia."""
+        from korg.line_profiles import voigt_hjerting
+
+        ref = reference_data["voigt_hjerting"]
+        for key, julia_val in ref["outputs"].items():
+            parts = key.split("_")
+            alpha = float(parts[0])
+            v = float(parts[1])
+
+            py_val = float(voigt_hjerting(alpha, v))
+            assert np.isclose(py_val, julia_val, rtol=1e-5), \
+                f"Mismatch for alpha={alpha}, v={v}: Python={py_val}, Julia={julia_val}"
+
+
+class TestLineProfileReference:
+    """Test line_profile against Julia reference data."""
+
+    def test_line_profile(self, reference_data):
+        """line_profile should match Julia."""
+        from korg.line_profiles import line_profile
+
+        ref = reference_data["line_profile"]
+        inputs = ref["inputs"]
+        outputs = ref["outputs"]
+
+        for i, (wl0, sigma, gamma, amp, wl) in enumerate(inputs):
+            julia_val = outputs[str(i + 1)]  # Julia is 1-indexed
+            py_val = float(line_profile(wl0, sigma, gamma, amp, wl))
+
+            assert np.isclose(py_val, julia_val, rtol=1e-5), \
+                f"Mismatch for case {i}: Python={py_val}, Julia={julia_val}"
+
+
+class TestInverseGaussianDensityReference:
+    """Test inverse_gaussian_density against Julia reference data."""
+
+    def test_inverse_gaussian_density(self, reference_data):
+        """inverse_gaussian_density should match Julia."""
+        from korg.line_profiles import inverse_gaussian_density
+
+        ref = reference_data["inverse_gaussian_density"]
+        for key, julia_val in ref["outputs"].items():
+            parts = key.split("_")
+            rho = float(parts[0])
+            sigma = float(parts[1])
+
+            py_val = float(inverse_gaussian_density(rho, sigma))
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Mismatch for rho={rho}, sigma={sigma}: Python={py_val}, Julia={julia_val}"
+
+
+class TestInverseLorentzDensityReference:
+    """Test inverse_lorentz_density against Julia reference data."""
+
+    def test_inverse_lorentz_density(self, reference_data):
+        """inverse_lorentz_density should match Julia."""
+        from korg.line_profiles import inverse_lorentz_density
+
+        ref = reference_data["inverse_lorentz_density"]
+        for key, julia_val in ref["outputs"].items():
+            parts = key.split("_")
+            rho = float(parts[0])
+            gamma = float(parts[1])
+
+            py_val = float(inverse_lorentz_density(rho, gamma))
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Mismatch for rho={rho}, gamma={gamma}: Python={py_val}, Julia={julia_val}"
+
+
+class TestScaledVdWReference:
+    """Test scaled_vdW against Julia reference data."""
+
+    def test_scaled_vdW(self, reference_data):
+        """scaled_vdW should match Julia."""
+        from korg.line_absorption import scaled_vdW
+
+        ref = reference_data["scaled_vdW"]
+        inputs = ref["inputs"]
+        outputs = ref["outputs"]
+
+        for i, (vdW, mass, T) in enumerate(inputs):
+            julia_val = outputs[str(i + 1)]  # Julia is 1-indexed
+            py_val = float(scaled_vdW(tuple(vdW), mass, T))
+
+            assert np.isclose(py_val, julia_val, rtol=1e-5), \
+                f"Mismatch for case {i}: vdW={vdW}, mass={mass}, T={T}: Python={py_val}, Julia={julia_val}"
+
+
+class TestSpeciesDetailsReference:
+    """Test Species class against Julia reference data."""
+
+    def test_species_atoms(self, reference_data):
+        """Species atomic properties should match Julia."""
+        from korg.species import Species
+
+        ref = reference_data["species_details"]
+
+        # Test atomic species
+        for code in ["Fe I", "Fe II", "Ca II", "H I", "He I"]:
+            julia_data = ref[code]
+            sp = Species(code)
+
+            assert sp.charge == julia_data["charge"], \
+                f"Charge mismatch for {code}: Python={sp.charge}, Julia={julia_data['charge']}"
+            assert np.isclose(sp.get_mass(), julia_data["mass"], rtol=1e-6), \
+                f"Mass mismatch for {code}: Python={sp.get_mass()}, Julia={julia_data['mass']}"
+            assert sp.is_molecule() == julia_data["is_molecule"], \
+                f"is_molecule mismatch for {code}"
+            assert sp.n_atoms() == julia_data["n_atoms"], \
+                f"n_atoms mismatch for {code}"
+
+    def test_species_molecules(self, reference_data):
+        """Species molecular properties should match Julia."""
+        from korg.species import Species
+
+        ref = reference_data["species_details"]
+
+        # Test molecular species
+        for code in ["CO", "H2O", "FeH", "TiO", "C2"]:
+            julia_data = ref[code]
+            sp = Species(code)
+
+            assert sp.charge == julia_data["charge"], \
+                f"Charge mismatch for {code}: Python={sp.charge}, Julia={julia_data['charge']}"
+            assert np.isclose(sp.get_mass(), julia_data["mass"], rtol=1e-6), \
+                f"Mass mismatch for {code}: Python={sp.get_mass()}, Julia={julia_data['mass']}"
+            assert sp.is_molecule() == julia_data["is_molecule"], \
+                f"is_molecule mismatch for {code}"
+            assert sp.n_atoms() == julia_data["n_atoms"], \
+                f"n_atoms mismatch for {code}"
+
+
+class TestFormulaDetailsReference:
+    """Test Formula class against Julia reference data."""
+
+    def test_formula_properties(self, reference_data):
+        """Formula properties should match Julia."""
+        from korg.species import Formula
+
+        ref = reference_data["formula_details"]
+
+        for code in ["H", "Fe", "CO", "H2O", "FeH", "C2", "TiO"]:
+            julia_data = ref[code]
+            f = Formula(code)
+
+            assert np.isclose(f.get_mass(), julia_data["mass"], rtol=1e-6), \
+                f"Mass mismatch for {code}: Python={f.get_mass()}, Julia={julia_data['mass']}"
+            assert f.n_atoms() == julia_data["n_atoms"], \
+                f"n_atoms mismatch for {code}: Python={f.n_atoms()}, Julia={julia_data['n_atoms']}"
+            assert f.is_molecule() == julia_data["is_molecule"], \
+                f"is_molecule mismatch for {code}: Python={f.is_molecule()}, Julia={julia_data['is_molecule']}"
+
+
 class TestJITCompatibility:
     """Test that functions work with JAX JIT."""
 
@@ -693,6 +874,71 @@ class TestJITCompatibility:
 
         result2 = compute_e1(2.0)
         assert np.isfinite(float(result2))
+
+    # Level 2 JIT tests
+
+    def test_harris_series_jit(self):
+        """harris_series should be JIT-compatible."""
+        from korg.line_profiles import harris_series
+
+        # Already has @jit decorator
+        H0, H1, H2 = harris_series(1.0)
+        assert np.isfinite(float(H0))
+        assert np.isfinite(float(H1))
+        assert np.isfinite(float(H2))
+
+    def test_voigt_hjerting_jit(self):
+        """voigt_hjerting should be JIT-compatible."""
+        from korg.line_profiles import voigt_hjerting
+
+        # Already has @jit decorator
+        result = voigt_hjerting(0.5, 1.0)
+        assert np.isfinite(float(result))
+
+    def test_line_profile_jit(self):
+        """line_profile should be JIT-compatible."""
+        from korg.line_profiles import line_profile
+
+        # Already has @jit decorator
+        result = line_profile(5000e-8, 0.01e-8, 0.001e-8, 1.0, 5000e-8)
+        assert np.isfinite(float(result))
+
+    def test_inverse_gaussian_density_jit(self):
+        """inverse_gaussian_density should be JIT-compatible."""
+        from korg.line_profiles import inverse_gaussian_density
+
+        # Already has @jit decorator
+        result = inverse_gaussian_density(0.1, 1.0)
+        assert np.isfinite(float(result))
+
+    def test_inverse_lorentz_density_jit(self):
+        """inverse_lorentz_density should be JIT-compatible."""
+        from korg.line_profiles import inverse_lorentz_density
+
+        # Already has @jit decorator
+        result = inverse_lorentz_density(0.1, 1.0)
+        assert np.isfinite(float(result))
+
+    def test_scaled_vdW_jit(self):
+        """scaled_vdW should be JIT-compatible with both simple and ABO scaling."""
+        from korg.line_absorption import scaled_vdW
+        from korg.constants import amu_cgs
+
+        # Test simple scaling (vdW[1] == -1)
+        @jax.jit
+        def compute_vdw_simple(T):
+            return scaled_vdW((1e-7, -1.0), 55.85 * amu_cgs, T)
+
+        result = compute_vdw_simple(5777.0)
+        assert np.isfinite(float(result))
+
+        # Test ABO scaling (vdW[1] != -1) - now uses jax.scipy.special.gamma
+        @jax.jit
+        def compute_vdw_abo(T):
+            return scaled_vdW((300.0, 0.25), 55.85 * amu_cgs, T)
+
+        result_abo = compute_vdw_abo(5777.0)
+        assert np.isfinite(float(result_abo))
 
 
 if __name__ == "__main__":

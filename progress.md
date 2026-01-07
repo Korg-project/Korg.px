@@ -81,27 +81,27 @@ Each function has three checkboxes:
 ## Level 2: Functions with Simple Dependencies
 
 ### Species and Formula (`species.py`)
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `Formula` class - chemical formula representation
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `Species` class - species with charge
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `n_atoms(species)` - count atoms in molecule
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `get_atoms(formula)` - get atomic numbers
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `get_mass(species)` - get species mass
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `ismolecule(species)` - check if molecule
+- [x] Converted | [x] Tested (no JIT) | N/A (class) | `Formula` class - chemical formula representation
+- [x] Converted | [x] Tested (no JIT) | N/A (class) | `Species` class - species with charge
+- [x] Converted | [x] Tested (no JIT) | N/A (class) | `n_atoms(species)` - count atoms in molecule
+- [x] Converted | [x] Tested (no JIT) | N/A (class) | `get_atoms(formula)` - get atomic numbers
+- [x] Converted | [x] Tested (no JIT) | N/A (class) | `get_mass(species)` - get species mass
+- [x] Converted | [x] Tested (no JIT) | N/A (class) | `ismolecule(species)` - check if molecule
 
-### Voigt Profile (`line_absorption.py`)
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `harris_series(v)` - Harris series for Voigt
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `voigt_hjerting(α, v)` - Voigt-Hjerting function
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `line_profile(λ₀, σ, γ, amplitude, λ)` - Voigt profile
+### Voigt Profile (`line_profiles.py`)
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `harris_series(v)` - Harris series for Voigt
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `voigt_hjerting(α, v)` - Voigt-Hjerting function
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `line_profile(λ₀, σ, γ, amplitude, λ)` - Voigt profile
 
-### Line Window Functions (`line_absorption.py`)
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `inverse_gaussian_density(ρ, σ)` - inverse Gaussian
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `inverse_lorentz_density(ρ, γ)` - inverse Lorentz
+### Line Window Functions (`line_profiles.py`)
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `inverse_gaussian_density(ρ, σ)` - inverse Gaussian
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `inverse_lorentz_density(ρ, γ)` - inverse Lorentz
 
 ### VdW Broadening (`line_absorption.py`)
-- [ ] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `scaled_vdW(vdW, m, T)` - van der Waals broadening
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `scaled_vdW(vdW, m, T)` - van der Waals broadening (both simple and ABO modes)
 
 ### Scattering (`continuum_absorption/scattering.py`)
-- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `rayleigh(νs, nH_I, nHe_I, nH2)` - Rayleigh scattering (uses assert, not JIT-compatible)
+- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `rayleigh(νs, nH_I, nHe_I, nH2)` - Rayleigh scattering 
 
 ### Gaunt Factors (`continuum_absorption/hydrogenic_bf_ff.py`)
 - [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `gaunt_ff_vanHoof(log_u, log_γ2)` - ff Gaunt factor interpolation
@@ -203,21 +203,24 @@ Each function has three checkboxes:
 |-------|-------|-----------|-----------------|--------------|
 | 0     | 22    | 22        | 21              | 21           |
 | 1     | 13    | 13        | 13              | 9            |
-| 2     | 14    | 9         | 3               | 0            |
+| 2     | 15    | 15        | 15              | 7            |
 | 3     | 21    | 18        | 0               | 0            |
 | 4     | 12    | 12        | 0               | 0            |
 | 5     | 12    | 10        | 0               | 0            |
-| **Total** | **94** | **84** | **37** | **30** |
+| **Total** | **95** | **90** | **49** | **37** |
 
-Note: Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
+Notes:
+- Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
+- Level 2 Species/Formula (6 items) are marked N/A for JIT as they use Python classes (can be used as static args).
+- Level 2 rayleigh, gaunt_ff, and hydrogenic_ff are not JIT-compatible due to assert/interpolation.
 
 ---
 
 ## Test Results Summary
 
 Tests run against Julia reference data (`tests/test_julia_reference.py`):
-- **43 passed** (matching Julia to better than 1e-6 precision)
-- **3 skipped** (missing implementations)
+- **58 passed** (matching Julia to better than 1e-6 precision)
+- **3 skipped** (legacy tests using from_string API)
 
 ### Level 0 Passed Tests (all at rtol=1e-6):
 1. **Physical Constants (7)**: c_cgs, hplanck_cgs, kboltz_cgs, electron_mass_cgs, Rydberg_eV, kboltz_eV, hplanck_eV
@@ -241,10 +244,19 @@ Tests run against Julia reference data (`tests/test_julia_reference.py`):
 15. **Translational U (1)**: All 10 temperatures pass at rtol=1e-6
 16. **Gaunt factor (1)**: All 7 (log_u, log_γ2) combinations pass at rtol=1e-5
 17. **Hydrogenic ff (1)**: All 6 wavelengths pass at rtol=1e-5
+18. **Harris series (1)**: All 9 v values pass
+19. **Voigt-Hjerting (1)**: All 11 (alpha, v) combinations pass across all branches
+20. **Line profile (1)**: All 5 test cases pass
+21. **Inverse Gaussian density (1)**: All 6 test cases pass
+22. **Inverse Lorentz density (1)**: All 5 test cases pass
+23. **scaled_vdW (1)**: All 6 test cases (simple + ABO) pass
+24. **Species atoms (1)**: 5 atomic species (Fe I, Fe II, Ca II, H I, He I)
+25. **Species molecules (1)**: 5 molecular species (CO, H2O, FeH, TiO, C2)
+26. **Formula properties (1)**: 7 formulas (H, Fe, CO, H2O, FeH, C2, TiO)
 
-### JIT Compatibility Tests (12):
+### JIT Compatibility Tests (19):
 - Level 1: air_to_vacuum, vacuum_to_air, sigma_line, doppler_width, scaled_stark, normal_pdf, exponential_integral_1
-- Level 2: electron_scattering, translational_U, rayleigh (partial - uses assert)
+- Level 2: electron_scattering, translational_U, rayleigh (partial), harris_series, voigt_hjerting, line_profile, inverse_gaussian_density, inverse_lorentz_density, scaled_vdW (both simple and ABO modes)
 
 ### Skipped Tests (3):
 1. `Species.from_string` - Uses constructor with string parsing instead
@@ -252,7 +264,7 @@ Tests run against Julia reference data (`tests/test_julia_reference.py`):
 3. `test_species_is_molecule` - Depends on Species.from_string
 
 ### Known Issues:
-- `rayleigh()` uses Python `assert` which is not JIT-compatible; function works but cannot be fully JIT'd
 - Species and Formula classes work but have different API than Julia (constructor-based vs from_string)
 - `DEFAULT_ALPHA_ELEMENTS` is not exported from Julia Korg but is implemented in Python as [8, 10, 12, 14, 16, 18, 20, 22]
 - Interval utilities use Python classes and are not JIT-compatible (marked N/A)
+- Species/Formula can be used in JIT functions as static arguments but not as traced values

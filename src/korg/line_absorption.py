@@ -18,7 +18,7 @@ from .constants import (
 )
 from .line_profiles import voigt_hjerting
 from .atomic_data import atomic_masses
-from scipy.special import gamma as gamma_function
+from jax.scipy.special import gamma as gamma_function
 
 
 def inverse_gaussian_density(rho: float, sigma: float) -> float:

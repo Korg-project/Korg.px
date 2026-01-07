@@ -409,6 +409,190 @@ reference_data["interval_utils"] = Dict(
 )
 
 # =============================================================================
+# Level 2: Voigt Profile Functions
+# =============================================================================
+println("  - Voigt profile functions...")
+
+# harris_series test cases (v < 5)
+harris_test_values = [0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 4.9]
+harris_results = Dict{String, Any}()
+for v in harris_test_values
+    H0, H1, H2 = Korg.harris_series(v)
+    harris_results[string(v)] = Dict("H0" => H0, "H1" => H1, "H2" => H2)
+end
+reference_data["harris_series"] = Dict(
+    "inputs" => Dict("test_values" => harris_test_values),
+    "outputs" => harris_results,
+)
+
+# voigt_hjerting test cases covering all branches
+voigt_test_cases = [
+    # (alpha, v) - covering different regions of the approximation
+    (0.1, 0.5),   # alpha <= 0.2, v < 5 (case 2)
+    (0.1, 1.0),   # alpha <= 0.2, v < 5 (case 2)
+    (0.1, 2.0),   # alpha <= 0.2, v < 5 (case 2)
+    (0.1, 6.0),   # alpha <= 0.2, v >= 5 (case 1)
+    (0.1, 10.0),  # alpha <= 0.2, v >= 5 (case 1)
+    (0.5, 0.5),   # alpha <= 1.4, alpha + v < 3.2 (case 3)
+    (0.5, 2.0),   # alpha <= 1.4, alpha + v < 3.2 (case 3)
+    (1.0, 1.5),   # alpha <= 1.4, alpha + v < 3.2 (case 3)
+    (1.0, 3.0),   # alpha <= 1.4, alpha + v > 3.2 (case 4)
+    (2.0, 1.0),   # alpha > 1.4 (case 4)
+    (2.0, 5.0),   # alpha > 1.4 (case 4)
+]
+voigt_results = Dict{String, Float64}()
+for (alpha, v) in voigt_test_cases
+    result = Korg.voigt_hjerting(alpha, v)
+    key = "$(alpha)_$(v)"
+    voigt_results[key] = result
+end
+reference_data["voigt_hjerting"] = Dict(
+    "inputs" => voigt_test_cases,
+    "outputs" => voigt_results,
+)
+
+# line_profile test cases
+# (λ₀, σ, γ, amplitude, λ) -> result
+line_profile_test_cases = [
+    # Line center
+    (5000e-8, 0.01e-8, 0.001e-8, 1.0, 5000e-8),
+    # Doppler wing
+    (5000e-8, 0.01e-8, 0.001e-8, 1.0, 5000.02e-8),
+    # Lorentz wing
+    (5000e-8, 0.01e-8, 0.001e-8, 1.0, 5000.05e-8),
+    # Different parameters
+    (6000e-8, 0.02e-8, 0.005e-8, 2.0, 6000e-8),
+    (6000e-8, 0.02e-8, 0.005e-8, 2.0, 6000.01e-8),
+]
+line_profile_results = Dict{String, Float64}()
+for (i, (wl0, sigma, gamma, amp, wl)) in enumerate(line_profile_test_cases)
+    result = Korg.line_profile(wl0, sigma, gamma, amp, wl)
+    line_profile_results[string(i)] = result
+end
+reference_data["line_profile"] = Dict(
+    "inputs" => line_profile_test_cases,
+    "outputs" => line_profile_results,
+)
+
+# =============================================================================
+# Level 2: Line Window Functions
+# =============================================================================
+println("  - Line window functions...")
+
+# inverse_gaussian_density test cases
+# (rho, sigma) -> result
+inverse_gaussian_test_cases = [
+    (0.1, 1.0),   # Normal case
+    (0.2, 1.0),   # Normal case
+    (0.3, 1.0),   # Normal case
+    (0.01, 0.5),  # Small sigma
+    (0.01, 2.0),  # Large sigma
+    (0.5, 1.0),   # rho > max_density -> 0
+]
+inverse_gaussian_results = Dict{String, Float64}()
+for (rho, sigma) in inverse_gaussian_test_cases
+    result = Korg.inverse_gaussian_density(rho, sigma)
+    key = "$(rho)_$(sigma)"
+    inverse_gaussian_results[key] = result
+end
+reference_data["inverse_gaussian_density"] = Dict(
+    "inputs" => inverse_gaussian_test_cases,
+    "outputs" => inverse_gaussian_results,
+)
+
+# inverse_lorentz_density test cases
+# (rho, gamma) -> result
+inverse_lorentz_test_cases = [
+    (0.1, 1.0),   # Normal case
+    (0.2, 1.0),   # Normal case
+    (0.05, 0.5),  # Small gamma
+    (0.05, 2.0),  # Large gamma
+    (0.5, 1.0),   # rho > max_density -> 0
+]
+inverse_lorentz_results = Dict{String, Float64}()
+for (rho, gamma) in inverse_lorentz_test_cases
+    result = Korg.inverse_lorentz_density(rho, gamma)
+    key = "$(rho)_$(gamma)"
+    inverse_lorentz_results[key] = result
+end
+reference_data["inverse_lorentz_density"] = Dict(
+    "inputs" => inverse_lorentz_test_cases,
+    "outputs" => inverse_lorentz_results,
+)
+
+# =============================================================================
+# Level 2: VdW Broadening
+# =============================================================================
+println("  - VdW broadening...")
+
+# scaled_vdW test cases
+# (vdW, mass, T) -> result
+# vdW is either (gamma_vdW, -1) for simple scaling or (sigma, alpha) for ABO
+scaled_vdW_test_cases = [
+    # Simple scaling: gamma_vdW * (T/10000)^0.3
+    ((1e-7, -1.0), 55.85 * Korg.amu_cgs, 5777.0),
+    ((1e-7, -1.0), 55.85 * Korg.amu_cgs, 10000.0),
+    ((1e-7, -1.0), 55.85 * Korg.amu_cgs, 4000.0),
+    # ABO theory with typical σ and α values
+    ((300.0, 0.25), 55.85 * Korg.amu_cgs, 5777.0),
+    ((300.0, 0.25), 55.85 * Korg.amu_cgs, 10000.0),
+    ((250.0, 0.30), 24.305 * Korg.amu_cgs, 5777.0),  # Mg
+]
+scaled_vdW_results = Dict{String, Float64}()
+for (i, (vdW, mass, T)) in enumerate(scaled_vdW_test_cases)
+    result = Korg.scaled_vdW(vdW, mass, T)
+    scaled_vdW_results[string(i)] = result
+end
+reference_data["scaled_vdW"] = Dict(
+    "inputs" => scaled_vdW_test_cases,
+    "outputs" => scaled_vdW_results,
+)
+
+# =============================================================================
+# Level 2: Species and Formula
+# =============================================================================
+println("  - Species and Formula details...")
+
+# More detailed Species tests using constructor
+species_detail_tests = Dict{String, Any}()
+# Test atomic species
+for (code, Z, charge) in [("Fe I", 26, 0), ("Fe II", 26, 1), ("Ca II", 20, 1), ("H I", 1, 0), ("He I", 2, 0)]
+    sp = Korg.Species(code)
+    species_detail_tests[code] = Dict(
+        "Z" => sp.formula.atoms[end],
+        "charge" => sp.charge,
+        "mass" => Korg.get_mass(sp),
+        "is_molecule" => Korg.ismolecule(sp),
+        "n_atoms" => Korg.n_atoms(sp),
+    )
+end
+# Test molecular species
+for code in ["CO", "H2O", "FeH", "TiO", "C2"]
+    sp = Korg.Species(code)
+    species_detail_tests[code] = Dict(
+        "charge" => sp.charge,
+        "mass" => Korg.get_mass(sp),
+        "is_molecule" => Korg.ismolecule(sp),
+        "n_atoms" => Korg.n_atoms(sp),
+        "atoms" => collect(sp.formula.atoms),
+    )
+end
+reference_data["species_details"] = species_detail_tests
+
+# Formula tests
+formula_detail_tests = Dict{String, Any}()
+for code in ["H", "Fe", "CO", "H2O", "FeH", "C2", "TiO"]
+    f = Korg.Formula(code)
+    formula_detail_tests[code] = Dict(
+        "mass" => Korg.get_mass(f),
+        "atoms" => collect(f.atoms),
+        "n_atoms" => Korg.n_atoms(f),
+        "is_molecule" => Korg.ismolecule(f),
+    )
+end
+reference_data["formula_details"] = formula_detail_tests
+
+# =============================================================================
 # Isotopic Data
 # =============================================================================
 println("  - Isotopic data...")

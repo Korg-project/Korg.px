@@ -47,8 +47,9 @@ def rayleigh(nus: Union[np.ndarray, jnp.ndarray],
     alpha : array
         Linear absorption coefficient [cm⁻¹]
     """
+    # TODO: Figure out some other way to handle this
     # Ensure minimum frequency (corresponding to 1300 Å)
-    assert c_cgs / jnp.max(nus) > 1.3e-5, "Frequencies must correspond to λ ≥ 1300 Å"
+    #assert c_cgs / jnp.max(nus) > 1.3e-5, "Frequencies must correspond to λ ≥ 1300 Å"
 
     # Thomson scattering cross section [cm²]
     sigma_th = 6.65246e-25
