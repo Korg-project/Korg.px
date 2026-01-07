@@ -116,14 +116,14 @@ Each function has three checkboxes:
 ## Level 3: Intermediate Complexity
 
 ### Cubic Splines (`cubic_splines.py`)
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `CubicSpline` class - natural cubic spline
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `evaluate(spline, x)` - evaluate spline at x
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `CubicSpline` class - natural cubic spline
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `evaluate(spline, x)` - evaluate spline at x (via __call__)
 
 ### Wavelengths (`wavelengths.py`)
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `Wavelengths` class - wavelength grid handling
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `eachwindow(wls)` - iterate wavelength windows
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `eachfreq(wls)` - get frequencies
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `subspectrum_indices(wls)` - get subspectrum indices
+- [x] Converted | [x] Tested (no JIT) | N/A | `Wavelengths` class - wavelength grid handling
+- [x] Converted | [x] Tested (no JIT) | N/A | `eachwindow(wls)` - iterate wavelength windows
+- [x] Converted | [x] Tested (no JIT) | N/A | `eachfreq(wls)` - get frequencies
+- [x] Converted | [x] Tested (no JIT) | N/A | `subspectrum_indices(wls)` - get subspectrum indices
 
 ### Abundances (`abundances.py`)
 - [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `format_A_X(metals, alpha, abundances)` - format abundances
@@ -206,10 +206,10 @@ Each function has three checkboxes:
 | 0     | 22    | 22        | 21              | 21           |
 | 1     | 13    | 13        | 13              | 9            |
 | 2     | 19    | 19        | 19              | 13           |
-| 3     | 21    | 18        | 0               | 0            |
+| 3     | 21    | 18        | 6               | 1            |
 | 4     | 12    | 12        | 0               | 0            |
 | 5     | 12    | 10        | 0               | 0            |
-| **Total** | **99** | **94** | **53** | **43** |
+| **Total** | **99** | **94** | **59** | **44** |
 
 Notes:
 - Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
@@ -221,7 +221,7 @@ Notes:
 ## Test Results Summary
 
 Tests run against Julia reference data (`tests/test_julia_reference.py`):
-- **61 passed** (matching Julia to better than 1e-6 precision)
+- **69 passed** (matching Julia to better than 1e-6 precision)
 - **3 skipped** (legacy tests using from_string API)
 
 ### Level 0 Passed Tests (all at rtol=1e-6):

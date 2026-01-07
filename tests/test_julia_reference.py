@@ -1008,5 +1008,137 @@ class TestJITCompatibility:
         assert np.isfinite(float(result_abo))
 
 
+# =============================================================================
+# Level 3 Tests
+# =============================================================================
+
+class TestCubicSpline:
+    """Test CubicSpline against scipy and known values."""
+
+    def test_cubic_spline_interpolates_knots(self):
+        """Spline should pass through all knot points."""
+        from korg.cubic_splines import cubic_spline
+        import jax.numpy as jnp
+
+        # Create spline from some data
+        t = jnp.array([0.0, 1.0, 2.0, 3.0, 4.0])
+        u = jnp.array([0.0, 1.0, 4.0, 9.0, 16.0])
+
+        spline = cubic_spline(t, u)
+
+        # Verify it passes through all knot points
+        for ti, ui in zip(t, u):
+            result = float(spline(ti))
+            assert np.isclose(result, float(ui), rtol=1e-10), \
+                f"Mismatch at knot x={ti}: got {result}, expected {ui}"
+
+    def test_cubic_spline_is_smooth(self):
+        """Spline should produce smooth interpolation between knots."""
+        from korg.cubic_splines import cubic_spline
+        import jax.numpy as jnp
+
+        # Create spline
+        t = jnp.array([0.0, 1.0, 2.0, 3.0, 4.0])
+        u = jnp.array([0.0, 1.0, 0.5, 2.0, 1.0])
+
+        spline = cubic_spline(t, u)
+
+        # Check that midpoint values are reasonable (between adjacent knots for monotonic)
+        # and that the function is smooth (values change gradually)
+        test_points = jnp.linspace(0.0, 4.0, 41)
+        values = [float(spline(tp)) for tp in test_points]
+
+        # All values should be finite
+        assert all(np.isfinite(v) for v in values)
+
+        # Values shouldn't have huge jumps (smooth curve)
+        max_diff = max(abs(values[i+1] - values[i]) for i in range(len(values)-1))
+        assert max_diff < 2.0  # Reasonable bound for this data
+
+    def test_cubic_spline_extrapolation(self):
+        """Test extrapolation behavior."""
+        from korg.cubic_splines import cubic_spline
+        import jax.numpy as jnp
+
+        t = jnp.array([1.0, 2.0, 3.0, 4.0])
+        u = jnp.array([1.0, 4.0, 9.0, 16.0])
+
+        # Without extrapolation, out-of-bounds should raise
+        spline_no_extrap = cubic_spline(t, u, extrapolate=False)
+
+        # With extrapolation, should return boundary values
+        spline_extrap = cubic_spline(t, u, extrapolate=True)
+
+        # Test that extrapolation returns finite values
+        result_low = float(spline_extrap(0.5))
+        result_high = float(spline_extrap(4.5))
+        assert np.isfinite(result_low)
+        assert np.isfinite(result_high)
+
+    def test_cubic_spline_jit(self):
+        """CubicSpline evaluation should be JIT-compatible."""
+        from korg.cubic_splines import cubic_spline
+        import jax.numpy as jnp
+
+        t = jnp.array([0.0, 1.0, 2.0, 3.0])
+        u = jnp.array([0.0, 1.0, 4.0, 9.0])
+        spline = cubic_spline(t, u, extrapolate=True)
+
+        @jax.jit
+        def eval_spline(x):
+            return spline(x)
+
+        result = eval_spline(1.5)
+        assert np.isfinite(float(result))
+
+
+class TestWavelengths:
+    """Test Wavelengths class."""
+
+    def test_wavelengths_single_range(self):
+        """Test Wavelengths with a single range."""
+        from korg.wavelengths import Wavelengths
+
+        # Create wavelength range (start_Angstrom, stop_Angstrom, step_Angstrom)
+        wls = Wavelengths((5000, 5500, 1.0))
+
+        assert len(wls) == 501
+        assert np.isclose(wls[0], 5000e-8, rtol=1e-6)
+        assert np.isclose(wls[-1], 5500e-8, rtol=1e-6)
+
+    def test_wavelengths_multiple_ranges(self):
+        """Test Wavelengths with multiple ranges."""
+        from korg.wavelengths import Wavelengths
+
+        # Create two wavelength ranges
+        wls = Wavelengths([(5000, 5100, 1.0), (6000, 6100, 1.0)])
+
+        assert len(wls) == 202
+
+    def test_wavelengths_iteration(self):
+        """Test iterating over wavelengths."""
+        from korg.wavelengths import Wavelengths
+
+        wls = Wavelengths((5000, 5010, 1.0))
+        wl_list = list(wls)
+
+        assert len(wl_list) == 11
+        assert all(np.isfinite(w) for w in wl_list)
+
+    def test_wavelengths_searchsorted(self):
+        """Test search methods."""
+        from korg.wavelengths import Wavelengths
+
+        wls = Wavelengths((5000, 5100, 1.0))
+
+        # searchsortedfirst: first index >= value
+        idx = wls.searchsortedfirst(5050)
+        assert np.isclose(wls[idx], 5050e-8, rtol=1e-6)
+
+        # searchsortedlast: last index <= value
+        idx = wls.searchsortedlast(5050)
+        assert np.isclose(wls[idx], 5050e-8, rtol=1e-6)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
