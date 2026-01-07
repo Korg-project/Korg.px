@@ -146,7 +146,7 @@ Each function has three checkboxes:
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `Heminus_ff(...)` - He⁻ free-free
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `ndens_state_He_I(...)` - He I level populations
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `positive_ion_ff_absorption!(...)` - metal ff
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `metal_bf_absorption!(...)` - metal bf (skipped: data file not found)
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `metal_bf_absorption!(...)` - metal bf
 
 ---
 
@@ -212,17 +212,17 @@ Each function has three checkboxes:
 | 0     | 22    | 22        | 21              | 21           |
 | 1     | 13    | 13        | 13              | 9            |
 | 2     | 17    | 17        | 17              | 11           |
-| 3     | 22    | 21        | 19              | 13           |
+| 3     | 22    | 21        | 20              | 14           |
 | 4     | 14    | 14        | 11              | 7            |
 | 5     | 15    | 15        | 10              | 0            |
-| **Total** | **103** | **102** | **91** | **61** |
+| **Total** | **103** | **102** | **92** | **62** |
 
 Notes:
 - Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
 - Level 2 Species/Formula (6 items) are marked N/A for JIT as they use Python classes (can be used as static args).
 - Level 2 includes JAX-compatible versions of Gaunt factor and hydrogenic ff absorption.
 - Level 3 Abundances functions (3 items) are marked N/A for JIT as they use Python dicts/arrays.
-- Level 3 metal_bf_absorption skipped due to missing data file.
+- Level 3 all continuum absorption functions are now JAX-compatible using custom bilinear interpolation.
 - Level 5 Post-processing functions (3 items) are marked N/A for JIT as they use numpy and are designed for post-synthesis operations.
 - Level 5 Line class and linelist functions are marked N/A for JIT as they use Python classes and file I/O.
 - Level 5 Atmosphere classes (4 items) are marked N/A for JIT as they use Python classes.
@@ -314,13 +314,11 @@ Tests run against Julia reference data (`tests/test_julia_reference.py`, `tests/
 - **interpolate_marcs (4)**: Solar, metal-poor, giant, alpha-enhanced - skipped due to missing MARCS data
 - **interpolate_marcs reference (2)**: Solar reference, giant reference - skipped due to missing MARCS data
 
-### Skipped Tests (6):
+### Skipped Tests (4):
 1. `Species.from_string` - Uses constructor with string parsing instead
 2. `Formula.from_string` - Uses constructor with string parsing instead
 3. `test_species_is_molecule` - Depends on Species.from_string
-4. `test_metal_bf_available_species` - Data file not found
-5. `test_metal_bf_absorption_basic` - Data file not found
-6. `test_read_vald_linelist_basic` - Requires pandas
+4. `test_read_vald_linelist_basic` - Requires pandas
 
 ### Known Issues:
 - Species and Formula classes work but have different API than Julia (constructor-based vs from_string)

@@ -2898,9 +2898,14 @@ class TestMetalAbsorption:
         # Should have at least some species
         assert len(available) > 0
 
-        # Should be Species objects
-        for sp in available:
-            assert hasattr(sp, 'charge')
+        # Should include common species (returned as strings like 'Fe I', 'Ca I')
+        assert isinstance(available[0], str)
+
+        # Should have some expected species
+        expected_species = {'Fe I', 'Ca I', 'Mg I', 'Si I', 'Al I'}
+        available_set = set(available)
+        overlap = expected_species & available_set
+        assert len(overlap) > 0, f"Expected some of {expected_species}, got {available}"
 
     def test_metal_bf_absorption_basic(self):
         """Metal bf absorption should be non-negative."""
@@ -2920,12 +2925,9 @@ class TestMetalAbsorption:
         if len(available) == 0:
             pytest.skip("No species data available")
 
-        # Use first available species
-        species = list(available)[0]
-
+        # Use Fe I as test species
         T = 5777.0
-        # Create dummy number densities
-        number_densities = {species: 1e10}
+        number_densities = {'Fe I': 1e10}
 
         # Test at 3000 Å (UV, where metal bf is important)
         lambda_cm = 3000e-8
@@ -2934,6 +2936,141 @@ class TestMetalAbsorption:
         alpha = metal_bf_absorption(np.array([nu]), T, number_densities)
         assert np.isfinite(alpha[0])
         assert alpha[0] >= 0
+
+    def test_metal_bf_absorption_wavelength_dependence(self):
+        """Metal bf absorption should vary with wavelength."""
+        try:
+            from korg.continuum_absorption.absorption_metals_bf import metal_bf_absorption
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            T = 5777.0
+            number_densities = {'Fe I': 1e12, 'Ca I': 1e11}
+
+            # Test at multiple wavelengths
+            wavelengths_A = [2000.0, 3000.0, 4000.0, 5000.0]
+            nus = c_cgs / (np.array(wavelengths_A) * 1e-8)
+
+            alpha = metal_bf_absorption(nus, T, number_densities)
+
+            assert len(alpha) == len(nus)
+            assert np.all(np.isfinite(alpha))
+            assert np.all(alpha >= 0)
+
+            # bf absorption generally increases at shorter wavelengths (higher frequencies)
+            # At least some values should be non-zero
+            assert np.any(alpha > 0), "Should have non-zero absorption for some wavelengths"
+
+        except FileNotFoundError as e:
+            pytest.skip(f"Metal bf data file not found: {e}")
+
+    def test_metal_bf_absorption_multiple_species(self):
+        """Metal bf should handle multiple species correctly."""
+        try:
+            from korg.continuum_absorption.absorption_metals_bf import metal_bf_absorption
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            T = 5777.0
+            lambda_cm = 3000e-8
+            nu = np.array([c_cgs / lambda_cm])
+
+            # Test with multiple species
+            number_densities = {
+                'Fe I': 1e12,
+                'Ca I': 1e11,
+                'Mg I': 1e11,
+                'Si I': 1e11,
+            }
+
+            alpha_all = metal_bf_absorption(nu, T, number_densities)
+
+            # Test individual contributions
+            alpha_fe = metal_bf_absorption(nu, T, {'Fe I': 1e12})
+            alpha_ca = metal_bf_absorption(nu, T, {'Ca I': 1e11})
+
+            assert np.isfinite(alpha_all[0])
+            assert np.isfinite(alpha_fe[0])
+            assert np.isfinite(alpha_ca[0])
+
+            # Combined should be at least as large as individual components
+            assert alpha_all[0] >= alpha_fe[0]
+            assert alpha_all[0] >= alpha_ca[0]
+
+        except FileNotFoundError as e:
+            pytest.skip(f"Metal bf data file not found: {e}")
+
+    def test_metal_bf_absorption_temperature_dependence(self):
+        """Metal bf absorption should vary with temperature."""
+        try:
+            from korg.continuum_absorption.absorption_metals_bf import metal_bf_absorption
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            number_densities = {'Fe I': 1e12}
+            lambda_cm = 3000e-8
+            nu = np.array([c_cgs / lambda_cm])
+
+            # Test at different temperatures
+            T_low = 4000.0
+            T_high = 8000.0
+
+            alpha_low = metal_bf_absorption(nu, T_low, number_densities)
+            alpha_high = metal_bf_absorption(nu, T_high, number_densities)
+
+            assert np.isfinite(alpha_low[0])
+            assert np.isfinite(alpha_high[0])
+            assert alpha_low[0] >= 0
+            assert alpha_high[0] >= 0
+
+            # Both should be positive (at least one)
+            assert alpha_low[0] > 0 or alpha_high[0] > 0
+
+        except FileNotFoundError as e:
+            pytest.skip(f"Metal bf data file not found: {e}")
+
+    def test_metal_bf_absorption_jit(self):
+        """metal_bf_absorption should work under JIT."""
+        try:
+            from korg.continuum_absorption.absorption_metals_bf import metal_bf_absorption
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            @jax.jit
+            def compute_metal_bf(nus, T):
+                """JIT-compiled wrapper for metal_bf_absorption."""
+                # Note: number_densities dict must be static for JIT
+                # We'll use a fixed dict structure
+                number_densities = {
+                    'Fe I': 1e12,
+                    'Ca I': 1e11,
+                }
+                return metal_bf_absorption(nus, T, number_densities)
+
+            T = 5777.0
+            lambda_cm = 3000e-8
+            nu = jnp.array([c_cgs / lambda_cm])
+
+            # Test JIT compilation
+            alpha_jit = compute_metal_bf(nu, T)
+            assert np.isfinite(float(alpha_jit[0]))
+            assert float(alpha_jit[0]) >= 0
+
+            # Verify it matches non-JIT version
+            number_densities = {'Fe I': 1e12, 'Ca I': 1e11}
+            alpha_nojit = metal_bf_absorption(nu, T, number_densities)
+            assert np.isclose(float(alpha_jit[0]), float(alpha_nojit[0]), rtol=1e-10)
+
+        except FileNotFoundError as e:
+            pytest.skip(f"Metal bf data file not found: {e}")
 
 
 # =============================================================================
