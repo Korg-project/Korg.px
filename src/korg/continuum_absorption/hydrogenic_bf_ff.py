@@ -11,6 +11,8 @@ References:
 
 import os
 import numpy as np
+import jax
+import jax.numpy as jnp
 from scipy.interpolate import RegularGridInterpolator
 from ..constants import hplanck_cgs, hplanck_eV, kboltz_cgs, kboltz_eV, c_cgs, Rydberg_eV
 
@@ -18,6 +20,11 @@ from ..constants import hplanck_cgs, hplanck_eV, kboltz_cgs, kboltz_eV, c_cgs, R
 # Module-level cache for interpolator
 _gauntff_interpolator = None
 _gauntff_table_data = None
+
+# JAX-compatible cache
+_jax_gauntff_table = None
+_jax_log10_u = None
+_jax_log10_γ2 = None
 
 
 def _load_gauntff_table(fname=None):
@@ -184,6 +191,180 @@ def _initialize_interpolator():
     }
 
     return _gauntff_interpolator
+
+
+def _initialize_jax_tables():
+    """
+    Initialize JAX-compatible arrays for Gaunt factor interpolation.
+
+    This loads the trimmed table into JAX arrays for use with JIT-compiled functions.
+    """
+    global _jax_gauntff_table, _jax_log10_u, _jax_log10_γ2
+
+    if _jax_gauntff_table is not None:
+        return _jax_gauntff_table, _jax_log10_u, _jax_log10_γ2
+
+    # Load the table (reuse existing loader)
+    table, log10_γ2, log10_u = _load_gauntff_table()
+
+    # Trim the table (same logic as _initialize_interpolator)
+    T_extrema = [100.0, 1e6]
+    λ_extrema = [1.0e-6, 1.0e-2]
+    Z_extrema = [1, 2]
+
+    def calc_log10_γ2(Z, T):
+        return np.log10(Rydberg_eV * Z**2 / (kboltz_eV * T))
+
+    def calc_log10_u(λ, T):
+        return np.log10(hplanck_cgs * c_cgs / (λ * kboltz_cgs * T))
+
+    γ2_vals = [calc_log10_γ2(Z, T) for Z in Z_extrema for T in T_extrema]
+    u_vals = [calc_log10_u(λ, T) for λ in λ_extrema for T in T_extrema]
+
+    γ2_min, γ2_max = min(γ2_vals), max(γ2_vals)
+    u_min, u_max = min(u_vals), max(u_vals)
+
+    γ2_lb = max(0, np.searchsorted(log10_γ2, γ2_min, side='right') - 1)
+    γ2_ub = min(len(log10_γ2), np.searchsorted(log10_γ2, γ2_max, side='left') + 1)
+    u_lb = max(0, np.searchsorted(log10_u, u_min, side='right') - 1)
+    u_ub = min(len(log10_u), np.searchsorted(log10_u, u_max, side='left') + 1)
+
+    # Convert to JAX arrays
+    _jax_gauntff_table = jnp.array(table[u_lb:u_ub, γ2_lb:γ2_ub])
+    _jax_log10_u = jnp.array(log10_u[u_lb:u_ub])
+    _jax_log10_γ2 = jnp.array(log10_γ2[γ2_lb:γ2_ub])
+
+    return _jax_gauntff_table, _jax_log10_u, _jax_log10_γ2
+
+
+def _bilinear_interp(table, x_grid, y_grid, x, y):
+    """
+    JAX-compatible bilinear interpolation on a regular grid.
+
+    Parameters
+    ----------
+    table : jnp.ndarray
+        2D table of values with shape (len(x_grid), len(y_grid))
+    x_grid : jnp.ndarray
+        1D array of x coordinates (must be uniformly spaced)
+    y_grid : jnp.ndarray
+        1D array of y coordinates (must be uniformly spaced)
+    x : float
+        x coordinate to interpolate at
+    y : float
+        y coordinate to interpolate at
+
+    Returns
+    -------
+    float
+        Interpolated value
+    """
+    # Get grid spacing (assumes uniform)
+    dx = x_grid[1] - x_grid[0]
+    dy = y_grid[1] - y_grid[0]
+
+    # Find indices
+    x_idx_f = (x - x_grid[0]) / dx
+    y_idx_f = (y - y_grid[0]) / dy
+
+    # Clamp to valid range
+    x_idx_f = jnp.clip(x_idx_f, 0, len(x_grid) - 1.001)
+    y_idx_f = jnp.clip(y_idx_f, 0, len(y_grid) - 1.001)
+
+    x_idx = jnp.floor(x_idx_f).astype(jnp.int32)
+    y_idx = jnp.floor(y_idx_f).astype(jnp.int32)
+
+    # Ensure we don't go out of bounds
+    x_idx = jnp.minimum(x_idx, len(x_grid) - 2)
+    y_idx = jnp.minimum(y_idx, len(y_grid) - 2)
+
+    # Fractional parts
+    x_frac = x_idx_f - x_idx
+    y_frac = y_idx_f - y_idx
+
+    # Bilinear interpolation
+    v00 = table[x_idx, y_idx]
+    v01 = table[x_idx, y_idx + 1]
+    v10 = table[x_idx + 1, y_idx]
+    v11 = table[x_idx + 1, y_idx + 1]
+
+    return (v00 * (1 - x_frac) * (1 - y_frac) +
+            v01 * (1 - x_frac) * y_frac +
+            v10 * x_frac * (1 - y_frac) +
+            v11 * x_frac * y_frac)
+
+
+def gaunt_ff_vanHoof_jax(log_u, log_γ2, table, log10_u_grid, log10_γ2_grid):
+    """
+    JIT-compatible version of gaunt_ff_vanHoof.
+
+    Parameters
+    ----------
+    log_u : float
+        log₁₀(u) where u = h*ν/(k*T)
+    log_γ2 : float
+        log₁₀(γ²) where γ² = Rydberg*Z²/(k*T)
+    table : jnp.ndarray
+        Gaunt factor table
+    log10_u_grid : jnp.ndarray
+        Grid of log₁₀(u) values
+    log10_γ2_grid : jnp.ndarray
+        Grid of log₁₀(γ²) values
+
+    Returns
+    -------
+    float
+        Thermally-averaged free-free Gaunt factor
+    """
+    return _bilinear_interp(table, log10_u_grid, log10_γ2_grid, log_u, log_γ2)
+
+
+def hydrogenic_ff_absorption_jax(ν, T, Z, ni, ne, table, log10_u_grid, log10_γ2_grid):
+    """
+    JIT-compatible free-free absorption coefficient.
+
+    Parameters
+    ----------
+    ν : float
+        Frequency in Hz
+    T : float
+        Temperature in K
+    Z : int
+        Charge of the ion
+    ni : float
+        Ion number density in cm⁻³
+    ne : float
+        Electron number density in cm⁻³
+    table : jnp.ndarray
+        Gaunt factor table
+    log10_u_grid : jnp.ndarray
+        Grid of log₁₀(u) values
+    log10_γ2_grid : jnp.ndarray
+        Grid of log₁₀(γ²) values
+
+    Returns
+    -------
+    float
+        Linear absorption coefficient in cm⁻¹
+    """
+    inv_T = 1.0 / T
+    Z2 = Z * Z
+
+    # Compute log₁₀(u) = log₁₀(hν/kT)
+    hν_div_kT = (hplanck_eV / kboltz_eV) * ν * inv_T
+    log_u = jnp.log10(hν_div_kT)
+
+    # Compute log₁₀(γ²) = log₁₀(Rydberg*Z²/kT)
+    log_γ2 = jnp.log10((Rydberg_eV / kboltz_eV) * Z2 * inv_T)
+
+    # Get Gaunt factor
+    gaunt_ff = gaunt_ff_vanHoof_jax(log_u, log_γ2, table, log10_u_grid, log10_γ2_grid)
+
+    # Compute absorption coefficient
+    F_ν = 3.6919e8 * gaunt_ff * Z2 * jnp.sqrt(inv_T) / (ν * ν * ν)
+    α = ni * ne * F_ν * (1 - jnp.exp(-hν_div_kT))
+
+    return α
 
 
 def gaunt_ff_vanHoof(log_u, log_γ2):

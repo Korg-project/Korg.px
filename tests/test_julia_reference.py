@@ -156,6 +156,29 @@ class TestGauntFactorReference:
         except FileNotFoundError as e:
             pytest.skip(f"Data file not found: {e}")
 
+    def test_gaunt_ff_jax_matches_scipy(self, reference_data):
+        """JAX Gaunt factor should match scipy version."""
+        try:
+            from korg.continuum_absorption.hydrogenic_bf_ff import (
+                gaunt_ff_vanHoof, gaunt_ff_vanHoof_jax, _initialize_jax_tables
+            )
+        except (ImportError, FileNotFoundError) as e:
+            pytest.skip(f"hydrogenic_bf_ff module not available: {e}")
+
+        try:
+            table, log10_u_grid, log10_γ2_grid = _initialize_jax_tables()
+
+            ref = reference_data["gaunt_ff"]
+            for key in ref["outputs"].keys():
+                log_u, log_gamma2 = [float(x) for x in key.split("_")]
+                scipy_val = gaunt_ff_vanHoof(log_u, log_gamma2)
+                jax_val = float(gaunt_ff_vanHoof_jax(log_u, log_gamma2, table, log10_u_grid, log10_γ2_grid))
+                # Allow slightly higher tolerance since different interpolation methods
+                assert np.isclose(jax_val, scipy_val, rtol=1e-3), \
+                    f"JAX vs scipy mismatch at ({log_u}, {log_gamma2}): JAX={jax_val}, scipy={scipy_val}"
+        except FileNotFoundError as e:
+            pytest.skip(f"Data file not found: {e}")
+
 
 class TestHydrogenicFFReference:
     """Compare hydrogenic free-free absorption with Julia reference values."""
@@ -778,12 +801,56 @@ class TestJITCompatibility:
         import jax.numpy as jnp
         from korg.continuum_absorption.scattering import rayleigh
 
-        # Note: The current rayleigh implementation uses Python assert which
-        # is not JIT-compatible. This test just verifies the function works
-        # without JIT for now.
+        # Wrap in jax.jit to verify JIT compatibility
+        @jax.jit
+        def compute_rayleigh(nu):
+            return rayleigh(nu, 1e15, 1e14, 1e10)
+
         nu = jnp.array([6e14])  # ~5000 Angstrom
-        result = rayleigh(nu, 1e15, 1e14, 1e10)
+        result = compute_rayleigh(nu)
         assert np.isfinite(float(result[0]))
+
+    def test_gaunt_ff_jax_jit(self):
+        """gaunt_ff_vanHoof_jax should be JIT-compatible."""
+        from korg.continuum_absorption.hydrogenic_bf_ff import (
+            gaunt_ff_vanHoof_jax, _initialize_jax_tables
+        )
+
+        # Initialize tables
+        table, log10_u_grid, log10_γ2_grid = _initialize_jax_tables()
+
+        @jax.jit
+        def compute_gaunt(log_u, log_γ2):
+            return gaunt_ff_vanHoof_jax(log_u, log_γ2, table, log10_u_grid, log10_γ2_grid)
+
+        # Test at a typical value
+        result = compute_gaunt(-0.5, 0.5)
+        assert np.isfinite(float(result))
+        assert float(result) > 0  # Gaunt factors should be positive
+
+    def test_hydrogenic_ff_jax_jit(self):
+        """hydrogenic_ff_absorption_jax should be JIT-compatible."""
+        from korg.continuum_absorption.hydrogenic_bf_ff import (
+            hydrogenic_ff_absorption_jax, _initialize_jax_tables
+        )
+        from korg.constants import c_cgs
+
+        # Initialize tables
+        table, log10_u_grid, log10_γ2_grid = _initialize_jax_tables()
+
+        @jax.jit
+        def compute_ff(nu, T):
+            return hydrogenic_ff_absorption_jax(
+                nu, T, 1, 1e10, 1e14,
+                table, log10_u_grid, log10_γ2_grid
+            )
+
+        # Test at 5000 Angstrom, T=5777 K
+        wl_cm = 5000e-8
+        nu = c_cgs / wl_cm
+        result = compute_ff(nu, 5777.0)
+        assert np.isfinite(float(result))
+        assert float(result) > 0  # Absorption should be positive
 
     def test_sigma_line_jit(self):
         """sigma_line should be JIT-compatible."""

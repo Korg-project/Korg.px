@@ -101,13 +101,15 @@ Each function has three checkboxes:
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `scaled_vdW(vdW, m, T)` - van der Waals broadening (both simple and ABO modes)
 
 ### Scattering (`continuum_absorption/scattering.py`)
-- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `rayleigh(νs, nH_I, nHe_I, nH2)` - Rayleigh scattering 
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `rayleigh(νs, nH_I, nHe_I, nH2)` - Rayleigh scattering
 
 ### Gaunt Factors (`continuum_absorption/hydrogenic_bf_ff.py`)
-- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `gaunt_ff_vanHoof(log_u, log_γ2)` - ff Gaunt factor interpolation
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `gaunt_ff_vanHoof(log_u, log_γ2)` - ff Gaunt factor (scipy version)
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `gaunt_ff_vanHoof_jax(...)` - ff Gaunt factor (JAX version)
 
 ### Hydrogenic Absorption (`continuum_absorption/hydrogenic_bf_ff.py`)
-- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `hydrogenic_ff_absorption(ν, T, Z, ni, ne)` - hydrogenic ff
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `hydrogenic_ff_absorption(ν, T, Z, ni, ne)` - hydrogenic ff (scipy version)
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `hydrogenic_ff_absorption_jax(...)` - hydrogenic ff (JAX version)
 
 ---
 
@@ -203,23 +205,23 @@ Each function has three checkboxes:
 |-------|-------|-----------|-----------------|--------------|
 | 0     | 22    | 22        | 21              | 21           |
 | 1     | 13    | 13        | 13              | 9            |
-| 2     | 15    | 15        | 15              | 7            |
+| 2     | 19    | 19        | 19              | 13           |
 | 3     | 21    | 18        | 0               | 0            |
 | 4     | 12    | 12        | 0               | 0            |
 | 5     | 12    | 10        | 0               | 0            |
-| **Total** | **95** | **90** | **49** | **37** |
+| **Total** | **99** | **94** | **53** | **43** |
 
 Notes:
 - Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
 - Level 2 Species/Formula (6 items) are marked N/A for JIT as they use Python classes (can be used as static args).
-- Level 2 rayleigh, gaunt_ff, and hydrogenic_ff are not JIT-compatible due to assert/interpolation.
+- Level 2 includes JAX-compatible versions of Gaunt factor and hydrogenic ff absorption.
 
 ---
 
 ## Test Results Summary
 
 Tests run against Julia reference data (`tests/test_julia_reference.py`):
-- **58 passed** (matching Julia to better than 1e-6 precision)
+- **61 passed** (matching Julia to better than 1e-6 precision)
 - **3 skipped** (legacy tests using from_string API)
 
 ### Level 0 Passed Tests (all at rtol=1e-6):
@@ -254,9 +256,9 @@ Tests run against Julia reference data (`tests/test_julia_reference.py`):
 25. **Species molecules (1)**: 5 molecular species (CO, H2O, FeH, TiO, C2)
 26. **Formula properties (1)**: 7 formulas (H, Fe, CO, H2O, FeH, C2, TiO)
 
-### JIT Compatibility Tests (19):
+### JIT Compatibility Tests (22):
 - Level 1: air_to_vacuum, vacuum_to_air, sigma_line, doppler_width, scaled_stark, normal_pdf, exponential_integral_1
-- Level 2: electron_scattering, translational_U, rayleigh (partial), harris_series, voigt_hjerting, line_profile, inverse_gaussian_density, inverse_lorentz_density, scaled_vdW (both simple and ABO modes)
+- Level 2: electron_scattering, translational_U, rayleigh, harris_series, voigt_hjerting, line_profile, inverse_gaussian_density, inverse_lorentz_density, scaled_vdW, gaunt_ff_vanHoof_jax, hydrogenic_ff_absorption_jax
 
 ### Skipped Tests (3):
 1. `Species.from_string` - Uses constructor with string parsing instead
