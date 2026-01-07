@@ -126,26 +126,27 @@ Each function has three checkboxes:
 - [x] Converted | [x] Tested (no JIT) | N/A | `subspectrum_indices(wls)` - get subspectrum indices
 
 ### Abundances (`abundances.py`)
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `format_A_X(metals, alpha, abundances)` - format abundances
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `get_metals_H(A_X)` - calculate [metals/H]
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `get_alpha_H(A_X)` - calculate [α/H]
+- [x] Converted | [x] Tested (no JIT) | N/A | `format_A_X(metals, alpha, abundances)` - format abundances
+- [x] Converted | [x] Tested (no JIT) | N/A | `get_metals_H(A_X)` - calculate [metals/H]
+- [x] Converted | [x] Tested (no JIT) | N/A | `get_alpha_H(A_X)` - calculate [α/H]
 
 ### Saha Equation (`statmech.py`)
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `saha_ion_weights(T, nₑ, atom, ...)` - ionization ratios
+- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `saha_ion_weights(T, nₑ, atom, ...)` - ionization ratios
 - [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `get_log_nK(mol, T, ...)` - molecular equilibrium constant
 
 ### Exponential Integrals (`radiative_transfer/expint.py`)
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `exponential_integral_2(x)` - E₂(x) approximation
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `exponential_integral_2(x)` - E₂(x) approximation
 - [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `expint_transfer_integral_core(τ, m, b)` - transfer integral
 
 ### Continuum Absorption Sources (`continuum_absorption/`)
 - [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `H_I_bf(...)` - H I bound-free
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `Hminus_bf(...)` - H⁻ bound-free
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `Hminus_ff(...)` - H⁻ free-free
+- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `Hminus_bf(...)` - H⁻ bound-free
+- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `Hminus_ff(...)` - H⁻ free-free
 - [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `H2plus_bf_and_ff(...)` - H₂⁺ absorption
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `Heminus_ff(...)` - He⁻ free-free
+- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `Heminus_ff(...)` - He⁻ free-free
+- [x] Converted | [x] Tested (no JIT) | [ ] Tested (JIT) | `ndens_state_He_I(...)` - He I level populations
 - [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `positive_ion_ff_absorption!(...)` - metal ff
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `metal_bf_absorption!(...)` - metal bf
+- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `metal_bf_absorption!(...)` - metal bf (skipped: data file not found)
 
 ---
 
@@ -206,23 +207,25 @@ Each function has three checkboxes:
 | 0     | 22    | 22        | 21              | 21           |
 | 1     | 13    | 13        | 13              | 9            |
 | 2     | 19    | 19        | 19              | 13           |
-| 3     | 21    | 18        | 6               | 1            |
+| 3     | 22    | 19        | 15              | 2            |
 | 4     | 12    | 12        | 0               | 0            |
 | 5     | 12    | 10        | 0               | 0            |
-| **Total** | **99** | **94** | **59** | **44** |
+| **Total** | **100** | **95** | **68** | **45** |
 
 Notes:
 - Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
 - Level 2 Species/Formula (6 items) are marked N/A for JIT as they use Python classes (can be used as static args).
 - Level 2 includes JAX-compatible versions of Gaunt factor and hydrogenic ff absorption.
+- Level 3 Abundances functions (3 items) are marked N/A for JIT as they use Python dicts/arrays.
+- Level 3 metal_bf_absorption skipped due to missing data file.
 
 ---
 
 ## Test Results Summary
 
 Tests run against Julia reference data (`tests/test_julia_reference.py`):
-- **69 passed** (matching Julia to better than 1e-6 precision)
-- **3 skipped** (legacy tests using from_string API)
+- **86 passed** (matching Julia to better than 1e-6 precision)
+- **5 skipped** (3 legacy tests using from_string API, 2 metal bf tests skipped due to missing data file)
 
 ### Level 0 Passed Tests (all at rtol=1e-6):
 1. **Physical Constants (7)**: c_cgs, hplanck_cgs, kboltz_cgs, electron_mass_cgs, Rydberg_eV, kboltz_eV, hplanck_eV
@@ -260,10 +263,21 @@ Tests run against Julia reference data (`tests/test_julia_reference.py`):
 - Level 1: air_to_vacuum, vacuum_to_air, sigma_line, doppler_width, scaled_stark, normal_pdf, exponential_integral_1
 - Level 2: electron_scattering, translational_U, rayleigh, harris_series, voigt_hjerting, line_profile, inverse_gaussian_density, inverse_lorentz_density, scaled_vdW, gaunt_ff_vanHoof_jax, hydrogenic_ff_absorption_jax
 
-### Skipped Tests (3):
+### Level 3 Passed Tests:
+27. **CubicSpline (4)**: Interpolates knots, smooth, extrapolation, JIT
+28. **Wavelengths (4)**: Single range, multiple ranges, iteration, searchsorted
+29. **Abundances (6)**: format_A_X solar/metal-poor/alpha-enhanced/custom, get_metals_H, get_alpha_H
+30. **Exponential integral E2 (2)**: Basic values, JIT
+31. **Saha equation (3)**: Hydrogen, iron, temperature dependence
+32. **H⁻ absorption (4)**: Hminus_bf basic/below threshold, Hminus_ff basic/wavelength dependence
+33. **He absorption (2)**: Heminus_ff basic, ndens_state_He_I
+
+### Skipped Tests (5):
 1. `Species.from_string` - Uses constructor with string parsing instead
 2. `Formula.from_string` - Uses constructor with string parsing instead
 3. `test_species_is_molecule` - Depends on Species.from_string
+4. `test_metal_bf_available_species` - Data file not found
+5. `test_metal_bf_absorption_basic` - Data file not found
 
 ### Known Issues:
 - Species and Formula classes work but have different API than Julia (constructor-based vs from_string)

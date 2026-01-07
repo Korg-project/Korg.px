@@ -1140,5 +1140,402 @@ class TestWavelengths:
         assert np.isclose(wls[idx], 5050e-8, rtol=1e-6)
 
 
+class TestAbundances:
+    """Test abundance utilities."""
+
+    def test_format_A_X_solar(self):
+        """Solar abundances should match reference data."""
+        from korg.abundances import format_A_X
+
+        A_X = format_A_X()
+
+        # A(H) = 12.0 by definition
+        assert A_X[0] == 12.0
+
+        # A(He) should be around 10.9
+        assert 10.5 < A_X[1] < 11.5
+
+        # A(Fe) should be around 7.5
+        assert 7.0 < A_X[25] < 8.0
+
+    def test_format_A_X_metal_poor(self):
+        """Metal-poor abundances should be shifted correctly."""
+        from korg.abundances import format_A_X
+
+        A_X_solar = format_A_X()
+        A_X_mp = format_A_X(default_metals_H=-1.0)
+
+        # H and He should be unchanged
+        assert A_X_mp[0] == 12.0  # H unchanged
+        assert A_X_mp[1] == A_X_solar[1]  # He unchanged
+
+        # Metals should be reduced by 1 dex
+        assert np.isclose(A_X_mp[25], A_X_solar[25] - 1.0)  # Fe
+        assert np.isclose(A_X_mp[11], A_X_solar[11] - 1.0)  # Mg (alpha)
+
+    def test_format_A_X_alpha_enhanced(self):
+        """Alpha-enhanced abundances should have correct alpha boost."""
+        from korg.abundances import format_A_X, DEFAULT_ALPHA_ELEMENTS
+
+        A_X_solar = format_A_X()
+        A_X_ae = format_A_X(default_metals_H=-1.0, default_alpha_H=-0.6)
+
+        # Alpha elements should be enhanced relative to metals
+        for Z in DEFAULT_ALPHA_ELEMENTS:
+            # Alpha element should be -0.6 from solar, not -1.0
+            assert np.isclose(A_X_ae[Z-1], A_X_solar[Z-1] - 0.6, rtol=1e-10)
+
+        # Non-alpha metals should still be at -1.0
+        assert np.isclose(A_X_ae[25], A_X_solar[25] - 1.0)  # Fe
+
+    def test_format_A_X_custom_abundance(self):
+        """Custom abundances should override defaults."""
+        from korg.abundances import format_A_X
+
+        A_X_solar = format_A_X()
+        A_X_custom = format_A_X(abundances={'Fe': -0.5})
+
+        # Fe should be -0.5 from solar
+        assert np.isclose(A_X_custom[25], A_X_solar[25] - 0.5)
+
+    def test_get_metals_H(self):
+        """get_metals_H should recover metallicity correctly."""
+        from korg.abundances import format_A_X, get_metals_H
+
+        # Solar should give [M/H] ~ 0
+        A_X_solar = format_A_X()
+        M_H = get_metals_H(A_X_solar)
+        assert np.isclose(M_H, 0.0, atol=0.01)
+
+        # Metal-poor should give correct [M/H]
+        A_X_mp = format_A_X(default_metals_H=-1.0)
+        M_H_mp = get_metals_H(A_X_mp)
+        assert np.isclose(M_H_mp, -1.0, atol=0.01)
+
+    def test_get_alpha_H(self):
+        """get_alpha_H should recover alpha enhancement correctly."""
+        from korg.abundances import format_A_X, get_alpha_H
+
+        # Solar should give [α/H] ~ 0
+        A_X_solar = format_A_X()
+        alpha_H = get_alpha_H(A_X_solar)
+        assert np.isclose(alpha_H, 0.0, atol=0.01)
+
+        # Alpha-enhanced should give correct [α/H]
+        A_X_ae = format_A_X(default_metals_H=-1.0, default_alpha_H=-0.6)
+        alpha_H_ae = get_alpha_H(A_X_ae)
+        assert np.isclose(alpha_H_ae, -0.6, atol=0.01)
+
+
+class TestExponentialIntegral2:
+    """Test exponential_integral_2 function."""
+
+    def test_E2_basic_values(self):
+        """E2 should give correct values at test points."""
+        from korg.radiative_transfer.expint import exponential_integral_2
+
+        # E2(x) = integral from 1 to inf of exp(-x*t)/t^2 dt
+        # E2(0) = 1
+        # E2(1) ≈ 0.1485
+        # E2(inf) = 0
+
+        # At x=0, E2 = 1
+        assert np.isclose(exponential_integral_2(0.0), 1.0, rtol=1e-6)
+
+        # At x=1, E2 ≈ 0.1485
+        assert np.isclose(exponential_integral_2(1.0), 0.1485, rtol=0.01)
+
+        # Large x should approach 0
+        assert exponential_integral_2(10.0) < 0.01
+
+    def test_E2_jit(self):
+        """exponential_integral_2 should be JIT-compatible."""
+        from korg.radiative_transfer.expint import exponential_integral_2
+
+        @jax.jit
+        def compute_E2(x):
+            return exponential_integral_2(x)
+
+        result = compute_E2(1.0)
+        assert np.isfinite(float(result))
+
+
+class TestSahaEquation:
+    """Test Saha equation and related functions."""
+
+    def test_saha_ion_weights_hydrogen(self):
+        """Saha equation for hydrogen at solar temperature."""
+        try:
+            from korg.statmech import saha_ion_weights
+            from korg.data_loader import load_ionization_energies, load_atomic_partition_functions
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        T = 5777.0  # Solar temperature
+        ne = 1e14   # Typical photospheric ne
+
+        # For hydrogen (Z=1)
+        wII, wIII = saha_ion_weights(T, ne, 1, ionization_energies, partition_funcs)
+
+        # At solar temperature, H should be mostly neutral
+        # wII should be small (ionization fraction is low)
+        assert np.isfinite(float(wII))
+        assert float(wII) > 0
+        assert float(wII) < 1  # Not fully ionized
+
+        # wIII should be 0 for hydrogen (can't be doubly ionized)
+        assert float(wIII) == 0.0
+
+    def test_saha_ion_weights_iron(self):
+        """Saha equation for iron at solar temperature."""
+        try:
+            from korg.statmech import saha_ion_weights
+            from korg.data_loader import load_ionization_energies, load_atomic_partition_functions
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        T = 5777.0  # Solar temperature
+        ne = 1e14
+
+        # For iron (Z=26)
+        wII, wIII = saha_ion_weights(T, ne, 26, ionization_energies, partition_funcs)
+
+        # Fe is mostly singly ionized in solar photosphere
+        assert np.isfinite(float(wII))
+        assert np.isfinite(float(wIII))
+        assert float(wII) > 0.1  # Should have significant ionization
+        assert float(wIII) >= 0  # Can have some doubly ionized
+
+    def test_saha_temperature_dependence(self):
+        """Ionization should increase with temperature."""
+        try:
+            from korg.statmech import saha_ion_weights
+            from korg.data_loader import load_ionization_energies, load_atomic_partition_functions
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            ionization_energies = load_ionization_energies()
+            partition_funcs = load_atomic_partition_functions()
+        except FileNotFoundError as e:
+            pytest.skip(f"Data files not found: {e}")
+
+        ne = 1e14
+
+        # Fe at two temperatures
+        wII_cool, _ = saha_ion_weights(4000.0, ne, 26, ionization_energies, partition_funcs)
+        wII_hot, _ = saha_ion_weights(6000.0, ne, 26, ionization_energies, partition_funcs)
+
+        # Higher temperature should give higher ionization
+        assert float(wII_hot) > float(wII_cool)
+
+
+class TestHminusAbsorption:
+    """Test H⁻ continuum absorption."""
+
+    def test_Hminus_bf_basic(self):
+        """H⁻ bound-free absorption should be positive for valid frequencies."""
+        try:
+            from korg.continuum_absorption.absorption_h_minus import Hminus_bf
+            from korg.constants import c_cgs, hplanck_eV
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        nH_I_div_partition = 1e17  # Typical value
+        ne = 1e14
+
+        # H⁻ ionization threshold: 0.754 eV → λ < 1.644 μm
+        # Test at 5000 Å (well above threshold)
+        lambda_cm = 5000e-8
+        nu = c_cgs / lambda_cm
+
+        try:
+            alpha = Hminus_bf(nu, T, nH_I_div_partition, ne)
+            assert np.isfinite(alpha)
+            assert alpha > 0  # Should have positive absorption
+        except FileNotFoundError:
+            pytest.skip("H⁻ data file not found")
+
+    def test_Hminus_bf_below_threshold(self):
+        """H⁻ bf should be zero below ionization threshold."""
+        try:
+            from korg.continuum_absorption.absorption_h_minus import Hminus_bf
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        nH_I_div_partition = 1e17
+        ne = 1e14
+
+        # Below threshold: λ > 1.644 μm (> 16440 Å)
+        lambda_cm = 20000e-8  # 2 μm, well below threshold
+        nu = c_cgs / lambda_cm
+
+        try:
+            alpha = Hminus_bf(nu, T, nH_I_div_partition, ne)
+            assert np.isclose(alpha, 0.0, atol=1e-30)
+        except FileNotFoundError:
+            pytest.skip("H⁻ data file not found")
+
+    def test_Hminus_ff_basic(self):
+        """H⁻ free-free absorption should be positive."""
+        try:
+            from korg.continuum_absorption.absorption_h_minus import Hminus_ff
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        nH_I_div_partition = 1e17
+        ne = 1e14
+
+        # Test at 10000 Å (infrared, where H⁻ ff is important)
+        lambda_cm = 10000e-8
+        nu = c_cgs / lambda_cm
+
+        alpha = Hminus_ff(nu, T, nH_I_div_partition, ne)
+        assert np.isfinite(alpha)
+        assert alpha > 0
+
+    def test_Hminus_ff_wavelength_dependence(self):
+        """H⁻ ff should increase towards longer wavelengths."""
+        try:
+            from korg.continuum_absorption.absorption_h_minus import Hminus_ff
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 5777.0
+        nH_I_div_partition = 1e17
+        ne = 1e14
+
+        # Compare 5000 Å and 15000 Å
+        nu_5000 = c_cgs / (5000e-8)
+        nu_15000 = c_cgs / (15000e-8)
+
+        alpha_5000 = Hminus_ff(nu_5000, T, nH_I_div_partition, ne)
+        alpha_15000 = Hminus_ff(nu_15000, T, nH_I_div_partition, ne)
+
+        # H⁻ ff increases with wavelength (lower frequency)
+        assert alpha_15000 > alpha_5000
+
+
+class TestHeAbsorption:
+    """Test He continuum absorption."""
+
+    def test_Heminus_ff_basic(self):
+        """He⁻ free-free absorption should be positive."""
+        try:
+            from korg.continuum_absorption.absorption_He import Heminus_ff
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 6000.0  # Temperature in valid range [1400, 10080] K
+        nHe_I_div_U = 1e16  # He I number density / partition function
+        ne = 1e14
+
+        # Test at 10000 Å (in valid range 5063-15188 Å)
+        lambda_cm = 10000e-8
+        nus = np.array([c_cgs / lambda_cm])
+
+        alpha = Heminus_ff(nus, T, nHe_I_div_U, ne)
+        assert np.isfinite(float(alpha[0]))
+        assert float(alpha[0]) >= 0  # Should be non-negative
+
+    def test_ndens_state_He_I(self):
+        """He I level population should be physical."""
+        try:
+            from korg.continuum_absorption.absorption_He import ndens_state_He_I
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        T = 10000.0
+        nHe_I_div_U = 1e16  # nHe_I / partition function
+        U_He = 1.0  # Approximate partition function
+
+        # Ground state (n=1) - signature is ndens_state_He_I(n, nsdens_div_partition, T)
+        n_1 = ndens_state_He_I(1, nHe_I_div_U, T)
+        assert np.isfinite(float(n_1))
+        assert float(n_1) > 0
+        assert float(n_1) <= float(nHe_I_div_U * U_He)  # Can't exceed total He I
+
+        # Excited state (n=2) should be less populated
+        n_2 = ndens_state_He_I(2, nHe_I_div_U, T)
+        assert np.isfinite(float(n_2))
+        assert float(n_2) >= 0
+        assert float(n_2) < float(n_1)  # Excited state less populated
+
+
+class TestMetalAbsorption:
+    """Test metal bound-free absorption."""
+
+    def test_metal_bf_available_species(self):
+        """Should have data for common species."""
+        try:
+            from korg.continuum_absorption.absorption_metals_bf import get_available_species
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            available = get_available_species()
+        except FileNotFoundError as e:
+            pytest.skip(f"Metal bf data file not found: {e}")
+
+        # Should have at least some species
+        assert len(available) > 0
+
+        # Should be Species objects
+        for sp in available:
+            assert hasattr(sp, 'charge')
+
+    def test_metal_bf_absorption_basic(self):
+        """Metal bf absorption should be non-negative."""
+        try:
+            from korg.continuum_absorption.absorption_metals_bf import (
+                metal_bf_absorption, get_available_species
+            )
+            from korg.constants import c_cgs
+        except ImportError as e:
+            pytest.skip(f"Required modules not available: {e}")
+
+        try:
+            available = get_available_species()
+        except FileNotFoundError as e:
+            pytest.skip(f"Metal bf data file not found: {e}")
+
+        if len(available) == 0:
+            pytest.skip("No species data available")
+
+        # Use first available species
+        species = list(available)[0]
+
+        T = 5777.0
+        # Create dummy number densities
+        number_densities = {species: 1e10}
+
+        # Test at 3000 Å (UV, where metal bf is important)
+        lambda_cm = 3000e-8
+        nu = c_cgs / lambda_cm
+
+        alpha = metal_bf_absorption(np.array([nu]), T, number_densities)
+        assert np.isfinite(alpha[0])
+        assert alpha[0] >= 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
