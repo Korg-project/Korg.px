@@ -628,10 +628,182 @@ def bracket_line_interpolator(m: int, λ0: float, T: float, ne: float, xi: float
     return jax_linear_interp, window
 
 
+def prepare_stark_profiles_for_jit(stark_profiles: dict, T: float, ne: float) -> Tuple[Dict, List]:
+    """
+    Prepare stark profiles data for JIT compilation.
+
+    Extracts data from StarkProfileLine objects into JAX arrays and filters
+    profiles that are within valid temperature/density bounds.
+
+    Args:
+        stark_profiles: Dictionary of StarkProfileLine objects
+        T: Temperature [K]
+        ne: Electron density [cm^-3]
+
+    Returns:
+        Tuple of (profile_data_dict, valid_transitions):
+        - profile_data_dict: Dictionary with keys 'lower', 'upper', 'log_gf', 'lambda0', etc.
+        - valid_transitions: List of transition names that are within bounds
+    """
+    valid_transitions = []
+    lowers = []
+    uppers = []
+    log_gfs = []
+    lambda0s = []
+    temps_mins = []
+    temps_maxs = []
+    ne_mins = []
+    ne_maxs = []
+
+    # For storing interpolation data
+    all_temps = []
+    all_nes = []
+    all_log_delta_nu_grids = []
+    all_profile_data = []
+    all_lambda0_data = []
+
+    for transition, line in stark_profiles.items():
+        # Check if within bounds
+        if (line.temps.min() < T < line.temps.max() and
+            line.electron_number_densities.min() < ne < line.electron_number_densities.max()):
+
+            valid_transitions.append(transition)
+            lowers.append(line.lower)
+            uppers.append(line.upper)
+            log_gfs.append(line.log_gf)
+
+            # Interpolate lambda0 for this T, ne
+            lambda0_val = line.interpolate_lambda0_jax(T, ne)
+            lambda0s.append(lambda0_val)
+
+            temps_mins.append(float(line.temps.min()))
+            temps_maxs.append(float(line.temps.max()))
+            ne_mins.append(float(line.electron_number_densities.min()))
+            ne_maxs.append(float(line.electron_number_densities.max()))
+
+            # Store interpolation grids and data
+            all_temps.append(line.temps)
+            all_nes.append(line.electron_number_densities)
+            all_log_delta_nu_grids.append(line.log_delta_nu_grid)
+            all_profile_data.append(line.profile_data)
+            all_lambda0_data.append(line.lambda0_data)
+
+    if len(valid_transitions) == 0:
+        return {}, []
+
+    profile_data = {
+        'lowers': jnp.array(lowers, dtype=jnp.int32),
+        'uppers': jnp.array(uppers, dtype=jnp.int32),
+        'log_gfs': jnp.array(log_gfs),
+        'lambda0s': jnp.array(lambda0s),
+        'temps_mins': jnp.array(temps_mins),
+        'temps_maxs': jnp.array(temps_maxs),
+        'ne_mins': jnp.array(ne_mins),
+        'ne_maxs': jnp.array(ne_maxs),
+        # Store grids and data for interpolation
+        'all_temps': all_temps,
+        'all_nes': all_nes,
+        'all_log_delta_nu_grids': all_log_delta_nu_grids,
+        'all_profile_data': all_profile_data,
+    }
+
+    return profile_data, valid_transitions
+
+
+@jax.jit
+def hydrogen_line_absorption_core(
+    wavelengths: jnp.ndarray,
+    T: float,
+    ne: float,
+    nH_I: float,
+    UH_I: float,
+    window_size: float,
+    ws: jnp.ndarray,
+    profile_data: Dict,
+    n_stehle_lines: int
+) -> jnp.ndarray:
+    """
+    JIT-compiled core function for hydrogen line absorption.
+
+    This function processes Stehlé profiles using JAX operations.
+
+    Args:
+        wavelengths: Wavelengths [cm]
+        T: Temperature [K]
+        ne: Electron density [cm^-3]
+        nH_I: Neutral H density [cm^-3]
+        UH_I: H partition function
+        window_size: Line window size [cm]
+        ws: Occupation probabilities array
+        profile_data: Dictionary with line data
+        n_stehle_lines: Number of Stehlé lines to process
+
+    Returns:
+        Absorption coefficient array [cm^-1]
+    """
+    n_wl = len(wavelengths)
+    nus = c_cgs / wavelengths
+    dnu_dlambda = c_cgs / wavelengths**2
+    beta = 1 / (kboltz_eV * T)
+    F0 = 1.25e-9 * ne**(2 / 3)
+
+    def process_one_stehle_line(i_line, alpha_accum):
+        """Process a single Stehlé profile line."""
+        # Extract line properties
+        lower = profile_data['lowers'][i_line]
+        upper = profile_data['uppers'][i_line]
+        log_gf = profile_data['log_gfs'][i_line]
+        λ0 = profile_data['lambda0s'][i_line]
+
+        # Get interpolation grids and data for this line
+        temps_grid = profile_data['all_temps'][i_line]
+        nes_grid = profile_data['all_nes'][i_line]
+        log_delta_nu_grid = profile_data['all_log_delta_nu_grids'][i_line]
+        profile_3d_data = profile_data['all_profile_data'][i_line]
+
+        # Calculate energy levels and occupation factors
+        Elo = RydbergH_eV * (1 - 1 / lower**2)
+        Eup = RydbergH_eV * (1 - 1 / upper**2)
+
+        # Factor of w because transition can't happen if upper level doesn't exist
+        levels_factor = ws[upper - 1] * (jnp.exp(-beta * Elo) - jnp.exp(-beta * Eup)) / UH_I
+        amplitude = 10.0**log_gf * nH_I * sigma_line(λ0) * levels_factor
+
+        # Calculate Stark-broadened profile for all wavelengths
+        nu0 = c_cgs / λ0
+        scaled_delta_nu = jnp.abs(nus - nu0) / F0
+        # Avoid log(0) by using a small value
+        scaled_delta_nu = jnp.maximum(scaled_delta_nu, jnp.finfo(jnp.float64).tiny)
+        log_scaled_delta_nu = jnp.log(scaled_delta_nu)
+
+        # Vectorized 3D interpolation for all wavelengths
+        log_profile_vals = jax.vmap(
+            lambda log_sdn: _interp_linear_3d_jax(
+                T, ne, log_sdn,
+                temps_grid, nes_grid, log_delta_nu_grid, profile_3d_data
+            )
+        )(log_scaled_delta_nu)
+
+        dIdnu = jnp.exp(log_profile_vals)
+
+        # Apply window masking
+        in_window = jnp.abs(wavelengths - λ0) < window_size
+        contribution = jnp.where(in_window, dIdnu * dnu_dlambda * amplitude, 0.0)
+
+        return alpha_accum + contribution
+
+    # Process all Stehlé lines using fori_loop
+    alpha_init = jnp.zeros(n_wl)
+    alpha = jax.lax.fori_loop(0, n_stehle_lines, process_one_stehle_line, alpha_init)
+
+    return alpha
+
+
 def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
                                nH_I: float, nHe_I: float, UH_I: float, xi: float,
                                window_size: float, use_MHD: bool = True,
-                               stark_profiles: dict = None) -> np.ndarray:
+                               stark_profiles: dict = None,
+                               use_jit: bool = True) -> np.ndarray:
     """
     Calculate the opacity coefficient from hydrogen lines.
 
@@ -651,6 +823,7 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
         use_MHD: Whether to use Mihalas-Daeppen-Hummer formalism for occupation
                  probabilities (default: True)
         stark_profiles: Dictionary of Stark profiles (default: uses loaded profiles)
+        use_jit: Whether to use JIT compilation (default: True)
 
     Returns:
         Absorption coefficient array [cm^-1] at each wavelength
@@ -658,94 +831,90 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
     if stark_profiles is None:
         stark_profiles = hline_stark_profiles
 
-    if len(stark_profiles) == 0:
-        # No Stark profiles available, return zeros
-        return np.zeros_like(wavelengths)
-
-    # Initialize absorption array
-    alphas = np.zeros(len(wavelengths), dtype=np.float64)
-
-    # Convert wavelengths to frequencies
-    nus = c_cgs / wavelengths
-    dnu_dlambda = c_cgs / wavelengths**2
-
-    # Get hydrogen mass
-    H_mass = atomic_masses[0]
-
-    # Find maximum upper level in stark profiles
-    n_max = max(line.upper for line in stark_profiles.values())
+    # Find maximum upper level in stark profiles (default to 20 if no profiles)
+    if len(stark_profiles) > 0:
+        n_max = max(line.upper for line in stark_profiles.values())
+    else:
+        n_max = 20  # Default to including Brackett lines up to n=20
 
     # Precalculate occupation probabilities if using MHD
     if use_MHD:
-        ws = np.array([hummer_mihalas_w(T, n, nH_I, nHe_I, ne) for n in range(1, n_max + 1)])
+        ws = jnp.array([hummer_mihalas_w(T, n, nH_I, nHe_I, ne) for n in range(1, n_max + 1)])
     else:
-        ws = np.ones(n_max)
+        ws = jnp.ones(n_max)
 
-    beta = 1 / (kboltz_eV * T)
+    # Convert wavelengths to JAX array
+    wavelengths_jax = jnp.array(wavelengths)
 
-    # Holtsmark field for the interpolated Stark profiles
-    F0 = 1.25e-9 * ne**(2 / 3)
+    if use_jit:
+        # Prepare stark profiles data for JIT
+        profile_data, valid_transitions = prepare_stark_profiles_for_jit(stark_profiles, T, ne)
 
-    # Process Stehlé+ 1999 Stark-broadened profiles
-    for transition, line in stark_profiles.items():
-        # Check if this temperature and density are within interpolation bounds
-        if not (line.temps.min() < T < line.temps.max() and
-                line.electron_number_densities.min() < ne < line.electron_number_densities.max()):
-            continue  # Skip transitions outside valid T, ne range
+        if len(valid_transitions) > 0:
+            # Process Stehlé profiles using JIT
+            alphas_stehle = hydrogen_line_absorption_core(
+                wavelengths_jax, T, ne, nH_I, UH_I, window_size,
+                ws, profile_data, len(valid_transitions)
+            )
+        else:
+            alphas_stehle = jnp.zeros_like(wavelengths_jax)
+    else:
+        # Non-JIT path (original implementation)
+        alphas_stehle = np.zeros(len(wavelengths), dtype=np.float64)
+        nus = c_cgs / wavelengths
+        dnu_dlambda = c_cgs / wavelengths**2
+        beta = 1 / (kboltz_eV * T)
+        F0 = 1.25e-9 * ne**(2 / 3)
 
-        # Get line center wavelength from interpolator
-        λ0 = line.lambda0([T, ne])[0]
+        for transition, line in stark_profiles.items():
+            if not (line.temps.min() < T < line.temps.max() and
+                    line.electron_number_densities.min() < ne < line.electron_number_densities.max()):
+                continue
 
-        # Calculate energy levels and occupation factors
-        Elo = RydbergH_eV * (1 - 1 / line.lower**2)
-        Eup = RydbergH_eV * (1 - 1 / line.upper**2)
+            λ0 = line.lambda0([T, ne])[0]
+            Elo = RydbergH_eV * (1 - 1 / line.lower**2)
+            Eup = RydbergH_eV * (1 - 1 / line.upper**2)
+            levels_factor = ws[line.upper - 1] * (np.exp(-beta * Elo) - np.exp(-beta * Eup)) / UH_I
+            amplitude = 10.0**line.log_gf * nH_I * sigma_line(λ0) * levels_factor
 
-        # Factor of w because transition can't happen if upper level doesn't exist
-        levels_factor = ws[line.upper - 1] * (np.exp(-beta * Elo) - np.exp(-beta * Eup)) / UH_I
-        amplitude = 10.0**line.log_gf * nH_I * sigma_line(λ0) * levels_factor
+            lb = np.searchsorted(wavelengths, λ0 - window_size, side='left')
+            ub = np.searchsorted(wavelengths, λ0 + window_size, side='right')
+            if lb >= ub:
+                continue
 
-        # Find wavelength range for this line
-        lb = np.searchsorted(wavelengths, λ0 - window_size, side='left')
-        ub = np.searchsorted(wavelengths, λ0 + window_size, side='right')
-        if lb >= ub:
-            continue
+            nu0 = c_cgs / λ0
+            scaled_delta_nu = np.abs(nus[lb:ub] - nu0) / F0
+            scaled_delta_nu = np.maximum(scaled_delta_nu, np.finfo(float).tiny)
 
-        # Calculate Stark-broadened profile
-        nu0 = c_cgs / λ0
-        scaled_delta_nu = np.abs(nus[lb:ub] - nu0) / F0
-        # Avoid log(0) by using a small epsilon
-        scaled_delta_nu = np.maximum(scaled_delta_nu, np.finfo(float).tiny)
+            log_profile_vals = np.array([line.profile([T, ne, np.log(sdn)])[0]
+                                          for sdn in scaled_delta_nu])
+            dIdnu = np.exp(log_profile_vals)
+            alphas_stehle[lb:ub] += dIdnu * dnu_dlambda[lb:ub] * amplitude
 
-        # Interpolate profile (returns log of profile)
-        log_profile_vals = np.array([line.profile([T, ne, np.log(sdn)])[0]
-                                      for sdn in scaled_delta_nu])
-        dIdnu = np.exp(log_profile_vals)
-
-        # Add contribution to absorption
-        alphas[lb:ub] += dIdnu * dnu_dlambda[lb:ub] * amplitude
-
-    # Now process the Brackett series (n=4)
+    # Process the Brackett series (n=4) - already JIT-compatible
     n = 4
     E_low = RydbergH_eV * (1 - 1 / n**2)
+    beta = 1 / (kboltz_eV * T)
+
+    alphas_brackett = jnp.zeros_like(wavelengths_jax)
     for m in range(5, n_max + 1):
         E = RydbergH_eV * (1 / n**2 - 1 / m**2)
         λ0 = hplanck_eV * c_cgs / E  # cm
-        levels_factor = ws[m - 1] * np.exp(-beta * E_low) * (1 - np.exp(-beta * E)) / UH_I
+        levels_factor = ws[m - 1] * jnp.exp(-beta * E_low) * (1 - jnp.exp(-beta * E)) / UH_I
         gf = 2 * n**2 * brackett_oscillator_strength(n, m)
         amplitude = gf * nH_I * sigma_line(λ0) * levels_factor
 
-        # Get Stark profile interpolator
+        # Get Stark profile interpolator (already JAX-compatible)
         stark_profile_itp, stark_window = bracket_line_interpolator(
             m, λ0, T, ne, xi, wavelengths[0], wavelengths[-1]
         )
 
-        # Find wavelength range for this line
-        lb = np.searchsorted(wavelengths, λ0 - stark_window, side='left')
-        ub = np.searchsorted(wavelengths, λ0 + stark_window, side='right')
+        # Evaluate interpolated profile for all wavelengths with masking
+        in_window = jnp.abs(wavelengths_jax - λ0) < stark_window
+        profile_vals = jax.vmap(stark_profile_itp)(wavelengths_jax)
+        alphas_brackett = alphas_brackett + jnp.where(in_window, profile_vals * amplitude, 0.0)
 
-        if lb < ub:
-            # Evaluate interpolated profile
-            profile_vals = stark_profile_itp(wavelengths[lb:ub])
-            alphas[lb:ub] += profile_vals * amplitude
+    # Combine Stehlé and Brackett contributions
+    alphas_total = alphas_stehle + alphas_brackett
 
-    return alphas
+    return np.array(alphas_total)

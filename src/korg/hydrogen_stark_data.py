@@ -6,6 +6,7 @@ from Stehlé & Hutcheon (1999).
 """
 
 import numpy as np
+import jax.numpy as jnp
 import h5py
 from scipy.interpolate import RegularGridInterpolator
 from typing import Dict, Tuple
@@ -19,24 +20,69 @@ class StarkProfileLine:
     Attributes:
         temps: Temperature grid [K]
         electron_number_densities: Electron density grid [cm^-3]
-        profile: 3D interpolator for log(profile) over (T, ne, log(delta_nu/F0))
-        lambda0: 2D interpolator for line center [cm] over (T, ne)
+        log_delta_nu_grid: Log of delta_nu/F0 grid
+        profile_data: 3D array of log(profile) values with shape (temps, nes, delta_nu)
+        lambda0_data: 2D array of line center [cm] with shape (temps, nes)
         lower: Lower level quantum number
         upper: Upper level quantum number
         Kalpha: Kalpha parameter
         log_gf: Log of gf value
+
+        # Legacy scipy interpolators (for backward compatibility)
+        profile: 3D interpolator for log(profile) over (T, ne, log(delta_nu/F0))
+        lambda0: 2D interpolator for line center [cm] over (T, ne)
     """
 
     def __init__(self, temps, nes, profile_interp, lambda0_interp,
-                 lower, upper, Kalpha, log_gf):
-        self.temps = temps
-        self.electron_number_densities = nes
-        self.profile = profile_interp
-        self.lambda0 = lambda0_interp
+                 lower, upper, Kalpha, log_gf,
+                 log_delta_nu_grid=None, profile_data=None, lambda0_data_array=None):
+        self.temps = jnp.array(temps)
+        self.electron_number_densities = jnp.array(nes)
         self.lower = lower
         self.upper = upper
         self.Kalpha = Kalpha
         self.log_gf = log_gf
+
+        # Legacy scipy interpolators
+        self.profile = profile_interp
+        self.lambda0 = lambda0_interp
+
+        # JAX-compatible data arrays
+        self.log_delta_nu_grid = jnp.array(log_delta_nu_grid) if log_delta_nu_grid is not None else None
+        self.profile_data = jnp.array(profile_data) if profile_data is not None else None
+        self.lambda0_data = jnp.array(lambda0_data_array) if lambda0_data_array is not None else None
+
+    def interpolate_lambda0_jax(self, T: float, ne: float) -> float:
+        """
+        JAX-compatible 2D interpolation for line center wavelength.
+
+        Args:
+            T: Temperature [K]
+            ne: Electron number density [cm^-3]
+
+        Returns:
+            Line center wavelength [cm]
+        """
+        from .hydrogen_line_absorption import _interp_linear_2d_jax
+        return _interp_linear_2d_jax(T, ne, self.temps, self.electron_number_densities,
+                                      self.lambda0_data)
+
+    def interpolate_profile_jax(self, T: float, ne: float, log_delta_nu: float) -> float:
+        """
+        JAX-compatible 3D interpolation for log(profile).
+
+        Args:
+            T: Temperature [K]
+            ne: Electron number density [cm^-3]
+            log_delta_nu: Log of scaled frequency detuning
+
+        Returns:
+            Log of profile value
+        """
+        from .hydrogen_line_absorption import _interp_linear_3d_jax
+        return _interp_linear_3d_jax(T, ne, log_delta_nu,
+                                      self.temps, self.electron_number_densities,
+                                      self.log_delta_nu_grid, self.profile_data)
 
 
 def _load_stark_profiles(fname: str) -> Dict[str, StarkProfileLine]:
@@ -111,7 +157,10 @@ def _load_stark_profiles(fname: str) -> Dict[str, StarkProfileLine]:
 
             profiles[transition] = StarkProfileLine(
                 temps, nes, profile_interp, lambda0_interp,
-                lower, upper, Kalpha, log_gf
+                lower, upper, Kalpha, log_gf,
+                log_delta_nu_grid=log_delta_nu_grid,
+                profile_data=logP_transposed,
+                lambda0_data_array=lambda0_transposed
             )
 
     return profiles
