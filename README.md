@@ -2,22 +2,10 @@
 
 [![Tests](https://github.com/ajwheeler/Korg.jl/actions/workflows/PythonTests.yml/badge.svg)](https://github.com/ajwheeler/Korg.jl/actions/workflows/PythonTests.yml)
 
-Python wrapper for [Korg.jl](https://github.com/ajwheeler/Korg.jl), a package for computing stellar spectra from 1D model atmospheres and linelists assuming local thermodynamic equilibrium.
+A Python (JAX) implementation of [Korg.jl](https://github.com/ajwheeler/Korg.jl), a package for computing stellar spectra from 1D model atmospheres and linelists assuming local thermodynamic equilibrium.
 
-## Features
-
-- Compute spectra from Teff, logg, abundances, etc.
-- Model atmosphere interpolation (MARCS)
-- Linelist parsing (VALD, Kurucz, MOOG, ExoMol, Turbospectrum formats)
-- Synthesis with arbitrary abundances/solar abundance scales
-
-## Installation
-
-```bash
-pip install korg
-```
-
-This will automatically install Julia and Korg.jl via `juliacall` on first import.
+## Note
+This is a research project in development that has used large language models. No guarantee is given (yet) about the accuracy or completeness of the calculations.
 
 ## Quick Start
 
@@ -65,19 +53,11 @@ A_X = korg.format_A_X(metals=-0.5, alpha=0.3)
 A_X = korg.format_A_X(abundances={"Fe": 7.0, "C": 8.5})
 ```
 
-## Multithreading
-
-Korg.jl uses multithreading to speed up line opacity calculation. Set the number of threads via the `JULIA_NUM_THREADS` environment variable before importing:
-
-```bash
-export JULIA_NUM_THREADS=4
-python your_script.py
-```
 
 ## Documentation
 
 - [Korg.jl documentation](https://ajwheeler.github.io/Korg.jl/stable/)
-- [API reference](https://ajwheeler.github.io/Korg.jl/stable/API/)
+- [Korg.jl API reference](https://ajwheeler.github.io/Korg.jl/stable/API/)
 
 ## Citation
 
@@ -87,4 +67,4 @@ If you use this package, please cite:
 
 ## Getting Help
 
-If you have trouble using or installing korg, please [open a GitHub issue](https://github.com/ajwheeler/Korg.jl/issues).
+If you have trouble using or installing korg, please [open a GitHub issue](https://github.com/Korg-project/Korg.px/issues).
