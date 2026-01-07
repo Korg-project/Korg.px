@@ -159,7 +159,11 @@ Each function has three checkboxes:
 - [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `total_continuum_absorption(νs, T, nₑ, ...)` - total α
 
 ### Line Absorption (`line_absorption.py`)
-- [x] Converted | [ ] Tested (no JIT) | [ ] Tested (JIT) | `line_absorption!(α, linelist, λs, ...)` - compute line opacity
+- [x] Converted | [x] Tested (no JIT) | [x] Tested (JIT) | `line_absorption(linelist, λs, ...)` - compute line opacity
+  - **Implementation**: Fully JIT-compatible via `line_absorption_core()` with `use_jit=True` by default
+  - **Key features**: Uses `jax.lax.fori_loop` for line iteration, masking instead of dynamic slicing
+  - **Helper functions**: All JIT-compatible (`doppler_width`, `scaled_stark`, `scaled_vdW`, `line_profile`, etc.)
+  - **Testing**: 20 tests pass including end-to-end synthesis-like JIT compilation test
 
 ### Radiative Transfer (`radiative_transfer/`)
 - [x] Converted | [x] Tested (no JIT) | N/A (numpy) | `generate_mu_grid(n_points)` - μ quadrature grid
@@ -213,9 +217,9 @@ Each function has three checkboxes:
 | 1     | 13    | 13        | 13              | 9            |
 | 2     | 17    | 17        | 17              | 11           |
 | 3     | 22    | 21        | 20              | 14           |
-| 4     | 14    | 14        | 11              | 8            |
+| 4     | 14    | 14        | 12              | 9            |
 | 5     | 15    | 15        | 10              | 0            |
-| **Total** | **103** | **102** | **92** | **63** |
+| **Total** | **103** | **102** | **93** | **64** |
 
 Notes:
 - Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
@@ -232,8 +236,9 @@ Notes:
 
 ## Test Results Summary
 
-Tests run against Julia reference data (`tests/test_julia_reference.py`, `tests/test_atmosphere.py`, and `tests/test_radiative_transfer.py`):
-- **158 passed** (matching Julia to better than 1e-6 precision, or 1% for E2 approximation)
+Tests run against Julia reference data (`tests/test_julia_reference.py`, `tests/test_atmosphere.py`, `tests/test_radiative_transfer.py`, and `tests/test_line_absorption_jit.py`):
+- **178 passed** (matching Julia to better than 1e-6 precision, or 1% for E2 approximation)
+  - Includes 20 line_absorption tests with full JIT compatibility testing
 - **14 skipped** (3 legacy tests using from_string API, 2 metal bf tests skipped due to missing data file, 1 VALD parser test requires pandas, 6 interpolate_marcs tests skipped due to missing MARCS data, 2 chemical equilibrium reference tests skipped due to solver issues in Julia)
 
 ### Level 0 Passed Tests (all at rtol=1e-6):
@@ -300,15 +305,21 @@ Tests run against Julia reference data (`tests/test_julia_reference.py`, `tests/
 46. **Total continuum absorption (3)**: Julia reference solar layer, wavelength dependence, JIT
 47. **Hydrogen line absorption (3)**: brackett_oscillator_strength Julia reference, hummer_mihalas_w Julia reference, holtsmark_profile Julia reference
 
+### Level 4 Passed Tests (Line Absorption - tests/test_line_absorption_jit.py):
+48. **Line absorption helpers (8)**: doppler_width, scaled_stark, scaled_vdW (simple and ABO), sigma_line, inverse_gaussian_density, inverse_lorentz_density, line_profile
+49. **Line absorption basic (4)**: basic computation, empty linelist, multiple layers, multiple lines
+50. **Line absorption JIT (5)**: JIT vs Python comparison, line_absorption_core JIT, consistency, end-to-end synthesis JIT, helper functions JIT
+51. **Line absorption physics (3)**: temperature dependence, abundance dependence, microturbulence broadening
+
 ### Level 5 Passed Tests:
-48. **Line class (6)**: Basic construction, explicit broadening, repr, immutability, wavelength units, vdW modes
-49. **approximate_radiative_gamma (1)**: Julia reference comparison at 5 test cases
-50. **approximate_gammas (1)**: Julia reference comparison for neutral and ionized atoms
-51. **Line explicit broadening (1)**: Julia reference for log(gamma_vdW), zero, and ABO modes
-52. **PlanarAtmosphere (4)**: Creation, arrays, log_tau_ref, repr
-53. **ShellAtmosphere (3)**: Creation, arrays, repr
-54. **create_simple_atmosphere (3)**: Planar, spherical, solar test atmosphere
-55. **Atmosphere Julia reference (2)**: Planar properties, shell properties
+52. **Line class (6)**: Basic construction, explicit broadening, repr, immutability, wavelength units, vdW modes
+53. **approximate_radiative_gamma (1)**: Julia reference comparison at 5 test cases
+54. **approximate_gammas (1)**: Julia reference comparison for neutral and ionized atoms
+55. **Line explicit broadening (1)**: Julia reference for log(gamma_vdW), zero, and ABO modes
+56. **PlanarAtmosphere (4)**: Creation, arrays, log_tau_ref, repr
+57. **ShellAtmosphere (3)**: Creation, arrays, repr
+58. **create_simple_atmosphere (3)**: Planar, spherical, solar test atmosphere
+59. **Atmosphere Julia reference (2)**: Planar properties, shell properties
 
 ### Level 5 Skipped Tests (6):
 - **interpolate_marcs (4)**: Solar, metal-poor, giant, alpha-enhanced - skipped due to missing MARCS data
