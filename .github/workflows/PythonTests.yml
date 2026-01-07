@@ -37,7 +37,7 @@ jobs:
           julia --project=. tests/generate_julia_reference.jl
 
       - name: Upload reference data
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: julia-reference-data
           path: tests/julia_reference_data.json
