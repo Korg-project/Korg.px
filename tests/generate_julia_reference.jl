@@ -10,7 +10,9 @@ The output is saved to tests/julia_reference_data.json
 
 using Pkg
 # Activate the current project (Korg.jl)
-Pkg.activate(dirname(dirname(@__FILE__)))
+project_dir = dirname(dirname(@__FILE__))
+Pkg.activate(project_dir)
+Pkg.instantiate()
 using Korg
 using JSON
 
@@ -187,8 +189,50 @@ reference_data["formula"] = Dict(
 # =============================================================================
 println("  - Atomic data...")
 reference_data["atomic_data"] = Dict(
+    "atomic_symbols" => Korg.atomic_symbols,
     "atomic_masses" => [Korg.atomic_masses[i] for i in 1:92],
-    "first_ionization_energies" => [Korg.ionization_energies[i][1] for i in 1:92],
+    # Ionization energies: Dict Z => [χ₁, χ₂, χ₃] in eV
+    "ionization_energies" => Dict(
+        string(Z) => Korg.ionization_energies[Z] for Z in 1:92
+    ),
+)
+
+# =============================================================================
+# Solar Abundances
+# =============================================================================
+println("  - Solar abundances...")
+reference_data["solar_abundances"] = Dict(
+    "grevesse_2007" => Korg.grevesse_2007_solar_abundances,
+    "asplund_2009" => Korg.asplund_2009_solar_abundances,
+    "asplund_2020" => Korg.asplund_2020_solar_abundances,
+    "bergemann_2025" => Korg.bergemann_2025_solar_abundances,
+    "magg_2022" => Korg.magg_2022_solar_abundances,
+    "default" => Korg.default_solar_abundances,
+)
+
+# =============================================================================
+# Isotopic Data
+# =============================================================================
+println("  - Isotopic data...")
+# Convert isotopic_abundances to JSON-serializable format: Dict(Z => Dict(A => abundance))
+isotopic_abundances_json = Dict{String, Dict{String, Float64}}()
+for (Z, isotopes) in Korg.isotopic_abundances
+    isotopic_abundances_json[string(Z)] = Dict{String, Float64}(
+        string(A) => abund for (A, abund) in isotopes
+    )
+end
+
+# Convert isotopic_nuclear_spin_degeneracies: Dict(Z => Dict(A => degeneracy))
+isotopic_spin_json = Dict{String, Dict{String, Int}}()
+for (Z, isotopes) in Korg.isotopic_nuclear_spin_degeneracies
+    isotopic_spin_json[string(Z)] = Dict{String, Int}(
+        string(A) => deg for (A, deg) in isotopes
+    )
+end
+
+reference_data["isotopic_data"] = Dict(
+    "isotopic_abundances" => isotopic_abundances_json,
+    "isotopic_nuclear_spin_degeneracies" => isotopic_spin_json,
 )
 
 # =============================================================================

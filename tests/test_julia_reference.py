@@ -239,6 +239,17 @@ class TestFormulaReference:
 class TestAtomicDataReference:
     """Compare atomic data with Julia reference values."""
 
+    def test_atomic_symbols(self, reference_data):
+        """Atomic symbols should match."""
+        from korg.atomic_data import atomic_symbols
+
+        julia_symbols = reference_data["atomic_data"]["atomic_symbols"]
+        assert len(atomic_symbols) == len(julia_symbols), \
+            f"Length mismatch: Python={len(atomic_symbols)}, Julia={len(julia_symbols)}"
+        for i, (py_sym, julia_sym) in enumerate(zip(atomic_symbols, julia_symbols)):
+            assert py_sym == julia_sym, \
+                f"Symbol mismatch for Z={i+1}: Python={py_sym}, Julia={julia_sym}"
+
     def test_atomic_masses(self, reference_data):
         """Atomic masses should match."""
         from korg.atomic_data import atomic_masses
@@ -249,28 +260,122 @@ class TestAtomicDataReference:
             assert np.isclose(py_mass, julia_mass, rtol=1e-6), \
                 f"Mass mismatch for Z={i+1}: Python={py_mass}, Julia={julia_mass}"
 
-    def test_first_ionization_energies(self, reference_data):
-        """First ionization energies should match."""
-        try:
-            from korg.atomic_data import ionization_energies
-        except ImportError:
-            pytest.skip("ionization_energies not available in atomic_data module")
+    def test_ionization_energies(self, reference_data):
+        """Ionization energies (all three levels) should match."""
+        from korg.atomic_data import ionization_energies
 
-        julia_chi = reference_data["atomic_data"]["first_ionization_energies"]
-        mismatches = []
-        for i, julia_val in enumerate(julia_chi):
-            Z = i + 1
-            py_chi = ionization_energies[Z][0]  # First ionization energy
-            # Julia uses -1 for unavailable, Python might use different convention
-            if julia_val > 0 and py_chi > 0:
-                # Use 5% tolerance since ionization energies may differ slightly
-                # between data sources, especially for rare earth and actinide elements
-                if not np.isclose(py_chi, julia_val, rtol=0.05):
-                    mismatches.append(f"Z={Z}: Python={py_chi}, Julia={julia_val}")
+        julia_ie = reference_data["atomic_data"]["ionization_energies"]
+        for Z_str, julia_vals in julia_ie.items():
+            Z = int(Z_str)
+            py_vals = ionization_energies[Z]
+            for i, (py_val, julia_val) in enumerate(zip(py_vals, julia_vals)):
+                # Both use -1 for unavailable
+                if julia_val > 0 and py_val > 0:
+                    assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                        f"Ionization energy mismatch for Z={Z}, level {i+1}: Python={py_val}, Julia={julia_val}"
+                elif julia_val < 0 and py_val < 0:
+                    pass  # Both unavailable, OK
+                else:
+                    # One is available and one is not
+                    pytest.fail(f"Availability mismatch for Z={Z}, level {i+1}: Python={py_val}, Julia={julia_val}")
 
-        # Allow up to 3 mismatches for elements with uncertain data
-        assert len(mismatches) <= 3, \
-            f"Too many ionization energy mismatches (>3): {mismatches}"
+
+class TestSolarAbundancesReference:
+    """Compare solar abundances with Julia reference values."""
+
+    def test_grevesse_2007(self, reference_data):
+        """Grevesse 2007 solar abundances should match."""
+        from korg.atomic_data import grevesse_2007_solar_abundances
+
+        julia_abund = reference_data["solar_abundances"]["grevesse_2007"]
+        for i, (py_val, julia_val) in enumerate(zip(grevesse_2007_solar_abundances, julia_abund)):
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Grevesse 2007 abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
+
+    def test_asplund_2009(self, reference_data):
+        """Asplund 2009 solar abundances should match."""
+        from korg.atomic_data import asplund_2009_solar_abundances
+
+        julia_abund = reference_data["solar_abundances"]["asplund_2009"]
+        for i, (py_val, julia_val) in enumerate(zip(asplund_2009_solar_abundances, julia_abund)):
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Asplund 2009 abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
+
+    def test_asplund_2020(self, reference_data):
+        """Asplund 2020 solar abundances should match."""
+        from korg.atomic_data import asplund_2020_solar_abundances
+
+        julia_abund = reference_data["solar_abundances"]["asplund_2020"]
+        for i, (py_val, julia_val) in enumerate(zip(asplund_2020_solar_abundances, julia_abund)):
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Asplund 2020 abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
+
+    def test_bergemann_2025(self, reference_data):
+        """Bergemann 2025 solar abundances should match."""
+        from korg.atomic_data import bergemann_2025_solar_abundances
+
+        julia_abund = reference_data["solar_abundances"]["bergemann_2025"]
+        for i, (py_val, julia_val) in enumerate(zip(bergemann_2025_solar_abundances, julia_abund)):
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Bergemann 2025 abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
+
+    def test_default_abundances(self, reference_data):
+        """Default solar abundances should match."""
+        from korg.atomic_data import default_solar_abundances
+
+        julia_abund = reference_data["solar_abundances"]["default"]
+        for i, (py_val, julia_val) in enumerate(zip(default_solar_abundances, julia_abund)):
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Default abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
+
+    def test_magg_2022(self, reference_data):
+        """Magg 2022 solar abundances should match."""
+        from korg.atomic_data import magg_2022_solar_abundances
+
+        julia_abund = reference_data["solar_abundances"]["magg_2022"]
+        for i, (py_val, julia_val) in enumerate(zip(magg_2022_solar_abundances, julia_abund)):
+            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                f"Magg 2022 abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
+
+
+class TestIsotopicDataReference:
+    """Compare isotopic data with Julia reference values."""
+
+    def test_isotopic_abundances(self, reference_data):
+        """Isotopic abundances should match."""
+        from korg.isotopic_data import isotopic_abundances
+
+        julia_data = reference_data["isotopic_data"]["isotopic_abundances"]
+        for Z_str, julia_isotopes in julia_data.items():
+            Z = int(Z_str)
+            assert Z in isotopic_abundances, \
+                f"Z={Z} missing from Python isotopic_abundances"
+            py_isotopes = isotopic_abundances[Z]
+            for A_str, julia_val in julia_isotopes.items():
+                A = int(A_str)
+                assert A in py_isotopes, \
+                    f"Isotope A={A} missing for Z={Z}"
+                py_val = py_isotopes[A]
+                assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                    f"Isotopic abundance mismatch for Z={Z}, A={A}: Python={py_val}, Julia={julia_val}"
+
+    def test_isotopic_nuclear_spin_degeneracies(self, reference_data):
+        """Isotopic nuclear spin degeneracies should match."""
+        from korg.isotopic_data import isotopic_nuclear_spin_degeneracies
+
+        julia_data = reference_data["isotopic_data"]["isotopic_nuclear_spin_degeneracies"]
+        for Z_str, julia_isotopes in julia_data.items():
+            Z = int(Z_str)
+            assert Z in isotopic_nuclear_spin_degeneracies, \
+                f"Z={Z} missing from Python isotopic_nuclear_spin_degeneracies"
+            py_isotopes = isotopic_nuclear_spin_degeneracies[Z]
+            for A_str, julia_val in julia_isotopes.items():
+                A = int(A_str)
+                assert A in py_isotopes, \
+                    f"Isotope A={A} missing for Z={Z} in nuclear spin data"
+                py_val = py_isotopes[A]
+                assert py_val == julia_val, \
+                    f"Nuclear spin mismatch for Z={Z}, A={A}: Python={py_val}, Julia={julia_val}"
 
 
 class TestJITCompatibility:
