@@ -182,8 +182,10 @@ def create_line(
         wl = wl * 1e-8
 
     # Approximate missing broadening parameters
-    need_stark = gamma_stark is None or np.isnan(gamma_stark)
-    need_vdW = vdW is None or (not isinstance(vdW, tuple) and np.isnan(vdW))
+    # Note: Julia treats both 0 and 1 as flags to approximate (missing/placeholder values)
+    need_stark = (gamma_stark is None or np.isnan(gamma_stark) or
+                  gamma_stark == 0.0 or gamma_stark == 1.0)
+    need_vdW = (vdW is None or (not isinstance(vdW, tuple) and np.isnan(vdW)))
 
     if need_stark or need_vdW:
         gamma_stark_approx, vdW_approx = approximate_gammas(
@@ -195,7 +197,8 @@ def create_line(
             vdW = vdW_approx
 
     # Approximate radiative damping if missing
-    if gamma_rad is None or np.isnan(gamma_rad):
+    # Note: Julia treats both 0 and 1 as flags to approximate (missing/placeholder values)
+    if gamma_rad is None or np.isnan(gamma_rad) or gamma_rad == 0.0 or gamma_rad == 1.0:
         gamma_rad = approximate_radiative_gamma(wl, log_gf)
 
     # Process vdW parameter into (γ or σ, -1 or α) tuple
@@ -296,8 +299,9 @@ def read_vald_linelist(filename: str) -> list:
                 # Rad, Stark, Waals, Reference
 
                 # Parse the line
+                # Format: 'Spec Ion', WL_vac(A), Excit(eV), Vmic, log gf*, Rad., Stark, Waals, Lande, depth, Reference
                 parts = line.strip().split(',')
-                if len(parts) < 14:
+                if len(parts) < 11:
                     continue
 
                 try:
@@ -312,28 +316,28 @@ def read_vald_linelist(filename: str) -> list:
                     roman_numerals = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X']
                     species = Species(f"{element}_{roman_numerals[ion_stage-1]}")
 
-                    # Wavelength in air (Angstroms)
-                    wl_air = float(parts[1].strip())
-                    # Convert to vacuum
-                    wl_vac = air_to_vacuum(wl_air)
-
-                    # log(gf)
-                    log_gf = float(parts[2].strip())
+                    # Wavelength in vacuum (Angstroms) - already in vacuum!
+                    wl_vac = float(parts[1].strip())
 
                     # Lower level energy (eV)
-                    E_lower = float(parts[3].strip())
+                    E_lower = float(parts[2].strip())
+
+                    # Vmic is in parts[3], skip it
+
+                    # log(gf)
+                    log_gf = float(parts[4].strip())
 
                     # Broadening parameters
                     # Radiative damping (log scale in VALD)
-                    rad_str = parts[10].strip()
+                    rad_str = parts[5].strip()
                     gamma_rad = 10**float(rad_str) if rad_str else None
 
                     # Stark damping (log scale in VALD)
-                    stark_str = parts[11].strip()
+                    stark_str = parts[6].strip()
                     gamma_stark = 10**float(stark_str) if stark_str else None
 
-                    # van der Waals damping (log scale in VALD)
-                    vdw_str = parts[12].strip()
+                    # van der Waals damping (log scale in VALD or direct value)
+                    vdw_str = parts[7].strip()
                     vdW = float(vdw_str) if vdw_str else None
 
                     # Create line
@@ -444,7 +448,8 @@ def get_GALAH_DR3_linelist() -> list:
             if len(non_zero) == 1:
                 # Atomic species
                 from .atomic_data import atomic_symbols
-                element = atomic_symbols[non_zero[0]]
+                # Offset index by -1 for 0-based indexing
+                element = atomic_symbols[non_zero[0] - 1]
                 roman_numerals = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X']
                 species = Species(f"{element}_{roman_numerals[ion-1]}")
             else:
