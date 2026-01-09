@@ -444,18 +444,26 @@ def get_GALAH_DR3_linelist() -> list:
 
             # Convert to Species
             # For atoms: use atomic number directly
-            # For molecules: would need to handle multiple atoms
+            # For molecules: construct from multiple atoms
+            from .atomic_data import atomic_symbols
+
             if len(non_zero) == 1:
                 # Atomic species
-                from .atomic_data import atomic_symbols
                 # Offset index by -1 for 0-based indexing
                 element = atomic_symbols[non_zero[0] - 1]
                 roman_numerals = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X']
                 species = Species(f"{element}_{roman_numerals[ion-1]}")
             else:
-                # Molecular species - would need more complex handling
-                # For now, skip molecules
-                continue
+                # Molecular species - construct formula from atomic numbers
+                # Julia sorts the atoms: Formula(sort(atoms[1:2])) or Formula(sort(atoms))
+                # Build formula string like "OH", "CN", "TiO", etc.
+                formula_parts = []
+                for atom_num in sorted(non_zero):
+                    element = atomic_symbols[atom_num - 1]
+                    formula_parts.append(element)
+                formula_str = ''.join(formula_parts)
+                # Molecules have charge from ionization stage
+                species = Species(formula_str, charge=ion-1)
 
             # Filter out hydrogen lines
             if species.charge == 0 and non_zero[0] == 1:  # H I
