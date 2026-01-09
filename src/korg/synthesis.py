@@ -141,42 +141,29 @@ def compute_continuum_absorption(
     alpha_continuum : array
         Continuum absorption coefficient [cm⁻¹] at each wavelength
     """
-    from .continuum_absorption.scattering import rayleigh, electron_scattering
-    from .continuum_absorption.hydrogenic_bf_ff import hydrogenic_ff_absorption
-    from .continuum_absorption.absorption_h_minus import Hminus_bf, Hminus_ff
+    from .continuum import total_continuum_absorption
 
+    # Convert wavelengths to frequencies
     frequencies = c_cgs / wavelengths_cm
-    n_wavelengths = len(wavelengths_cm)
-    alpha_continuum = np.zeros(n_wavelengths)
 
-    # Get number densities
-    nH_I = number_densities.get(Species("H_I"), 0.0)
-    nH_II = number_densities.get(Species("H_II"), 0.0)
-    nHe_I = number_densities.get(Species("He_I"), 0.0)
-    nH2 = number_densities.get(Species("H2_I"), 0.0)
+    # Convert Species keys to strings for continuum module
+    # Species.__str__() returns 'H I', 'Fe II', 'H2' etc (with spaces)
+    # But continuum.py expects 'H_I', 'Fe_II', 'H2' (with underscores)
+    def species_to_key(spec):
+        s = str(spec)
+        # Replace space with underscore: 'H I' -> 'H_I', 'Fe II' -> 'Fe_II'
+        # But keep molecules like 'H2' unchanged
+        return s.replace(' ', '_')
 
-    # Get H I partition function for H⁻ calculations
-    U_H_I = partition_funcs[Species("H_I")](jnp.log(T))
-    nH_I_div_partition = nH_I / U_H_I
+    number_densities_str = {species_to_key(k): v for k, v in number_densities.items()}
+    partition_funcs_str = {species_to_key(k): v for k, v in partition_funcs.items()}
 
-    # Compute absorption for all wavelengths
-    for j, (wl_cm, nu) in enumerate(zip(wavelengths_cm, frequencies)):
-        # Scattering
-        alpha_rayleigh = rayleigh(nu, nH_I, nHe_I, nH2)
-        alpha_electron = electron_scattering(ne)
+    # Call complete continuum absorption (includes all opacity sources)
+    alpha_continuum = total_continuum_absorption(
+        frequencies, T, ne, number_densities_str, partition_funcs_str
+    )
 
-        # H I free-free
-        alpha_H_I_ff = hydrogenic_ff_absorption(nu, T, 1, nH_II, ne)
-
-        # H⁻ bound-free and free-free
-        alpha_H_minus_bf = Hminus_bf(nu, T, nH_I_div_partition, ne)
-        alpha_H_minus_ff = Hminus_ff(nu, T, nH_I_div_partition, ne)
-
-        alpha_continuum[j] = (alpha_rayleigh + alpha_electron +
-                              alpha_H_I_ff + alpha_H_minus_bf +
-                              alpha_H_minus_ff)
-
-    return alpha_continuum
+    return np.array(alpha_continuum)
 
 
 def synthesize_spectrum(
