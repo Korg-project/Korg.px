@@ -993,3 +993,135 @@ def get_GES_linelist(include_molecules: bool = True) -> list:
     result = [l for l in result if not (l.species == ch_spec and l.log_gf > -1.9)]
 
     return result
+
+
+def load_ExoMol_linelist(spec, states_file: str, transitions_file: str,
+                         lower_wavelength: float, upper_wavelength: float,
+                         isotopes=None,
+                         line_strength_cutoff: float = -15.0,
+                         T_line_strength: float = 3500.0,
+                         verbose: bool = True) -> list:
+    """
+    Load a molecular linelist from ExoMol data files.
+
+    Reads the ExoMol states and transitions files, computes log(gf) values,
+    applies isotopic corrections, and returns lines within the wavelength range.
+
+    Args:
+        spec: Species string (e.g. 'MgH') or Species object
+        states_file: Path to the ExoMol .states file (space-delimited: id, E_wavenumber, g, ...)
+        transitions_file: Path to the ExoMol .trans file (space-delimited: id_upper, id_lower, A, ...)
+        lower_wavelength: Lower wavelength bound in Å
+        upper_wavelength: Upper wavelength bound in Å
+        isotopes: List of (Z, isotope_index) tuples. If None, uses the most abundant isotope.
+        line_strength_cutoff: log10 strength cutoff (default -15; weaker lines are dropped)
+        T_line_strength: Temperature for strength calculation (default 3500 K)
+        verbose: Print progress messages (default True)
+
+    Returns:
+        List of Line objects sorted by wavelength (ascending)
+    """
+    from .isotopic_data import isotopic_abundances, isotopic_nuclear_spin_degeneracies
+
+    if isinstance(spec, str):
+        spec = Species(spec)
+
+    if verbose:
+        print(f"Loading ExoMol linelist from {states_file} and {transitions_file}.")
+
+    # Read transitions file (columns: id_upper, id_lower, A)
+    trans_ids_upper = []
+    trans_ids_lower = []
+    trans_A = []
+    with open(transitions_file) as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            trans_ids_upper.append(int(parts[0]))
+            trans_ids_lower.append(int(parts[1]))
+            trans_A.append(float(parts[2]))
+
+    # Read states file (columns: id, E_wavenumber, g, ...)
+    state_id_to_E = {}
+    state_id_to_g = {}
+    with open(states_file) as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            sid = int(parts[0])
+            state_id_to_E[sid] = float(parts[1])
+            state_id_to_g[sid] = int(parts[2])
+
+    # Compute log(gf) for each transition using Gray (4th ed), eq 11.12
+    # gf = A * (electron_mass_cgs * c_cgs) / (8π² * electron_charge_cgs²) * g_upper / ν²
+    prefactor = (electron_mass_cgs * c_cgs) / (8 * math.pi**2 * electron_charge_cgs**2)
+
+    # Compute isotopic correction
+    if isotopes is None:
+        # Use most abundant isotope for each atom (keys are mass numbers)
+        atoms = list(spec.formula.get_atoms())
+        isotopes = [(int(Z), max(isotopic_abundances[int(Z)],
+                                 key=lambda iso: isotopic_abundances[int(Z)][iso]))
+                    for Z in atoms]
+        if verbose:
+            print("Assuming the most abundant isotope for all atoms.")
+
+    try:
+        iso_correction = math.log10(
+            math.prod(isotopic_abundances[Z][iso] for Z, iso in isotopes)
+        )
+        iso_correction -= math.log10(
+            math.prod(isotopic_nuclear_spin_degeneracies[Z][iso] for Z, iso in isotopes)
+        )
+    except (KeyError, IndexError, ValueError):
+        iso_correction = 0.0
+
+    lines = []
+    lower_cm = lower_wavelength * 1e-8
+    upper_cm = upper_wavelength * 1e-8
+
+    for i_u, i_l, A in zip(trans_ids_upper, trans_ids_lower, trans_A):
+        E_upper = state_id_to_E.get(i_u)
+        E_lower = state_id_to_E.get(i_l)
+        g_upper = state_id_to_g.get(i_u)
+        g_lower = state_id_to_g.get(i_l)
+
+        if E_upper is None or E_lower is None or g_upper is None or g_lower is None:
+            continue
+
+        wavenumber = E_upper - E_lower
+        if wavenumber <= 0:
+            continue
+
+        wavelength_cm = 1.0 / wavenumber  # cm (wavenumber in cm⁻¹)
+        if not (lower_cm <= wavelength_cm <= upper_cm):
+            continue
+
+        f = A * prefactor * g_upper / (g_lower * wavenumber**2)
+        if f <= 0:
+            continue
+
+        log_gf = math.log10(g_lower * f) + iso_correction
+        E_lower_eV = hplanck_eV * E_lower * c_cgs
+
+        lines.append(create_line(wavelength_cm * 1e8, log_gf, spec, E_lower_eV))
+
+    # Sort by wavelength descending (ExoMol convention: high→low energy = low→high wl)
+    # then reverse to get ascending wavelength
+    lines.sort(key=lambda l: l.wl)
+
+    if not lines:
+        return lines
+
+    # Remove weak lines using approximate_line_strength
+    filtered = [l for l in lines
+                if approximate_line_strength(l, T_line_strength) > line_strength_cutoff]
+    if verbose:
+        n_removed = len(lines) - len(filtered)
+        pct = 100 * n_removed // len(lines) if lines else 0
+        print(f"Removed {n_removed} lines with strength below {line_strength_cutoff} "
+              f"at T={T_line_strength} K out of {len(lines)} total ({pct}%).")
+
+    return filtered

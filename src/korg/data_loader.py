@@ -785,3 +785,58 @@ def setup_partition_funcs_and_equilibrium_constants():
 
 # Load default partition functions and equilibrium constants at module import
 default_partition_funcs, default_log_equilibrium_constants = setup_partition_funcs_and_equilibrium_constants()
+
+
+def load_default_linelist(reference_wavelength_cm: float = 5e-5):
+    """
+    Load the built-in fallback linelist for a given reference wavelength.
+
+    Currently only 5000 Å (5e-5 cm) is supported, matching the MARCS model atmosphere
+    reference wavelength. Returns an empty list for other wavelengths.
+
+    Parameters
+    ----------
+    reference_wavelength_cm : float
+        Reference wavelength in cm (default: 5e-5 = 5000 Å)
+
+    Returns
+    -------
+    linelist : list of Line
+        Lines sorted by wavelength (ascending)
+    """
+    import csv
+    from .linelist import Line, Species
+
+    if reference_wavelength_cm != 5e-5:
+        return []
+
+    path = os.path.join(_DATA_DIR, "linelists", "alpha_5000_lines.csv")
+    if not os.path.exists(path):
+        return []
+
+    lines = []
+    with open(path, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            wl = float(row['wl'])
+            log_gf = float(row['log_gf'])
+            spec = Species(row['species'])
+            E_lower = float(row['E_lower'])
+            # Parse optional broadening params
+            gamma_rad = float(row['gamma_rad']) if row.get('gamma_rad') else None
+            gamma_stark = float(row['gamma_stark']) if row.get('gamma_stark') else None
+            vdW_raw = row.get('vdW', '')
+            if vdW_raw and vdW_raw.startswith('('):
+                # Tuple format: "(val, power)"
+                parts = vdW_raw.strip('()').split(',')
+                vdW = (float(parts[0].strip()), float(parts[1].strip()))
+            elif vdW_raw:
+                try:
+                    vdW = float(vdW_raw)
+                except ValueError:
+                    vdW = None
+            else:
+                vdW = None
+            lines.append(Line(wl, log_gf, spec, E_lower,
+                              gamma_rad=gamma_rad, gamma_stark=gamma_stark, vdW=vdW))
+    return lines

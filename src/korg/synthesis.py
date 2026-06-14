@@ -166,6 +166,118 @@ def compute_continuum_absorption(
     return np.array(alpha_continuum)
 
 
+def filter_linelist(linelist: List[Line], wavelengths_cm: np.ndarray,
+                    line_buffer_cm: float, warn_empty: bool = True) -> List[Line]:
+    """
+    Filter a sorted linelist to only lines that affect the given wavelength range.
+
+    Parameters
+    ----------
+    linelist : list of Line
+        Lines sorted by wavelength (cm)
+    wavelengths_cm : array
+        Synthesis wavelength grid (cm)
+    line_buffer_cm : float
+        Extra wavelength margin beyond the grid edges (cm)
+    warn_empty : bool, optional
+        Warn if the original linelist was non-empty but the result is empty (default: True)
+
+    Returns
+    -------
+    filtered : list of Line
+        Lines with wl in [wavelengths_cm[0] - line_buffer_cm, wavelengths_cm[-1] + line_buffer_cm]
+    """
+    import warnings
+    import bisect
+
+    n_before = len(linelist)
+    if n_before == 0:
+        return linelist
+
+    lo = wavelengths_cm[0] - line_buffer_cm
+    hi = wavelengths_cm[-1] + line_buffer_cm
+
+    # Binary search for range limits in sorted list
+    wls = [l.wl for l in linelist]
+    i_start = bisect.bisect_left(wls, lo)
+    i_stop = bisect.bisect_right(wls, hi)
+    filtered = linelist[i_start:i_stop]
+
+    if warn_empty and n_before > 0 and len(filtered) == 0:
+        warnings.warn(
+            "The provided linelist was not empty, but none of the lines were within "
+            "the provided wavelength range."
+        )
+    return filtered
+
+
+def get_reference_wavelength_linelist(linelist: List[Line],
+                                      reference_wavelength_cm: float = 5e-5,
+                                      use_internal_reference_linelist: bool = True
+                                      ) -> List[Line]:
+    """
+    Return a linelist for computing absorption at the reference wavelength.
+
+    Required for the anchored optical depth scheme (used by MARCS models at 5000 Å).
+    If the user linelist has no lines near the reference wavelength, falls back to
+    a built-in linelist (only available for 5000 Å / 5e-5 cm).
+
+    Parameters
+    ----------
+    linelist : list of Line
+        Sorted atomic/molecular lines
+    reference_wavelength_cm : float
+        Reference wavelength in cm (default: 5e-5 = 5000 Å, MARCS default)
+    use_internal_reference_linelist : bool
+        If True, fall back to the built-in 5000 Å linelist when the user linelist
+        has insufficient coverage (default: True)
+
+    Returns
+    -------
+    ref_linelist : list of Line
+        Lines to use when computing opacity at the reference wavelength
+    """
+    # Filter to ±21 Å window around the reference wavelength (matches Julia)
+    window_cm = np.array([reference_wavelength_cm, reference_wavelength_cm])
+    buffer_cm = 21e-8  # 21 Å in cm
+    filtered = filter_linelist(linelist, window_cm, buffer_cm, warn_empty=False)
+
+    # If using a non-5000 Å reference and no lines found, error
+    if reference_wavelength_cm != 5e-5 and len(filtered) == 0:
+        raise ValueError(
+            f"The provided linelist contains no lines near the reference wavelength "
+            f"{reference_wavelength_cm * 1e8:.1f} Å. Korg has a built-in fallback "
+            f"only for 5000 Å (the MARCS default)."
+        )
+
+    # If enough lines span the reference wavelength, use them
+    if len(filtered) > 0 and filtered[0].wl <= reference_wavelength_cm <= filtered[-1].wl:
+        return filtered
+
+    # Fall back to or supplement with the built-in 5000 Å linelist
+    if use_internal_reference_linelist and reference_wavelength_cm == 5e-5:
+        from .data_loader import load_default_linelist
+        try:
+            builtin = load_default_linelist(reference_wavelength_cm)
+        except Exception:
+            builtin = []
+
+        if len(filtered) == 0:
+            return builtin
+
+        # Supplement: prepend built-in lines below the user's coverage
+        if len(filtered) > 0 and filtered[0].wl > reference_wavelength_cm:
+            prefix = [l for l in builtin if l.wl < filtered[0].wl]
+            return prefix + filtered
+
+        # Supplement: append built-in lines above the user's coverage
+        if len(filtered) > 0 and filtered[-1].wl < reference_wavelength_cm:
+            suffix = [l for l in builtin if l.wl > filtered[-1].wl]
+            return filtered + suffix
+
+    return filtered
+
+
 def synthesize_spectrum(
     atmosphere,
     linelist: List[Line],

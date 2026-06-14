@@ -320,47 +320,48 @@ Each function has three checkboxes:
 
 These Julia functions/modules have no Python equivalent. Listed in dependency order (implement earlier items first).
 
-### Priority 1 — Core Synthesis Gaps
+### Priority 1 — Core Synthesis Gaps ✅ COMPLETE
 
-| Julia file | Function(s) | Notes |
-|-----------|------------|-------|
-| `synthesize.jl` | `filter_linelist`, `get_reference_wavelength_linelist` | Internal helpers to `synthesize()`; needed to make full synthesis correct |
-| `prune_linelist.jl` | `prune_linelist(atm, linelist, A_X, wl_params)` | Prunes linelist to lines that materially affect a given synthesis; important for performance |
-| `prune_linelist.jl` | `merge_close_lines(lines)` | Merges spectrally unresolved nearby lines |
+| Julia file | Function(s) | Python location | Status |
+|-----------|------------|-----------------|--------|
+| `synthesize.jl` | `filter_linelist` | `synthesis.py` | ✅ Implemented |
+| `synthesize.jl` | `get_reference_wavelength_linelist` | `synthesis.py` | ✅ Implemented (with alpha_5000 fallback) |
+| `prune_linelist.jl` | `prune_linelist(atm, linelist, A_X, wl_params)` | `prune_linelist.py` | ✅ Implemented |
+| `prune_linelist.jl` | `merge_close_lines(lines)` | `prune_linelist.py` | ✅ Implemented |
 
-### Priority 2 — Linelist Format Support
+### Priority 2 — Linelist Format Support ✅ COMPLETE
 
-| Julia file | Function(s) | Notes |
-|-----------|------------|-------|
-| `linelist.jl` | `parse_moog_linelist(f, ...)` | MOOG format reader |
-| `linelist.jl` | `parse_turbospectrum_linelist(fn, ...)` | TurboSpectrum format reader |
-| `linelist.jl` | `load_ExoMol_linelist(spec, states, transitions, ...)` | ExoMol molecular linelists |
-| `linelist.jl` | `save_linelist(path, linelist)` | Native Korg linelist serialization |
-| `linelist.jl` | `read_korg_linelist(path)` | Native Korg linelist loader |
-| `linelist.jl` | `get_APOGEE_DR17_linelist()` | Built-in APOGEE linelist |
-| `linelist.jl` | `get_GES_linelist()` | Built-in GES linelist |
-| `linelist.jl` | `approximate_line_strength(line, T)` | Quick line strength estimate (used by `prune_linelist`) |
+| Julia file | Function(s) | Python location | Status |
+|-----------|------------|-----------------|--------|
+| `linelist.jl` | `parse_moog_linelist(f, ...)` | `linelist.py` | ✅ Implemented |
+| `linelist.jl` | `parse_turbospectrum_linelist(fn, ...)` | `linelist.py` | ✅ Implemented |
+| `linelist.jl` | `load_ExoMol_linelist(spec, states, transitions, ...)` | `linelist.py` | ✅ Implemented |
+| `linelist.jl` | `save_linelist(path, linelist)` | `linelist.py` | ✅ Implemented |
+| `linelist.jl` | `read_korg_linelist(path)` | `linelist.py` | ✅ Implemented |
+| `linelist.jl` | `get_APOGEE_DR17_linelist()` | `linelist.py` | ✅ Implemented |
+| `linelist.jl` | `get_GES_linelist()` | `linelist.py` | ✅ Implemented |
+| `linelist.jl` | `approximate_line_strength(line, T)` | `linelist.py` | ✅ Implemented |
 
-### Priority 3 — Molecular Opacity
+### Priority 3 — Molecular Opacity ✅ COMPLETE
 
-| Julia file | Function(s) | Notes |
-|-----------|------------|-------|
-| `molecular_cross_sections.jl` | `MolecularCrossSection` | Precomputed molecular opacity grid (struct + constructor) |
-| `molecular_cross_sections.jl` | `interpolate_molecular_cross_sections!(α, ...)` | Add molecular opacity to total α |
-| `molecular_cross_sections.jl` | `save_molecular_cross_section` / `read_molecular_cross_section` | Serialization |
+| Julia file | Function(s) | Python location | Status |
+|-----------|------------|-----------------|--------|
+| `molecular_cross_sections.jl` | `MolecularCrossSection` | `molecular_cross_sections.py` | ✅ Implemented |
+| `molecular_cross_sections.jl` | `interpolate_molecular_cross_sections!(α, ...)` | `molecular_cross_sections.py` | ✅ Implemented |
+| `molecular_cross_sections.jl` | `save_molecular_cross_section` / `read_molecular_cross_section` | `molecular_cross_sections.py` | ✅ Implemented |
 
-### Priority 4 — Alternative RT Solver
+### Priority 4 — Alternative RT Solver ✅ COMPLETE
 
-| Julia file | Function(s) | Notes |
-|-----------|------------|-------|
-| `RadiativeTransfer/RadiativeTransfer.jl` | `compute_tau_bezier!(τ, s, α)` | Bezier scheme for optical depth integration (more accurate than linear at coarse grids) |
+| Julia file | Function(s) | Python location | Status |
+|-----------|------------|-----------------|--------|
+| `RadiativeTransfer/RadiativeTransfer.jl` | `compute_tau_bezier!(τ, s, α)` | `radiative_transfer/optical_depth.py` | ✅ Implemented |
 
-### Priority 5 — Atmosphere Readers
+### Priority 5 — Atmosphere Readers ✅ COMPLETE
 
-| Julia file | Function(s) | Notes |
-|-----------|------------|-------|
-| `atmosphere.jl` | `_read_phoenix_model_atmosphere(fname)` | Phoenix model atmosphere reader |
-| `lazy_multilinear_interpolation.jl` | `lazy_multilinear_interpolation(params, nodes, grid)` | Used internally by MARCS interpolation |
+| Julia file | Function(s) | Python location | Status |
+|-----------|------------|-----------------|--------|
+| `atmosphere.jl` | `_read_phoenix_model_atmosphere(fname)` | `atmosphere.py` | ✅ Implemented |
+| `lazy_multilinear_interpolation.jl` | `lazy_multilinear_interpolation(params, nodes, grid)` | `marcs_interpolation.py` | ✅ Implemented |
 
 ### Priority 6 — Fitting & Analysis
 
