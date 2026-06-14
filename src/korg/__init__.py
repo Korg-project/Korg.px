@@ -69,6 +69,12 @@ from .molecular_cross_sections import (
 # Atmosphere I/O
 from .atmosphere import read_model_atmosphere
 
+# Fitting
+from .fit import fit_spectrum, validate_params
+
+# Q-factors / RV precision
+from .qfactors import Qfactor, RV_prec_from_Q, RV_prec_from_noise
+
 # Re-export commonly used constants
 from .constants import (
     c_cgs, hplanck_cgs, hplanck_eV, kboltz_cgs, kboltz_eV,
@@ -125,6 +131,13 @@ __all__ = [
     "read_molecular_cross_section",
     # Atmosphere I/O
     "read_model_atmosphere",
+    # Fitting
+    "fit_spectrum",
+    "validate_params",
+    # Q-factors
+    "Qfactor",
+    "RV_prec_from_Q",
+    "RV_prec_from_noise",
     # Constants
     "c_cgs",
     "hplanck_cgs",
