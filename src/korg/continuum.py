@@ -702,10 +702,6 @@ def H_I_bf(nu, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
             use_hubeny_generalization=use_hubeny_generalization
         )
 
-        # Stop if occupation probability is negligible
-        if float(w_lower) < 1e-5:
-            break
-
         # Degeneracy for level n is 2n²
         degeneracy = 2 * n * n
         boltzmann_factor = jnp.exp(-chi_ion * (1.0 - 1.0 / (n * n)) / (kboltz_eV * T))
@@ -714,7 +710,9 @@ def H_I_bf(nu, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
         # Use simple analytic formula
         sigma_simple = simple_hydrogen_bf_cross_section(n, nu)
 
-        total_cross_section += occupation_prob * sigma_simple
+        # Zero out negligible contributions (replaces the non-JIT-compatible break)
+        contribution = occupation_prob * sigma_simple
+        total_cross_section += jnp.where(w_lower < 1e-5, 0.0, contribution)
 
     # Convert from Megabarns to cm² and apply stimulated emission
     stimulated_emission = 1.0 - jnp.exp(-hplanck_eV * nu / (kboltz_eV * T))
@@ -1212,11 +1210,9 @@ def positive_ion_ff_absorption(nu, T, number_densities, ne):
                 # For now, skip (not supported in original Julia code either)
                 pass
 
-    # Add contributions from accumulated species
-    if ndens_Z1 > 0:
-        alpha_total += hydrogenic_ff_absorption(nu, T, 1, ndens_Z1, ne)
-    if ndens_Z2 > 0:
-        alpha_total += hydrogenic_ff_absorption(nu, T, 2, ndens_Z2, ne)
+    # Add contributions from accumulated species (always call; ndens=0 gives 0)
+    alpha_total += hydrogenic_ff_absorption(nu, T, 1, ndens_Z1, ne)
+    alpha_total += hydrogenic_ff_absorption(nu, T, 2, ndens_Z2, ne)
 
     return alpha_total
 
@@ -1395,9 +1391,16 @@ def total_continuum_absorption(nu, T, ne, number_densities, partition_funcs):
 
     # Get partition function values by calling with log(T)
     # Partition functions are CubicSpline objects that take log(T) as input
+    # NOTE: When called from synthesis, partition_funcs has string keys like 'H_I'
+    # When called standalone, it may have Species keys like Species('H I')
+    # Try both formats for robustness
+    from .species import Species
     log_T = jnp.log(T)
-    U_H_I = partition_funcs.get('H_I', lambda x: 1.0)(log_T)
-    U_He_I = partition_funcs.get('He_I', lambda x: 1.0)(log_T)
+    # Try string key first (from synthesis), then Species key (standalone)
+    U_H_I_func = partition_funcs.get('H_I', partition_funcs.get(Species('H I'), lambda x: 1.0))
+    U_He_I_func = partition_funcs.get('He_I', partition_funcs.get(Species('He I'), lambda x: 1.0))
+    U_H_I = U_H_I_func(log_T)
+    U_He_I = U_He_I_func(log_T)
 
     # Compute number density divided by partition function
     nH_I_div_U = nH_I / U_H_I

@@ -50,8 +50,8 @@ def _bilinear_interpolate_table(T, sigma, T_vals, sigma_vals, table_vals):
     sigma = jnp.asarray(sigma)
 
     # Check if we're outside the table bounds
-    T_min, T_max = float(T_vals[0]), float(T_vals[-1])
-    sigma_min, sigma_max = float(sigma_vals[0]), float(sigma_vals[-1])
+    T_min, T_max = T_vals[0], T_vals[-1]
+    sigma_min, sigma_max = sigma_vals[0], sigma_vals[-1]
 
     out_of_bounds = (T < T_min) | (T > T_max) | (sigma < sigma_min) | (sigma > sigma_max)
 

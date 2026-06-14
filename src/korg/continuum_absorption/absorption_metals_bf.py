@@ -129,17 +129,16 @@ def _load_metal_bf_data() -> Dict:
         nu_max = float(f['nu_max'][()])
         nu_step = float(f['nu_step'][()])
 
-        # Create grids as JAX arrays
-        logT_grid = jnp.arange(logT_min, logT_max + logT_step/2, logT_step)
-        nu_grid = jnp.arange(nu_min, nu_max + nu_step/2, nu_step)
+        # Create grids as numpy arrays (converted to JAX inside metal_bf_absorption)
+        logT_grid = np.arange(logT_min, logT_max + logT_step/2, logT_step)
+        nu_grid = np.arange(nu_min, nu_max + nu_step/2, nu_step)
 
-        # Load cross-sections for each species into JAX arrays
+        # Load cross-sections for each species into numpy arrays
         species_data = {}
         for name in f['cross-sections'].keys():
             sigma = f['cross-sections'][name][:]
-            # Convert to JAX array
             # Data is stored as (nT, nfreq) in HDF5
-            species_data[name] = jnp.array(sigma, dtype=jnp.float64)
+            species_data[name] = np.array(sigma, dtype=np.float64)
 
     _metal_bf_data = {
         'logT_grid': logT_grid,
@@ -193,10 +192,10 @@ def metal_bf_absorption(
     # Convert to JAX arrays
     nus = jnp.asarray(nus)
 
-    # Load data (cached at module level)
+    # Load data (cached at module level as numpy arrays; convert to JAX here)
     data = _load_metal_bf_data()
-    logT_grid = data['logT_grid']
-    nu_grid = data['nu_grid']
+    logT_grid = jnp.asarray(data['logT_grid'])
+    nu_grid = jnp.asarray(data['nu_grid'])
     species_data = data['species']
 
     if out_alpha is None:
@@ -209,15 +208,14 @@ def metal_bf_absorption(
     # Species to skip (handled elsewhere)
     skip_species = {'H I', 'He I', 'H II'}
 
-    for species_name, sigma_table in species_data.items():
+    for species_name, sigma_table_np in species_data.items():
         if species_name in skip_species:
             continue
         if species_name not in number_densities:
             continue
 
         n_density = number_densities[species_name]
-        if n_density <= 0:
-            continue
+        sigma_table = jnp.asarray(sigma_table_np)
 
         # Interpolate cross-sections for this species
         # Table is indexed as (logT, nu)
@@ -230,10 +228,10 @@ def metal_bf_absorption(
 
         # Convert from log10(sigma) in 10^-18 cm^2 to cm^2 and multiply by density
         # sigma is in units of 10^-18 cm^2 in the table
-        # Only add contribution where cross-section is finite
+        # Only add where cross-section is finite and density is positive
         contribution = jnp.where(
             mask,
-            jnp.exp(jnp.log(n_density) + log_sigma * jnp.log(10.0)) * 1e-18,
+            jnp.exp(jnp.log(jnp.maximum(n_density, 1e-300)) + log_sigma * jnp.log(10.0)) * 1e-18,
             0.0
         )
         out_alpha = out_alpha + contribution

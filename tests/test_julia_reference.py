@@ -19,6 +19,7 @@ from pathlib import Path
 import korg
 
 import jax
+import jax.numpy as jnp
 from korg.synthesis import precompute_synthesis_data
 import numpy as np
 import pytest
@@ -3924,8 +3925,9 @@ class TestComputeContinuumAbsorption:
         except (FileNotFoundError, KeyError) as e:
             pytest.skip(f"Required data not available: {e}")
 
-        # Values should be different at different wavelengths
-        assert not np.allclose(alpha[0], alpha[-1])
+        # Values should vary significantly across the wavelength range
+        # (3000 Å and 20000 Å can be similar by physics, but 5000-10000 Å peak differs)
+        assert (alpha.max() - alpha.min()) / alpha.mean() > 0.2
 
 
 class TestLinelistData:
