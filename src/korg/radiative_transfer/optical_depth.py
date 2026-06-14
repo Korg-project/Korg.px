@@ -78,7 +78,8 @@ def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, alpha_ref, spherical
     # Compute increments using vectorized operations
     delta_log_tau = jnp.diff(log_tau_ref)  # log_tau_ref[i] - log_tau_ref[i-1] for i=1..n-1
     integrand_avg = 0.5 * (integrand[:-1] + integrand[1:])  # Average of adjacent layers
-    dtau = integrand_avg * delta_log_tau  # Increment in tau
+    # d(tau_ref) = tau_ref * ln(10) * d(log10_tau_ref), so multiply by ln(10)
+    dtau = integrand_avg * delta_log_tau * jnp.log(10.0)
 
     # Cumulative sum to get tau at each layer
     # tau[0] = 0, tau[i] = sum(dtau[0:i]) for i >= 1
