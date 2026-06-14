@@ -402,7 +402,8 @@ These Julia functions/modules have no Python equivalent. Listed in dependency or
 | 3     | 22    | 21        | 20              | 14           |
 | 4     | 14    | 14        | 12              | 9            |
 | 5     | 15    | 15        | 10              | 0            |
-| **Total** | **103** | **102** | **93** | **64** |
+| 6 (fit) | 8  | 8         | 8               | N/A          |
+| **Total** | **111** | **110** | **101** | **64** |
 
 Notes:
 - Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
