@@ -363,14 +363,26 @@ These Julia functions/modules have no Python equivalent. Listed in dependency or
 | `atmosphere.jl` | `_read_phoenix_model_atmosphere(fname)` | `atmosphere.py` | ✅ Implemented |
 | `lazy_multilinear_interpolation.jl` | `lazy_multilinear_interpolation(params, nodes, grid)` | `marcs_interpolation.py` | ✅ Implemented |
 
-### Priority 6 — Fitting & Analysis
+### Priority 6 — Fitting & Analysis ✅ COMPLETE
+
+| Julia file | Function(s) | Python location | Status |
+|-----------|------------|-----------------|--------|
+| `Fit/fit_via_synthesis.jl` | `fit_spectrum(obs_wls, obs_flux, obs_err, linelist, ...)` | `fit.py` | ✅ Implemented |
+| `Fit/fit_via_synthesis.jl` | `_synthetic_spectrum`, `validate_params`, `_linear_continuum_adjustment` | `fit.py` | ✅ Implemented |
+| `qfactors.jl` | `Qfactor(synth_flux, ...)` | `qfactors.py` | ✅ Implemented |
+| `qfactors.jl` | `RV_prec_from_Q`, `RV_prec_from_noise` | `qfactors.py` | ✅ Implemented |
+
+**Note**: `fit_spectrum` uses scipy BFGS in place of Julia's Optim.jl BFGS. Each synthesis call costs ~120 s in Python (vs ~0.1 s in Julia), making multi-parameter fits very slow. The API is otherwise identical.
+
+### Priority 7 — Equivalent Width Fitting (not yet started)
 
 | Julia file | Function(s) | Notes |
 |-----------|------------|-------|
-| `Fit/fit_via_synthesis.jl` | `fit_spectrum(obs_wls, obs_flux, obs_err, linelist, ...)` | Main stellar parameter fitting via spectrum comparison |
-| `Fit/fit_via_synthesis.jl` | `synthetic_spectrum`, `postprocessed_synthetic_spectrum`, `validate_params` | Helpers for `fit_spectrum` |
-| `qfactors.jl` | `Qfactor(synth_flux, ...)` | Spectral quality factor for RV precision estimation |
-| `qfactors.jl` | `RV_prec_from_Q`, `RV_prec_from_noise` | RV precision from Q factor or noise |
+| `Fit/fit_via_EWs.jl` | `calculate_EWs(atm, linelist, A_X)` | Synthesise EWs for each line via integration |
+| `Fit/fit_via_EWs.jl` | `ews_to_abundances(atm, linelist, A_X, measured_EWs)` | Fit per-element abundances from observed EWs |
+| `Fit/fit_via_EWs.jl` | `ews_to_abundances_approx(...)` | Fast approximate version using linear response |
+| `Fit/fit_via_EWs.jl` | `ews_to_stellar_parameters(linelist, measured_EWs, ...)` | Fit Teff/logg/M_H/vmic from iron EW excitation/ionization balance |
+| `Fit/fit_via_EWs.jl` | `ews_to_stellar_parameters_direct(...)` | Direct Newton solver variant |
 
 ### Not Planned (Julia-specific)
 
