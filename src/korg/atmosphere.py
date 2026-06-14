@@ -411,3 +411,179 @@ def create_solar_test_atmosphere():
         logg=4.44,  # Solar
         spherical=False
     )
+
+
+def _read_phoenix_model_atmosphere(fname: str):
+    """
+    Read a Phoenix model atmosphere from a FITS file.
+
+    Phoenix FITS files contain columns: tau (Rosseland mean optical depth),
+    temp (K), pgas (dyn/cm²), pe (electron pressure in dyn/cm²).
+
+    Args:
+        fname: Path to the Phoenix FITS file.
+
+    Returns:
+        PlanarAtmosphere (plane-parallel, no z data).
+
+    Notes:
+        The first layer (tau=0) is dropped since Korg's radiative transfer
+        requires tau > 0 at the top layer.
+        Reference wavelength: 12,000 Å for Teff < 5000 K, else 5000 Å.
+    """
+    try:
+        from astropy.io import fits
+    except ImportError:
+        raise ImportError(
+            "astropy is required to read Phoenix FITS files. "
+            "Install it with: pip install astropy"
+        )
+    from .constants import kboltz_cgs
+
+    with fits.open(fname) as hdul:
+        Teff = hdul[0].header.get('PHXTEFF', 5000.0)
+        table = hdul[1].data
+        tau = table['tau'].astype(float)
+        T = table['temp'].astype(float)
+        Pgas = table['pgas'].astype(float)
+        Pe = table['pe'].astype(float)
+
+    number_density = Pgas / (kboltz_cgs * T)
+    electron_number_density = Pe / (kboltz_cgs * T)
+
+    # Reference wavelength per Husser et al. 2013 (A&A 553, A6)
+    reference_wavelength = 12e-5 if Teff < 5000 else 5e-5  # cm
+
+    # Build layers, skip first layer where tau = 0
+    layers = []
+    for i in range(1, len(tau)):
+        layers.append(PlanarAtmosphereLayer(
+            tau_ref=float(tau[i]),
+            z=float('nan'),  # no z coordinate in Phoenix models
+            temp=float(T[i]),
+            electron_number_density=float(electron_number_density[i]),
+            number_density=float(number_density[i]),
+        ))
+
+    return PlanarAtmosphere(layers, reference_wavelength)
+
+
+def _read_marcs_model_atmosphere(fname: str):
+    """
+    Read a MARCS .mod format model atmosphere.
+
+    Args:
+        fname: Path to the MARCS .mod file.
+
+    Returns:
+        PlanarAtmosphere or ShellAtmosphere depending on the file.
+    """
+    from .constants import kboltz_cgs
+
+    with open(fname, 'r') as f:
+        lines = f.readlines()
+
+    # Detect planar vs spherical
+    R = 1.0
+    for line in lines:
+        if 'adius' in line:
+            try:
+                R = float(line.split()[0])
+            except (ValueError, IndexError):
+                pass
+            break
+    planar = (R == 1.0)
+
+    # Find number of layers
+    nlayers = None
+    for line in lines:
+        if 'Number of depth points' in line:
+            try:
+                nlayers = int(line.split()[0])
+            except (ValueError, IndexError):
+                pass
+            break
+
+    if nlayers is None:
+        raise ValueError("Cannot parse .mod file: cannot find number of layers")
+
+    # Find header row
+    header_idx = None
+    for i, line in enumerate(lines):
+        if 'lgTauR' in line:
+            header_idx = i
+            break
+
+    if header_idx is None:
+        raise ValueError("Cannot parse .mod file: cannot find column header")
+
+    atm_layers = []
+    for line in lines[header_idx + 1: header_idx + 1 + nlayers]:
+        try:
+            log_tau5 = float(line[10:17])
+            depth = float(line[18:28])
+            temp = float(line[29:36])
+            Pe_str = line[38:48].strip()
+            Pg_str = line[48:60].strip()
+            Pe = max(0.0, float(Pe_str))
+            Pg = max(0.0, float(Pg_str))
+
+            ne = Pe / (temp * kboltz_cgs)
+            n = Pg / (temp * kboltz_cgs)
+
+            if planar:
+                atm_layers.append(PlanarAtmosphereLayer(
+                    tau_ref=10.0 ** log_tau5,
+                    z=-depth,
+                    temp=temp,
+                    electron_number_density=ne,
+                    number_density=n,
+                ))
+            else:
+                atm_layers.append(ShellAtmosphereLayer(
+                    tau_ref=10.0 ** log_tau5,
+                    z=-depth,
+                    temp=temp,
+                    electron_number_density=ne,
+                    number_density=n,
+                ))
+        except (ValueError, IndexError):
+            continue
+
+    if planar:
+        return PlanarAtmosphere(atm_layers, 5e-5)
+    else:
+        return ShellAtmosphere(atm_layers, R, 5e-5)
+
+
+def read_model_atmosphere(fname: str, format: str = None):
+    """
+    Read a model atmosphere from a file.
+
+    Args:
+        fname: Path to the atmosphere file.
+        format: Format string: "marcs" for MARCS .mod files, "phoenix" for
+                Phoenix FITS files. Inferred from file extension if None:
+                ".mod" → marcs, ".fits" / ".fit" → phoenix.
+
+    Returns:
+        PlanarAtmosphere or ShellAtmosphere
+    """
+    if format is None:
+        if fname.endswith('.mod'):
+            format = 'marcs'
+        elif fname.endswith('.fits') or fname.endswith('.fit'):
+            format = 'phoenix'
+        else:
+            raise ValueError(
+                f"Cannot infer format from filename: {fname}. "
+                "Pass format='marcs' or format='phoenix'."
+            )
+
+    format = format.lower()
+    if format == 'marcs':
+        return _read_marcs_model_atmosphere(fname)
+    elif format == 'phoenix':
+        return _read_phoenix_model_atmosphere(fname)
+    else:
+        raise ValueError(f"Unknown format: {format!r}. Use 'marcs' or 'phoenix'.")

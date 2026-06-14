@@ -482,3 +482,514 @@ def get_GALAH_DR3_linelist() -> list:
             lines.append(line)
 
     return lines
+
+
+def approximate_line_strength(line: Line, T: float) -> float:
+    """
+    Approximate the line strength (log10(gfλ) - θχ) of a line at temperature T.
+
+    Used to quickly filter large linelists (especially molecular lines from ExoMol).
+
+    Args:
+        line: Line object
+        T: Temperature in K
+
+    Returns:
+        Approximate log-line strength in arbitrary units
+    """
+    import math
+    return line.log_gf + math.log10(line.wl) - math.log10(math.e) * line.E_lower / (kboltz_eV * T)
+
+
+# NIST isotopic abundances: maps atomic number -> {mass_number -> abundance}
+isotopic_abundances = {
+    1: {1: 1.0, 2: 1e-10},
+    2: {3: 1.34e-6, 4: 0.99999866},
+    3: {6: 0.0759, 7: 0.9241},
+    4: {9: 1.0},
+    5: {10: 0.199, 11: 0.801},
+    6: {12: 0.9893, 13: 0.0107},
+    7: {14: 0.99636, 15: 0.00364},
+    8: {16: 0.99757, 17: 0.00038, 18: 0.00205},
+    9: {19: 1.0},
+    10: {20: 0.9048, 21: 0.0027, 22: 0.0925},
+    11: {23: 1.0},
+    12: {24: 0.7899, 25: 0.1, 26: 0.1101},
+    13: {27: 1.0},
+    14: {28: 0.92223, 29: 0.04685, 30: 0.03092},
+    15: {31: 1.0},
+    16: {32: 0.9499, 33: 0.0075, 34: 0.0425, 36: 0.0001},
+    17: {35: 0.7576, 37: 0.2424},
+    18: {36: 0.003336, 38: 0.000629, 40: 0.996035},
+    19: {39: 0.932581, 40: 0.000117, 41: 0.067302},
+    20: {40: 0.96941, 42: 0.00647, 43: 0.00135, 44: 0.02086, 46: 4.0e-5, 48: 0.00187},
+    21: {45: 1.0},
+    22: {46: 0.0825, 47: 0.0744, 48: 0.7372, 49: 0.0541, 50: 0.0518},
+    23: {50: 0.0025, 51: 0.9975},
+    24: {50: 0.04345, 52: 0.83789, 53: 0.09501, 54: 0.02365},
+    25: {55: 1.0},
+    26: {54: 0.05845, 56: 0.91754, 57: 0.02119, 58: 0.00282},
+    27: {59: 1.0},
+    28: {58: 0.68077, 60: 0.26223, 61: 0.011399, 62: 0.036346, 64: 0.009255},
+    29: {63: 0.6915, 65: 0.3085},
+    30: {64: 0.4917, 66: 0.2773, 67: 0.0404, 68: 0.1845, 70: 0.0061},
+}
+
+
+def _moog_species_code_to_species(code_str: str):
+    """
+    Convert a MOOG species code string to a Species object.
+
+    MOOG codes: integer part = atomic number (or concatenated Z for molecules),
+    first decimal digit = charge. E.g. "26.0" = Fe I, "26.1" = Fe II.
+    """
+    from .atomic_data import atomic_symbols
+    dot_idx = code_str.index('.')
+    charge = int(code_str[dot_idx + 1])
+    Z = int(code_str[:dot_idx])
+
+    if Z <= 99:
+        element = atomic_symbols[Z - 1]
+        return Species(element, charge=charge)
+    else:
+        # Molecular: parse pairs of 2-digit atomic numbers from right of Z string
+        z_str = code_str[:dot_idx]
+        atoms = []
+        s = z_str
+        while len(s) >= 2:
+            z = int(s[-2:])
+            if z > 0:
+                atoms.append(z)
+            s = s[:-2]
+        if s:
+            z = int(s)
+            if z > 0:
+                atoms.append(z)
+        atoms.sort()
+        from .species import Formula
+        formula = Formula(atoms)
+        return Species(formula, charge=charge)
+
+
+def parse_moog_linelist(f, iso_abundances=None, vacuum_wavelengths: bool = True) -> list:
+    """
+    Parse a MOOG-format linelist.
+
+    Column order: wavelength(Å)  species_code  excitation_potential(eV)  log_gf
+
+    Args:
+        f: File path or file-like object
+        iso_abundances: Isotopic abundances dict {Z: {mass: abundance}}.
+            Defaults to NIST values from `isotopic_abundances`.
+        vacuum_wavelengths: If True, wavelengths are vacuum. If False, convert air->vacuum.
+
+    Returns:
+        List of Line objects sorted by wavelength
+    """
+    import math
+    if iso_abundances is None:
+        iso_abundances = isotopic_abundances
+
+    if isinstance(f, str):
+        with open(f, 'r') as fp:
+            content_lines = fp.readlines()
+    else:
+        content_lines = f.readlines()
+
+    result = []
+    for raw in content_lines[1:]:  # skip header line
+        raw = raw.strip()
+        if not raw or raw.startswith('#'):
+            continue
+        toks = raw.split()
+        if len(toks) < 4:
+            continue
+        try:
+            wl_angstrom = float(toks[0])
+            if not vacuum_wavelengths:
+                wl_angstrom = air_to_vacuum(wl_angstrom)
+
+            code_str = toks[1]
+            dot_idx = code_str.index('.')
+            spec = _moog_species_code_to_species(code_str)
+
+            # Isotope correction from digits after first decimal digit
+            iso_str = code_str[dot_idx + 2:]
+            delta_loggf = 0.0
+            if iso_str and not all(c == '0' for c in iso_str):
+                try:
+                    atoms = [int(a) for a in spec.formula.atoms if a != 0]
+                    natoms = len(atoms)
+                    if natoms > 0 and len(iso_str) % natoms == 0:
+                        digits_per = len(iso_str) // natoms
+                        for j, Z in enumerate(atoms):
+                            iso_start = j * digits_per
+                            m_num = int(iso_str[iso_start:iso_start + digits_per])
+                            if Z in iso_abundances and m_num in iso_abundances[Z]:
+                                delta_loggf += math.log10(iso_abundances[Z][m_num])
+                except (ValueError, AttributeError):
+                    pass
+
+            E_lower = float(toks[2])
+            log_gf = float(toks[3]) + delta_loggf
+
+            line_obj = create_line(wl_angstrom, log_gf, spec, E_lower)
+            result.append(line_obj)
+        except (ValueError, IndexError, KeyError):
+            continue
+
+    return sorted(result, key=lambda l: l.wl)
+
+
+def parse_turbospectrum_linelist(fn: str, iso_abundances=None,
+                                  vacuum: bool = False) -> list:
+    """
+    Parse a TurboSpectrum-format linelist.
+
+    Args:
+        fn: File path
+        iso_abundances: Isotopic abundances dict. Defaults to NIST values.
+        vacuum: If True, wavelengths are already in vacuum. If False (default), convert.
+
+    Returns:
+        List of Line objects sorted by wavelength
+    """
+    import math, re
+    if iso_abundances is None:
+        iso_abundances = isotopic_abundances
+
+    with open(fn, 'r') as fp:
+        content_lines = fp.readlines()
+
+    # Find species header lines (pairs of lines starting with "'")
+    species_headers = []
+    for i in range(len(content_lines) - 1):
+        if content_lines[i].startswith("'") and content_lines[i + 1].startswith("'"):
+            species_headers.append(i)
+
+    all_lines = []
+    for h_idx, header_line_idx in enumerate(species_headers):
+        first_line_idx = header_line_idx
+        last_line_idx = (species_headers[h_idx + 1] - 1
+                         if h_idx < len(species_headers) - 1
+                         else len(content_lines) - 1)
+
+        species_line = content_lines[first_line_idx]
+        m = re.match(r"'\s*(?P<formula>\d+)\.(?P<isostring>\d+)\s+'\s+(?P<ion>\d+)\s+(?P<n_lines>\d+)",
+                     species_line)
+        if m is None:
+            continue
+
+        from .atomic_data import atomic_symbols
+        Z = int(m.group('formula'))
+        charge = int(m.group('ion')) - 1
+        isostring = m.group('isostring')
+
+        if Z <= 99:
+            spec = Species(atomic_symbols[Z - 1], charge=charge)
+        else:
+            spec = _moog_species_code_to_species(f"{Z}.{charge}{isostring}")
+
+        # Isotopic correction
+        atoms = [int(a) for a in spec.formula.atoms if a != 0]
+        delta_loggf = 0.0
+        if isostring and len(isostring) >= 3 * len(atoms):
+            for j, atom_Z in enumerate(atoms):
+                m_start = j * 3
+                m_num = int(isostring[m_start:m_start + 3])
+                if m_num == 0:
+                    continue
+                if atom_Z in iso_abundances and m_num in iso_abundances[atom_Z]:
+                    delta_loggf += math.log10(iso_abundances[atom_Z][m_num])
+
+        for raw in content_lines[first_line_idx + 2:last_line_idx + 1]:
+            raw = raw.strip()
+            if not raw or raw.startswith("'"):
+                break
+            toks = raw.split()
+            if len(toks) < 6:
+                continue
+            try:
+                wl_angstrom = float(toks[0])
+                wl_vac = wl_angstrom if vacuum else air_to_vacuum(wl_angstrom)
+                E_lower = float(toks[1])
+                log_gf = float(toks[2]) + delta_loggf
+                vdW_val = float(toks[3])
+                gamma_rad_val = float(toks[5])
+                if gamma_rad_val in (0.0, 1.0):
+                    gamma_rad_val = None
+
+                gamma_stark_val = None
+                if len(toks) > 6:
+                    try:
+                        gs = float(toks[6])
+                        gamma_stark_val = gs if gs not in (0.0, 1.0) else None
+                    except ValueError:
+                        pass
+
+                line_obj = create_line(
+                    wl_vac, log_gf, spec, E_lower,
+                    gamma_rad=gamma_rad_val,
+                    gamma_stark=gamma_stark_val,
+                    vdW=vdW_val
+                )
+                all_lines.append(line_obj)
+            except (ValueError, IndexError):
+                continue
+
+    return sorted(all_lines, key=lambda l: l.wl)
+
+
+def save_linelist(path: str, linelist: list) -> None:
+    """
+    Save a linelist to an HDF5 file readable by read_korg_linelist.
+
+    Args:
+        path: Output file path (should end in .h5)
+        linelist: List of Line objects
+    """
+    import h5py
+
+    with h5py.File(path, 'w') as f:
+        f.attrs['version'] = '2024-12-18'
+
+        f.create_dataset('wl', data=np.array([l.wl for l in linelist]))
+        f['wl'].attrs['description'] = 'Wavelength in cm'
+
+        f.create_dataset('log_gf', data=np.array([l.log_gf for l in linelist]))
+        f['log_gf'].attrs['description'] = 'Log of oscillator strength times statistical weight'
+
+        max_atoms = max((len([a for a in l.species.formula.atoms if a != 0])
+                         for l in linelist), default=1)
+        formula_arr = np.zeros((max_atoms, len(linelist)), dtype=np.uint8)
+        for i, l in enumerate(linelist):
+            atoms = [int(a) for a in l.species.formula.atoms if a != 0]
+            for j, a in enumerate(atoms[:max_atoms]):
+                formula_arr[j, i] = a
+        f.create_dataset('formula', data=formula_arr)
+        f['formula'].attrs['description'] = 'Array of atomic numbers (rows) per line (cols)'
+
+        f.create_dataset('charge',
+                         data=np.array([l.species.charge for l in linelist], dtype=np.int32))
+        f['charge'].attrs['description'] = 'Ionization state (0=neutral, 1=singly ionized, etc)'
+
+        f.create_dataset('E_lower', data=np.array([l.E_lower for l in linelist]))
+        f['E_lower'].attrs['description'] = 'Lower energy level in eV'
+
+        f.create_dataset('gamma_rad', data=np.array([l.gamma_rad for l in linelist]))
+        f['gamma_rad'].attrs['description'] = 'Radiative damping parameter in rad/s'
+
+        f.create_dataset('gamma_stark', data=np.array([l.gamma_stark for l in linelist]))
+        f['gamma_stark'].attrs['description'] = 'Stark broadening parameter'
+
+        f.create_dataset('vdW_1', data=np.array([l.vdW[0] for l in linelist]))
+        f['vdW_1'].attrs['description'] = 'First van der Waals broadening parameter'
+
+        f.create_dataset('vdW_2', data=np.array([l.vdW[1] for l in linelist]))
+        f['vdW_2'].attrs['description'] = 'Second van der Waals broadening parameter'
+
+
+def read_korg_linelist(path: str) -> list:
+    """
+    Read a Korg-format HDF5 linelist saved by save_linelist.
+
+    Args:
+        path: Path to HDF5 linelist file
+
+    Returns:
+        List of Line objects
+    """
+    import h5py
+    from .species import Formula
+
+    with h5py.File(path, 'r') as f:
+        formula_arr = f['formula'][:]
+        charges = f['charge'][:]
+        wls = f['wl'][:]
+        log_gfs = f['log_gf'][:]
+        E_lowers = f['E_lower'][:]
+        gamma_rads = f['gamma_rad'][:]
+        gamma_starks = f['gamma_stark'][:]
+        vdW_1s = f['vdW_1'][:]
+        vdW_2s = f['vdW_2'][:]
+
+    result = []
+    for i in range(len(wls)):
+        atoms = [int(a) for a in formula_arr[:, i] if a != 0]
+        if not atoms:
+            continue
+        formula = Formula(atoms)
+        spec = Species(formula, charge=int(charges[i]))
+        line = Line(
+            wl=float(wls[i]),
+            log_gf=float(log_gfs[i]),
+            species=spec,
+            E_lower=float(E_lowers[i]),
+            gamma_rad=float(gamma_rads[i]),
+            gamma_stark=float(gamma_starks[i]),
+            vdW=(float(vdW_1s[i]), float(vdW_2s[i]))
+        )
+        result.append(line)
+
+    return result
+
+
+def read_linelist(filename: str, format: str = None,
+                  iso_abundances=None) -> list:
+    """
+    Read a linelist file in various formats.
+
+    Args:
+        filename: Path to linelist file
+        format: One of "vald", "moog", "moog_air", "turbospectrum",
+                "turbospectrum_vac", "korg". Defaults to "korg" if filename
+                ends in .h5, else "vald".
+        iso_abundances: Isotopic abundances dict for MOOG/TurboSpectrum formats.
+
+    Returns:
+        List of Line objects sorted by wavelength
+    """
+    if format is None:
+        format = 'korg' if filename.endswith('.h5') else 'vald'
+
+    if format == 'korg':
+        return read_korg_linelist(filename)
+    elif format == 'vald':
+        return read_vald_linelist(filename)
+    elif format == 'moog':
+        return parse_moog_linelist(filename, iso_abundances, vacuum_wavelengths=True)
+    elif format == 'moog_air':
+        return parse_moog_linelist(filename, iso_abundances, vacuum_wavelengths=False)
+    elif format == 'turbospectrum':
+        return parse_turbospectrum_linelist(filename, iso_abundances, vacuum=False)
+    elif format == 'turbospectrum_vac':
+        return parse_turbospectrum_linelist(filename, iso_abundances, vacuum=True)
+    else:
+        raise ValueError(f"Unknown linelist format: {format!r}. "
+                         "Use one of: vald, moog, moog_air, turbospectrum, "
+                         "turbospectrum_vac, korg")
+
+
+def get_APOGEE_DR17_linelist(include_water: bool = True) -> list:
+    """
+    Get the APOGEE DR17 linelist (15,000-17,000 Å).
+
+    Args:
+        include_water: Whether to include POKAZATEL water lines. Default True.
+
+    Returns:
+        List of Line objects sorted by wavelength
+    """
+    import os, h5py
+
+    from .data_loader import _DATA_DIR
+    py_dir = os.path.join(_DATA_DIR, 'linelists', 'APOGEE_DR17')
+    julia_dir = os.path.expanduser(
+        '~/.julia/packages/Korg/Rt7Dk/data/linelists/APOGEE_DR17'
+    )
+    data_dir = py_dir if os.path.isdir(py_dir) else julia_dir
+
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(
+            f"APOGEE DR17 linelist data not found. Expected at: {py_dir}"
+        )
+
+    atoms = parse_turbospectrum_linelist(
+        os.path.join(data_dir, 'turbospec.20180901t20.atoms_no_ba'),
+        vacuum=False
+    )
+    mols = parse_turbospectrum_linelist(
+        os.path.join(data_dir, 'turbospec.20180901t20.molec'),
+        vacuum=False
+    )
+    all_lines = atoms + mols
+
+    if include_water:
+        water_file = os.path.join(data_dir, 'pokazatel_water_lines.h5')
+        if os.path.exists(water_file):
+            with h5py.File(water_file, 'r') as f:
+                w_wls = f['wl'][:]
+                w_loggfs = f['log_gf'][:]
+                w_E_lowers = f['E_lower'][:]
+                w_gamma_rads = f['gamma_rad'][:]
+            water_spec = Species('H2O')
+            for i in range(len(w_wls)):
+                all_lines.append(Line(
+                    wl=float(w_wls[i]),
+                    log_gf=float(w_loggfs[i]),
+                    species=water_spec,
+                    E_lower=float(w_E_lowers[i]),
+                    gamma_rad=float(w_gamma_rads[i]),
+                    gamma_stark=0.0,
+                    vdW=(0.0, -1.0)
+                ))
+
+    return sorted(all_lines, key=lambda l: l.wl)
+
+
+def get_GES_linelist(include_molecules: bool = True) -> list:
+    """
+    Get the Gaia-ESO survey linelist from Heiter et al. 2021.
+
+    Contains > 15 million lines. Requires Korg.jl to be installed in Julia
+    (to download the artifact on first use).
+
+    Args:
+        include_molecules: Whether to include molecular lines. Default True.
+
+    Returns:
+        List of Line objects sorted by wavelength
+    """
+    import os, h5py, glob
+
+    artifacts_pattern = os.path.expanduser(
+        '~/.julia/artifacts/*/Heiter_et_al_2021_*/Heiter_et_al_2021.h5'
+    )
+    candidates = glob.glob(artifacts_pattern)
+    if not candidates:
+        raise FileNotFoundError(
+            "GES linelist not found. Install Korg.jl in Julia and run "
+            "Korg.get_GES_linelist() once to download the artifact."
+        )
+    path = candidates[0]
+
+    with h5py.File(path, 'r') as f:
+        species_strs = [s.decode() if isinstance(s, bytes) else s
+                        for s in f['species'][:]]
+        all_species = [Species(s) for s in species_strs]
+
+        keep = np.ones(len(all_species), dtype=bool)
+        if not include_molecules:
+            keep = np.array([not s.formula.is_molecule() for s in all_species])
+
+        wls_air = f['wl'][:][keep]
+        log_gfs_arr = f['log_gf'][:][keep]
+        E_lowers_arr = f['E_lower'][:][keep]
+        gamma_rads_raw = f['gamma_rad'][:][keep]
+        gamma_starks_raw = f['gamma_stark'][:][keep]
+        vdWs_raw = f['vdW'][:][keep]
+
+    species_kept = [s for s, k in zip(all_species, keep) if k]
+
+    def _ten_or_none(val):
+        return None if (np.isnan(val) or val == 0.0) else 10.0 ** val
+
+    def _vdw_or_none(val):
+        return None if np.isnan(val) else val
+
+    wls_vac = air_to_vacuum(wls_air * 1e8)  # convert cm->Å then air->vac
+    result = []
+    for i in range(len(wls_vac)):
+        line = create_line(
+            wls_vac[i], float(log_gfs_arr[i]), species_kept[i], float(E_lowers_arr[i]),
+            gamma_rad=_ten_or_none(gamma_rads_raw[i]),
+            gamma_stark=_ten_or_none(gamma_starks_raw[i]),
+            vdW=_vdw_or_none(vdWs_raw[i])
+        )
+        result.append(line)
+
+    # Filter bad CH lines (see Korg.jl issue #356)
+    ch_spec = Species('CH')
+    result = [l for l in result if not (l.species == ch_spec and l.log_gf > -1.9)]
+
+    return result

@@ -45,6 +45,30 @@ except (ImportError, FileNotFoundError) as e:
     save_synthesis_data = None
     interpolate_marcs = None
 
+# Linelist functions
+from .linelist import (
+    Line, approximate_line_strength, create_line,
+    read_linelist, read_vald_linelist, read_korg_linelist,
+    save_linelist, parse_moog_linelist, parse_turbospectrum_linelist,
+    get_VALD_solar_linelist, get_GALAH_DR3_linelist,
+    get_APOGEE_DR17_linelist, get_GES_linelist,
+    air_to_vacuum, vacuum_to_air, isotopic_abundances,
+)
+
+# Prune/merge utilities
+from .prune_linelist import merge_close_lines, prune_linelist
+
+# Molecular cross-sections
+from .molecular_cross_sections import (
+    MolecularCrossSection,
+    interpolate_molecular_cross_sections,
+    save_molecular_cross_section,
+    read_molecular_cross_section,
+)
+
+# Atmosphere I/O
+from .atmosphere import read_model_atmosphere
+
 # Re-export commonly used constants
 from .constants import (
     c_cgs, hplanck_cgs, hplanck_eV, kboltz_cgs, kboltz_eV,
@@ -74,6 +98,33 @@ __all__ = [
     # Key classes
     "Species",
     "Formula",
+    "Line",
+    "MolecularCrossSection",
+    # Linelist functions
+    "approximate_line_strength",
+    "create_line",
+    "read_linelist",
+    "read_vald_linelist",
+    "read_korg_linelist",
+    "save_linelist",
+    "parse_moog_linelist",
+    "parse_turbospectrum_linelist",
+    "get_VALD_solar_linelist",
+    "get_GALAH_DR3_linelist",
+    "get_APOGEE_DR17_linelist",
+    "get_GES_linelist",
+    "air_to_vacuum",
+    "vacuum_to_air",
+    "isotopic_abundances",
+    # Prune/merge
+    "merge_close_lines",
+    "prune_linelist",
+    # Molecular cross-sections
+    "interpolate_molecular_cross_sections",
+    "save_molecular_cross_section",
+    "read_molecular_cross_section",
+    # Atmosphere I/O
+    "read_model_atmosphere",
     # Constants
     "c_cgs",
     "hplanck_cgs",
