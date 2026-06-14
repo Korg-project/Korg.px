@@ -2377,12 +2377,8 @@ class TestChemicalEquilibrium:
         )
 
         # Convert abundances to array format for JIT version
-        absolute_abundances_array = jnp.zeros(92)
-        for Z in range(1, 93):
-            if Z in absolute_abundances_dict:
-                absolute_abundances_array = absolute_abundances_array.at[Z-1].set(
-                    absolute_abundances_dict[Z]
-                )
+        # absolute_abundances_dict is a numpy array indexed 0..91 (not a dict)
+        absolute_abundances_array = jnp.asarray(absolute_abundances_dict)
 
         # Test JIT version
         ne_jit, neutral_fractions = chemical_equilibrium_jit(
@@ -2426,13 +2422,8 @@ class TestChemicalEquilibrium:
 
         # Solar abundances as array
         A_X = format_A_X()
-        absolute_abundances_dict = A_X_to_absolute(A_X)
-        absolute_abundances_array = jnp.zeros(92)
-        for Z in range(1, 93):
-            if Z in absolute_abundances_dict:
-                absolute_abundances_array = absolute_abundances_array.at[Z-1].set(
-                    absolute_abundances_dict[Z]
-                )
+        # A_X_to_absolute returns numpy array indexed 0..91 (not a dict)
+        absolute_abundances_array = jnp.asarray(A_X_to_absolute(A_X))
 
         # The function is already decorated with @jax.jit, but we can also wrap it
         # This verifies it can be called multiple times efficiently
@@ -2485,13 +2476,8 @@ class TestChemicalEquilibrium:
 
         # Solar abundances as array
         A_X = format_A_X()
-        absolute_abundances_dict = A_X_to_absolute(A_X)
-        absolute_abundances_array = jnp.zeros(92)
-        for Z in range(1, 93):
-            if Z in absolute_abundances_dict:
-                absolute_abundances_array = absolute_abundances_array.at[Z-1].set(
-                    absolute_abundances_dict[Z]
-                )
+        # A_X_to_absolute returns numpy array indexed 0..91 (not a dict)
+        absolute_abundances_array = jnp.asarray(A_X_to_absolute(A_X))
 
         n_total = 1e17
         ne_model = 1e14

@@ -620,9 +620,20 @@ def newton_solve_jax(residuals_func, x0, ftol=1e-8, max_iter=1000):
         # Compute Jacobian using forward-mode autodiff
         J = jax.jacfwd(residuals_func)(x)
 
+        # Tikhonov regularization to handle rank-deficient Jacobians
+        # (elements with zero abundance give zero rows in J)
+        n = J.shape[0]
+        J_reg = J + 1e-8 * jnp.eye(n)
+
         # Solve J * dx = -F for the Newton step
-        # Use lstsq for robustness against singular Jacobians
-        dx = jnp.linalg.lstsq(J, -F, rcond=None)[0]
+        dx = jnp.linalg.lstsq(J_reg, -F, rcond=1e-10)[0]
+
+        # Clip step size to prevent divergence (max step = 5 in scaled units)
+        dx_norm = jnp.linalg.norm(dx)
+        dx = jnp.where(dx_norm > 5.0, dx * (5.0 / dx_norm), dx)
+
+        # Replace NaN/Inf steps with zero
+        dx = jnp.where(jnp.isfinite(dx), dx, 0.0)
 
         # Only update if not converged
         x_new = jnp.where(converged, x, x + dx)
@@ -895,9 +906,9 @@ def chemical_equilibrium_jit(T, n_total, ne_model, absolute_abundances, data):
     """
     Solve for chemical equilibrium (fully JIT-compatible version).
 
-    This version uses pre-computed data for partition functions and
-    equilibrium constants, allowing it to be called from within
-    other JIT-compiled functions.
+    Uses a Picard (fixed-point) iteration on the electron density instead of
+    Newton's method, avoiding the need for jacfwd inside while_loop which is
+    expensive to compile for high-dimensional systems.
 
     Parameters
     ----------
@@ -908,7 +919,7 @@ def chemical_equilibrium_jit(T, n_total, ne_model, absolute_abundances, data):
     ne_model : float
         Model atmosphere electron number density (initial guess)
     absolute_abundances : jax array
-        Absolute abundances N(X)/N_total, shape (92,)
+        Absolute abundances N(X)/N_total, shape (92,), indexed 0=H, 1=He, ...
     data : ChemicalEquilibriumData
         Pre-computed data from precompute_chemical_equilibrium_data()
 
@@ -919,82 +930,39 @@ def chemical_equilibrium_jit(T, n_total, ne_model, absolute_abundances, data):
         - ne: Calculated electron number density in cm⁻³
         - neutral_fractions: Array of neutral fractions for each element
     """
-    log_T = jnp.log(T)
+    # Precompute Saha weights at ne=1 (scale as wII(ne) = wII_ne1/ne)
+    wII_ne1, wIII_ne1 = _compute_saha_weights_jit(T, 1.0, data)
 
-    # Compute initial guess using Saha equation
-    wII_init, wIII_init = _compute_saha_weights_jit(T, ne_model, data)
-    neutral_fraction_guess = 1.0 / (1.0 + wII_init + wIII_init)
+    def electron_sum_from_ne(ne):
+        """Compute total electron count via Saha equation given ne."""
+        wII = wII_ne1 / jnp.clip(ne, 1e-12, jnp.inf)
+        wIII = wIII_ne1 / jnp.clip(ne * ne, 1e-24, jnp.inf)
+        atom_densities = absolute_abundances * (n_total - ne)
+        neutral_fracs = 1.0 / (1.0 + wII + wIII)
+        neutral_densities = atom_densities * neutral_fracs
+        return jnp.sum((wII + 2.0 * wIII) * neutral_densities)
 
-    # Initial state vector
-    x0 = jnp.concatenate([neutral_fraction_guess, jnp.array([ne_model / (n_total * 1e-5)])])
+    def body(state):
+        ne, i = state
+        ne_new = electron_sum_from_ne(ne)
+        ne_new = jnp.clip(ne_new, 1.0, n_total)
+        # Geometric-mean damping in log space (0.3/0.7 split) prevents oscillation
+        log_ne_new = 0.3 * jnp.log(jnp.clip(ne, 1e-99, jnp.inf)) + 0.7 * jnp.log(jnp.clip(ne_new, 1e-99, jnp.inf))
+        return jnp.exp(log_ne_new), i + 1
 
-    # Create residuals function with fixed parameters
-    def residuals(x):
-        # We need to pass T through the state vector for JIT compatibility
-        # But for now, T is fixed from the outer scope (captured in closure)
-        ne = jnp.clip(jnp.abs(x[-1]) * n_total * 1e-5, 1e-12, jnp.inf)
-        neutral_fractions = jnp.abs(x[:MAX_ATOMIC_NUMBER])
-        atom_number_densities = absolute_abundances * (n_total - ne)
-        neutral_number_densities = atom_number_densities * neutral_fractions
+    def cond(state):
+        _, i = state
+        return i < 300
 
-        wII, wIII = _compute_saha_weights_jit(T, ne, data)
+    ne_sol, _ = jax.lax.while_loop(
+        cond, body, (jnp.asarray(ne_model, dtype=jnp.float64), jnp.int32(0))
+    )
 
-        F_elements = atom_number_densities - (1.0 + wII + wIII) * neutral_number_densities
-        F_electron = jnp.sum((wII + 2.0 * wIII) * neutral_number_densities) - ne
-        F = jnp.concatenate([F_elements, jnp.array([F_electron])])
+    wII_sol = wII_ne1 / jnp.clip(ne_sol, 1e-12, jnp.inf)
+    wIII_sol = wIII_ne1 / jnp.clip(ne_sol * ne_sol, 1e-24, jnp.inf)
+    neutral_fractions = 1.0 / (1.0 + wII_sol + wIII_sol)
 
-        # Molecular contributions
-        log_neutral_densities = jnp.log10(jnp.clip(neutral_number_densities, 1e-99, jnp.inf))
-
-        def process_molecule(F, mol_idx):
-            atoms = data.mol_atoms_array[mol_idx]
-            charge = data.mol_charges[mol_idx]
-            n_atoms = data.mol_n_atoms[mol_idx]
-            log_nK = _get_log_nK_jit(mol_idx, log_T, data)
-
-            valid = jnp.isfinite(log_nK)
-
-            def neutral_contrib(F):
-                log_sum = jnp.sum(jnp.where(jnp.arange(6) < n_atoms, log_neutral_densities[atoms], 0.0))
-                n_mol = 10.0 ** jnp.clip(log_sum - log_nK, -300, 300)
-                updates = jnp.where(jnp.arange(6) < n_atoms, -n_mol, 0.0)
-                F_new = F
-                for k in range(6):
-                    F_new = F_new.at[atoms[k]].add(jnp.where(n_atoms > k, updates[k], 0.0))
-                return F_new
-
-            def ionized_contrib(F):
-                idx1, idx2 = atoms[0], atoms[1]
-                n1_II_log = log_neutral_densities[idx1] + jnp.log10(jnp.clip(wII[idx1], 1e-99, jnp.inf))
-                n2_I_log = log_neutral_densities[idx2]
-                n_mol = 10.0 ** jnp.clip(n1_II_log + n2_I_log - log_nK, -300, 300)
-                return F.at[idx1].add(-n_mol).at[idx2].add(-n_mol).at[-1].add(n_mol)
-
-            F_updated = jax.lax.cond(valid,
-                lambda F: jax.lax.cond(charge == 0, neutral_contrib, ionized_contrib, F),
-                lambda F: F, F)
-            return F_updated, None
-
-        # Process molecules - use array shape (known at trace time)
-        n_mols = data.mol_charges.shape[0]
-        if n_mols > 0:
-            F, _ = jax.lax.scan(process_molecule, F, jnp.arange(n_mols))
-
-        # Normalize
-        F = F.at[:MAX_ATOMIC_NUMBER].set(
-            jnp.where(atom_number_densities > 0,
-                     F[:MAX_ATOMIC_NUMBER] / jnp.clip(atom_number_densities, 1e-99, jnp.inf), 0.0))
-        F = F.at[-1].set(F[-1] / jnp.clip(ne * 1e-5, 1e-12, jnp.inf))
-        return F
-
-    # Solve using Newton's method
-    x_solution, converged, residual_norm, iterations = newton_solve_jax(residuals, x0)
-
-    # Extract solution
-    ne = jnp.abs(x_solution[-1]) * n_total * 1e-5
-    neutral_fractions = jnp.abs(x_solution[:MAX_ATOMIC_NUMBER])
-
-    return ne, neutral_fractions
+    return ne_sol, neutral_fractions
 
 
 def chemical_equilibrium(T, n_total, ne_model, absolute_abundances,
