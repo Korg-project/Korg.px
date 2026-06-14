@@ -1046,9 +1046,11 @@ def chemical_equilibrium(T, n_total, ne_model, absolute_abundances,
 
 
     # Solve using JAX-based Newton's method (like Julia's NLsolve)
-    # ftol scales with n_total: residuals have units cm^-3, so absolute tolerance
-    # must scale with the problem size. n_total * 1e-6 gives ~6 significant digits.
-    ftol = max(1.0, n_total * 1e-6)
+    # Residuals in _compute_residuals_core are normalized (element residuals divided
+    # by atom_number_densities, electron residual divided by ne*1e-5), so ftol is
+    # dimensionless. 1e-4 is safely above float32 precision (~1e-7) while tight
+    # enough that the solver must actually converge, not just accept the initial guess.
+    ftol = 1e-4
     try:
         x_solution, converged, residual_norm, iterations = newton_solve_jax(
             residuals_func, x0, ftol=ftol, max_iter=100
