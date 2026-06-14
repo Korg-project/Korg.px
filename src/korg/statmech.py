@@ -626,11 +626,7 @@ def newton_solve_jax(residuals_func, x0, ftol=1e-8, max_iter=1000):
         J_reg = J + 1e-8 * jnp.eye(n)
 
         # Solve J * dx = -F for the Newton step
-        dx = jnp.linalg.lstsq(J_reg, -F, rcond=1e-10)[0]
-
-        # Clip step size to prevent divergence (max step = 5 in scaled units)
-        dx_norm = jnp.linalg.norm(dx)
-        dx = jnp.where(dx_norm > 5.0, dx * (5.0 / dx_norm), dx)
+        dx = jnp.linalg.lstsq(J_reg, -F, rcond=None)[0]
 
         # Replace NaN/Inf steps with zero
         dx = jnp.where(jnp.isfinite(dx), dx, 0.0)
@@ -1050,16 +1046,19 @@ def chemical_equilibrium(T, n_total, ne_model, absolute_abundances,
 
 
     # Solve using JAX-based Newton's method (like Julia's NLsolve)
+    # ftol scales with n_total: residuals have units cm^-3, so absolute tolerance
+    # must scale with the problem size. n_total * 1e-6 gives ~6 significant digits.
+    ftol = max(1.0, n_total * 1e-6)
     try:
         x_solution, converged, residual_norm, iterations = newton_solve_jax(
-            residuals_func, x0, ftol=1e-8, max_iter=1000
+            residuals_func, x0, ftol=ftol, max_iter=100
         )
 
         if not converged:
             # Try again with very small ne guess (like Julia does)
             x0_retry = x0.at[-1].set(1e-5)
             x_solution, converged, residual_norm, iterations = newton_solve_jax(
-                residuals_func, x0_retry, ftol=1e-8, max_iter=1000
+                residuals_func, x0_retry, ftol=ftol, max_iter=100
             )
 
         if not converged:
