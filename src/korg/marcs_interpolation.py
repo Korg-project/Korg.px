@@ -107,10 +107,10 @@ def lazy_multilinear_interpolation(
         local_inds = list(idx)
         atm_inds = list(local_inds)
 
-        # Use upper bound as lower bound if param is on grid point
+        # When param is exactly on a grid point, both corners use the same node
         for i in range(n_params):
             if isexact[i]:
-                atm_inds[i] = 1  # Use upper bound
+                atm_inds[i] = 0  # Both corners map to the exact grid node (upper_vertex-1)
 
         # Convert to grid indices
         # local_ind 0 (lower) → grid index upper_vertex - 1
