@@ -499,3 +499,231 @@ def _numerical_dp_dscaled(name, scaled_val, eps=1e-6):
     p_plus = _unscale_params({name: scaled_val + eps})[name]
     p_minus = _unscale_params({name: scaled_val - eps})[name]
     return (p_plus - p_minus) / (2 * eps)
+
+
+# ---------------------------------------------------------------------------
+# Equivalent width fitting (port of Korg.jl Fit/fit_via_EWs.jl)
+# ---------------------------------------------------------------------------
+
+def calculate_EWs(atm, linelist, A_X, ew_window_size=2.0, wl_step=0.01,
+                  blend_warn_threshold=0.01, **synthesize_kwargs):
+    """
+    Compute the equivalent widths of spectral lines via synthesis.
+
+    Port of Korg.jl calculate_EWs.
+
+    Parameters
+    ----------
+    atm : PlanarAtmosphere or ShellAtmosphere
+        Model atmosphere.
+    linelist : list of Line
+        Spectral lines (must be sorted by wavelength).
+    A_X : array, shape (92,)
+        Abundances in A(X) format (from format_A_X).
+    ew_window_size : float, optional
+        Half-width of each synthesis window in Å. Default 2.0.
+    wl_step : float, optional
+        Wavelength step within each window in Å. Default 0.01.
+    blend_warn_threshold : float, optional
+        Minimum absorption between adjacent lines before a blend warning.
+        Default 0.01.
+    **synthesize_kwargs
+        Additional keyword arguments passed to synthesize().
+
+    Returns
+    -------
+    EWs : ndarray, shape (n_lines,)
+        Equivalent widths in mÅ.
+    """
+    lines = list(linelist)
+    if not lines:
+        return np.array([])
+
+    # Sort check
+    wls_cm = np.array([l.wl for l in lines])
+    if not np.all(np.diff(wls_cm) >= 0):
+        raise ValueError("linelist must be sorted by wavelength")
+
+    wls_ang = wls_cm * 1e8  # cm → Å
+
+    # Build one (lo, hi) window per line in Å, then merge overlapping ones.
+    # Track which lines fall in each merged window.
+    raw_windows = [(wl - ew_window_size, wl + ew_window_size) for wl in wls_ang]
+    merged = _merge_windows([(lo, hi) for lo, hi in raw_windows], buffer=0.0)
+
+    # Assign each line to a merged window
+    lines_per_merged = [[] for _ in merged]
+    for i, wl in enumerate(wls_ang):
+        for j, (lo, hi) in enumerate(merged):
+            if lo <= wl <= hi:
+                lines_per_merged[j].append(i)
+                break
+
+    # Build synthesis wavelength ranges from merged windows
+    wl_ranges = []
+    for lo, hi in merged:
+        n_pts = max(2, int(round((hi - lo) / wl_step)) + 1)
+        wl_ranges.append(np.linspace(lo, hi, n_pts))
+
+    # Synthesize all windows in one call (shares chemical equilibrium)
+    all_wls = np.concatenate(wl_ranges)
+    sol = synthesize(atm, lines, all_wls, A_X,
+                     line_buffer=0.0, hydrogen_lines=False, verbose=False,
+                     **synthesize_kwargs)
+
+    flux = np.asarray(sol.flux)
+    continuum = np.asarray(sol.continuum)
+    depth = 1.0 - flux / continuum
+
+    EWs = np.zeros(len(lines))
+
+    # Compute cumulative start index for each merged window
+    cumulative = np.concatenate([[0], np.cumsum([len(r) for r in wl_ranges])])
+
+    for win_idx, line_indices in enumerate(lines_per_merged):
+        if not line_indices:
+            continue
+
+        i0 = cumulative[win_idx]
+        i1 = cumulative[win_idx + 1]
+        wl_range = np.asarray(sol.wavelengths[i0:i1])
+        absorption = depth[i0:i1]
+        n_local = len(line_indices)
+
+        # Find boundary index (minimum absorption) between each pair of adjacent lines
+        boundaries = [0]
+        for k in range(n_local - 1):
+            wl_left = wls_ang[line_indices[k]]
+            wl_right = wls_ang[line_indices[k + 1]]
+            l1_idx = int(round((wl_left - wl_range[0]) / wl_step))
+            l2_idx = int(round((wl_right - wl_range[0]) / wl_step))
+            l1_idx = max(0, min(l1_idx, len(wl_range) - 1))
+            l2_idx = max(0, min(l2_idx, len(wl_range) - 1))
+            seg = absorption[l1_idx:l2_idx + 1]
+            if len(seg) > 0:
+                bound = int(np.argmin(seg)) + l1_idx
+            else:
+                bound = l1_idx
+            if len(seg) > 0 and absorption[bound] > blend_warn_threshold:
+                warnings.warn(
+                    f"Lines {line_indices[k]} and {line_indices[k+1]} "
+                    f"({wls_ang[line_indices[k]]:.2f} Å and {wls_ang[line_indices[k+1]]:.2f} Å) "
+                    f"appear blended (minimum absorption between them: "
+                    f"{absorption[bound]:.4f} > {blend_warn_threshold}). "
+                    f"Adjust blend_warn_threshold to suppress this warning.",
+                    stacklevel=2,
+                )
+            boundaries.append(bound)
+        boundaries.append(len(wl_range) - 1)
+
+        for k, li in enumerate(line_indices):
+            b0 = boundaries[k]
+            b1 = boundaries[k + 1] + 1
+            EWs[li] = np.trapz(absorption[b0:b1], wl_range[b0:b1]) * 1e3  # Å → mÅ
+
+    return EWs
+
+
+def ews_to_abundances(atm, linelist, A_X, measured_EWs, ew_window_size=2.0, wl_step=0.01,
+                      blend_warn_threshold=0.01, abundance_tol=1e-4,
+                      finite_difference_delta_A=0.01, **synthesize_kwargs):
+    """
+    Derive per-line chemical abundances from observed equivalent widths.
+
+    For each line, adjusts the element's abundance in A_X until the synthetic
+    EW matches the measured EW, using a Newton-like iteration.
+
+    Port of Korg.jl ews_to_abundances.
+
+    Parameters
+    ----------
+    atm : PlanarAtmosphere or ShellAtmosphere
+        Model atmosphere.
+    linelist : list of Line
+        Spectral lines (must be sorted by wavelength).
+    A_X : array, shape (92,)
+        Starting abundances in A(X) = log10(n_X/n_H)+12 format.
+    measured_EWs : array, shape (n_lines,)
+        Observed equivalent widths in mÅ.
+    ew_window_size : float, optional
+        Half-width of each synthesis window in Å. Default 2.0.
+    wl_step : float, optional
+        Wavelength resolution in Å. Default 0.01.
+    blend_warn_threshold : float, optional
+        Blend warning threshold. Default 0.01.
+    abundance_tol : float, optional
+        Convergence tolerance in A(X) dex. Default 1e-4.
+    finite_difference_delta_A : float, optional
+        Step size for curve-of-growth slope estimation. Default 0.01 dex.
+    **synthesize_kwargs
+        Extra keyword arguments passed to synthesize().
+
+    Returns
+    -------
+    abundances : ndarray, shape (n_lines,)
+        Best-fit A(X) for each line.
+    dA_d_log_EW : ndarray, shape (n_lines,)
+        Curve-of-growth slope ∂A/∂log(EW) for each line.
+    """
+    from .atomic_data import atomic_numbers
+    from .linelist import Line
+
+    lines = list(linelist)
+    measured_EWs = np.asarray(measured_EWs, dtype=float)
+    A_X = np.asarray(A_X, dtype=float).copy()
+
+    if len(lines) != len(measured_EWs):
+        raise ValueError("linelist and measured_EWs must have the same length")
+
+    abundances = np.zeros(len(lines))
+    dA_d_log_EW = np.zeros(len(lines))
+
+    for i, (line, ew_obs) in enumerate(zip(lines, measured_EWs)):
+        # Identify the element (Z) from the line species
+        Z = line.species.formula.atoms[0] if hasattr(line.species, "formula") else 1
+        if hasattr(line, "species") and hasattr(line.species, "formula"):
+            atoms = line.species.formula.atoms
+            Z = atoms[0] if atoms else 1
+
+        A_X_mod = A_X.copy()
+
+        def _get_ew(A_val):
+            A_X_mod[Z - 1] = A_val
+            ews = calculate_EWs(atm, [line], A_X_mod,
+                                 ew_window_size=ew_window_size, wl_step=wl_step,
+                                 blend_warn_threshold=1.0,  # suppress blend warnings
+                                 **synthesize_kwargs)
+            return float(ews[0])
+
+        # Initial EW at starting abundance
+        A0 = float(A_X[Z - 1])
+        ew0 = _get_ew(A0)
+
+        # Finite difference for curve-of-growth slope
+        ew_plus = _get_ew(A0 + finite_difference_delta_A)
+        if ew_plus > 1e-10 and ew0 > 1e-10:
+            d_log_ew = np.log10(ew_plus) - np.log10(ew0)
+            dA_d_log_EW[i] = finite_difference_delta_A / d_log_ew if abs(d_log_ew) > 1e-10 else np.inf
+        else:
+            dA_d_log_EW[i] = np.inf
+
+        # Newton iteration: adjust A until synthetic EW matches observed EW
+        A_cur = A0
+        for _ in range(50):
+            ew_cur = _get_ew(A_cur)
+            if ew_cur < 1e-10 or ew_obs < 1e-10:
+                break
+            delta_log_ew = np.log10(ew_obs) - np.log10(ew_cur)
+            if abs(delta_log_ew) < 1e-6:
+                break
+            dA = dA_d_log_EW[i] * delta_log_ew if np.isfinite(dA_d_log_EW[i]) else delta_log_ew
+            dA = np.clip(dA, -1.0, 1.0)  # limit step size to 1 dex
+            A_new = A_cur + dA
+            if abs(A_new - A_cur) < abundance_tol:
+                A_cur = A_new
+                break
+            A_cur = A_new
+
+        abundances[i] = A_cur
+
+    return abundances, dA_d_log_EW
