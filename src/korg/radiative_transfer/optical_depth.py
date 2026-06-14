@@ -8,11 +8,13 @@ accuracy compared to direct integration.
 Reference: Korg.jl RadiativeTransfer module
 """
 
+import jax
 import jax.numpy as jnp
 from jax import jit
+from .intensity import fritsch_butland_C
 
 
-def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, spherical=False):
+def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, alpha_ref, spherical=False):
     """
     Compute optical depth using the anchored scheme.
 
@@ -32,6 +34,9 @@ def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, spherical=False):
         For spherical: radius from center
     log_tau_ref : array, shape (n_layers,)
         log₁₀(optical depth) at reference wavelength
+    alpha_ref : array, shape (n_layers,)
+        Absorption coefficient at reference wavelength [cm⁻¹]
+        Required for computing the opacity ratio
     spherical : bool, optional
         If True, use spherical geometry correction factor
         Default: False (planar geometry)
@@ -46,10 +51,14 @@ def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, spherical=False):
     The integration is performed using trapezoidal rule:
     τ[i+1] = τ[i] + 0.5 * (integrand[i+1] + integrand[i]) * Δ(log τ_ref)
 
+    where integrand = α(λ) / α(λ_ref) * τ_ref
+
     For spherical geometry, the integrand includes a factor accounting for
     the changing ray path length through shells.
 
     The first layer (typically top of atmosphere) has τ = 0 by definition.
+
+    Reference: Korg.jl compute_tau_anchored! function
     """
     n_layers = len(alpha)
     tau = jnp.zeros(n_layers)
@@ -57,15 +66,10 @@ def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, spherical=False):
     # Convert log reference optical depth to linear
     tau_ref = 10.0 ** log_tau_ref
 
-    if spherical:
-        # For spherical geometry, integrand includes geometric factor
-        # integrand = α(λ) / α(λ_ref) * τ_ref * (1 + r/H_scale)
-        # This accounts for curved ray paths through shells
-        # For now, use simplified version (full version needs scale height)
-        integrand = alpha * tau_ref
-    else:
-        # Planar geometry: simple ratio
-        integrand = alpha * tau_ref
+    # Compute integrand = α(λ) / α(λ_ref) * τ_ref
+    # Handle division by zero by using a small epsilon
+    alpha_ref_safe = jnp.where(jnp.abs(alpha_ref) > 1e-30, alpha_ref, 1e-30)
+    integrand = alpha / alpha_ref_safe * tau_ref
 
     # Trapezoidal integration over log(τ_ref)
     # tau[0] = 0 (top of atmosphere)
@@ -139,5 +143,75 @@ def compute_tau_direct(alpha, spatial_coord, spherical=False, mu=1.0):
     # tau[-1] = 0 (surface)
     # tau[i] = tau[i+1] + dtau[i] (going deeper)
     tau = jnp.concatenate([jnp.cumsum(dtau[::-1])[::-1], jnp.array([0.0])])
+
+    return tau
+
+
+@jit
+def compute_tau_bezier(alpha, spatial_coord):
+    """
+    Compute optical depth using Bezier interpolation of opacity.
+
+    This method ensures monotonically increasing optical depth by integrating
+    opacity along the spatial path using Bezier control points. More stable
+    than the anchored scheme when opacity has inversions.
+
+    Parameters
+    ----------
+    alpha : array, shape (n_layers,)
+        Total absorption coefficient at each layer [cm⁻¹]
+    spatial_coord : array, shape (n_layers,)
+        Spatial coordinate at each layer [cm]
+        For planar: height/depth coordinate
+        Should decrease from top to bottom (increasing into atmosphere)
+
+    Returns
+    -------
+    tau : array, shape (n_layers,)
+        Optical depth at each layer, monotonically increasing
+
+    Notes
+    -----
+    The optical depth is computed by integrating:
+    τ[i] = τ[i-1] + (s[i-1] - s[i]) / 3 * (α[i] + α[i-1] + C[i-1])
+
+    where C are Bezier control points for the opacity profile.
+
+    The factor of 1/3 comes from the Simpson's rule-like integration with
+    Bezier control points.
+
+    Reference: Korg.jl compute_tau_bezier! function
+    """
+    n_layers = len(alpha)
+
+    # Start with small non-zero optical depth at surface
+    tau = jnp.zeros(n_layers)
+    tau = tau.at[0].set(1e-5)
+
+    # Compute Bezier control points for opacity along spatial coordinate
+    C = fritsch_butland_C(spatial_coord, alpha)
+
+    # Clamp control points for numerical stability
+    # (prevents extreme values that could cause overflow)
+    C = jnp.clip(C, 0.5 * jnp.min(alpha), 2.0 * jnp.max(alpha))
+
+    # Integrate optical depth using Bezier scheme
+    # τ[i] = τ[i-1] + Δs / 3 * (α[i-1] + α[i] + C[i-1])
+    def body_fn(i, tau_val):
+        # Spatial step: use absolute value to ensure positive dtau
+        # The direction doesn't matter since we're integrating opacity over path length
+        ds = jnp.abs(spatial_coord[i] - spatial_coord[i-1])
+
+        # Bezier-weighted average of opacity
+        alpha_avg = (alpha[i-1] + alpha[i] + C[i-1]) / 3.0
+
+        # Increment in optical depth
+        dtau = ds * alpha_avg
+
+        # Update tau
+        return tau_val.at[i].set(tau_val[i-1] + dtau)
+
+    # Loop through layers to build up optical depth
+    tau = jax.lax.fori_loop(1, n_layers, body_fn, tau)
 
     return tau

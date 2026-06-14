@@ -9,11 +9,38 @@ Reference: Korg.jl RadiativeTransfer module
 
 import jax.numpy as jnp
 from jax import jit
-import numpy as np
 
-from .optical_depth import compute_tau_anchored, compute_tau_direct
+from .optical_depth import compute_tau_anchored, compute_tau_direct, compute_tau_bezier
 from .intensity import (compute_I_linear_flux_only, compute_F_flux_only_expint,
-                         compute_I_linear, compute_flux_from_intensities)
+                         compute_I_linear, compute_I_bezier, compute_flux_from_intensities)
+
+
+def leggauss(n):
+    """
+    Gauss-Legendre quadrature nodes and weights.
+
+    Parameters
+    ----------
+    n : int
+        Number of points
+
+    Returns
+    -------
+    nodes : array, shape (n_mu, )
+    weights : array, shape (n_mu, )
+    """
+    # Companion matrix for Legendre polynomials
+    i = jnp.arange(1, n)
+    beta = i / jnp.sqrt(4 * i**2 - 1)
+
+    # Symmetric tridiagonal matrix
+    T = jnp.diag(beta, -1) + jnp.diag(beta, 1)
+
+    # Eigenvalues are nodes, eigenvectors give weights
+    nodes, V = jnp.linalg.eigh(T)
+    weights = 2 * V[0, :]**2
+
+    return nodes, weights
 
 
 def generate_mu_grid(n_mu=5):
@@ -42,8 +69,6 @@ def generate_mu_grid(n_mu=5):
     """
     # Get Gauss-Legendre quadrature on [-1, 1]
     # Then transform to [0, 1]
-    from numpy.polynomial.legendre import leggauss
-
     points, weights = leggauss(n_mu)
 
     # Transform from [-1, 1] to [0, 1]
@@ -60,6 +85,7 @@ def radiative_transfer_single_wavelength(
     log_tau_ref,
     alpha_ref=None,
     spherical=False,
+    tau_scheme="anchored",
     intensity_scheme="linear_flux_only",
     use_expint_flux=True,
     n_mu=5
@@ -91,11 +117,15 @@ def radiative_transfer_single_wavelength(
     spherical : bool, optional
         If True, use spherical geometry
         If False, use plane-parallel geometry (default)
+    tau_scheme : str, optional
+        Method for computing optical depth:
+        - "anchored": Scale tau_ref by opacity ratio (default, requires alpha_ref)
+        - "bezier": Direct integration with Bezier interpolation (more stable)
     intensity_scheme : str, optional
         Method for computing intensity:
         - "linear_flux_only": Fast, flux only (default)
         - "linear": Linear interpolation with angle integration
-        - "bezier": Bezier interpolation (not yet implemented)
+        - "bezier": Bezier interpolation (more stable at large optical depths)
     use_expint_flux : bool, optional
         If True and intensity_scheme="linear_flux_only", use exponential
         integral optimization for flux (default: True)
@@ -126,16 +156,18 @@ def radiative_transfer_single_wavelength(
     The emergent flux is the angle integral:
     F = 2π ∫₀¹ I(0, μ) μ dμ
     """
-    # Step 1: Compute optical depth using anchored scheme
-    # tau(λ) = tau_ref * α(λ) / α_ref
-    tau_ref = 10.0 ** log_tau_ref
-    if alpha_ref is not None:
-        # Anchored scheme: scale tau_ref by opacity ratio
-        tau = tau_ref * alpha / alpha_ref
+    # Step 1: Compute optical depth
+    if tau_scheme == "anchored":
+        # Anchored scheme: integrate dτ/d(log τ_ref) = α(λ) / α_ref * τ_ref
+        if alpha_ref is None:
+            raise ValueError("anchored tau scheme requires alpha_ref")
+        tau = compute_tau_anchored(alpha, spatial_coord, log_tau_ref, alpha_ref, spherical=spherical)
+    elif tau_scheme == "bezier":
+        # Bezier scheme: direct integration of opacity along path
+        # This ensures monotonic optical depth even with opacity inversions
+        tau = compute_tau_bezier(alpha, spatial_coord)
     else:
-        # No alpha_ref provided: use tau_ref directly
-        # This is correct for the reference wavelength (5000 Å)
-        tau = tau_ref
+        raise ValueError(f"Unknown tau_scheme: {tau_scheme}")
 
     # Step 2: Compute emergent flux based on intensity scheme
     if intensity_scheme == "linear_flux_only":
@@ -164,7 +196,17 @@ def radiative_transfer_single_wavelength(
         intensity = intensities
 
     elif intensity_scheme == "bezier":
-        raise NotImplementedError("Bezier intensity scheme not yet implemented")
+        # Compute intensity at multiple angles using Bezier interpolation
+        # More numerically stable than linear at large optical depths
+        mu_points, mu_weights = generate_mu_grid(n_mu)
+
+        # Compute intensity at each angle
+        # Scale optical depth by μ for slant path (as in compute_I_linear)
+        intensities = jnp.array([compute_I_bezier(tau / mu, S) for mu in mu_points])
+
+        # Integrate to get flux
+        flux = compute_flux_from_intensities(intensities, mu_points, mu_weights)
+        intensity = intensities
 
     else:
         raise ValueError(f"Unknown intensity_scheme: {intensity_scheme}")
@@ -179,6 +221,7 @@ def radiative_transfer(
     log_tau_ref,
     alpha_ref=None,
     spherical=False,
+    tau_scheme="anchored",
     intensity_scheme="linear_flux_only",
     use_expint_flux=True,
     n_mu=5
@@ -202,6 +245,8 @@ def radiative_transfer(
         If None, uses tau_ref directly (assumes alpha ≈ alpha_ref)
     spherical : bool, optional
         Spherical geometry flag (default: False)
+    tau_scheme : str, optional
+        Optical depth calculation method (default: "anchored")
     intensity_scheme : str, optional
         Intensity calculation method (default: "linear_flux_only")
     use_expint_flux : bool, optional
@@ -246,6 +291,7 @@ def radiative_transfer(
             log_tau_ref,
             alpha_ref=alpha_ref,
             spherical=spherical,
+            tau_scheme=tau_scheme,
             intensity_scheme=intensity_scheme,
             use_expint_flux=use_expint_flux,
             n_mu=n_mu

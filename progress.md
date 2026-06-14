@@ -316,6 +316,69 @@ Each function has three checkboxes:
 
 ---
 
+## Not Yet Converted
+
+These Julia functions/modules have no Python equivalent. Listed in dependency order (implement earlier items first).
+
+### Priority 1 — Core Synthesis Gaps
+
+| Julia file | Function(s) | Notes |
+|-----------|------------|-------|
+| `synthesize.jl` | `filter_linelist`, `get_reference_wavelength_linelist` | Internal helpers to `synthesize()`; needed to make full synthesis correct |
+| `prune_linelist.jl` | `prune_linelist(atm, linelist, A_X, wl_params)` | Prunes linelist to lines that materially affect a given synthesis; important for performance |
+| `prune_linelist.jl` | `merge_close_lines(lines)` | Merges spectrally unresolved nearby lines |
+
+### Priority 2 — Linelist Format Support
+
+| Julia file | Function(s) | Notes |
+|-----------|------------|-------|
+| `linelist.jl` | `parse_moog_linelist(f, ...)` | MOOG format reader |
+| `linelist.jl` | `parse_turbospectrum_linelist(fn, ...)` | TurboSpectrum format reader |
+| `linelist.jl` | `load_ExoMol_linelist(spec, states, transitions, ...)` | ExoMol molecular linelists |
+| `linelist.jl` | `save_linelist(path, linelist)` | Native Korg linelist serialization |
+| `linelist.jl` | `read_korg_linelist(path)` | Native Korg linelist loader |
+| `linelist.jl` | `get_APOGEE_DR17_linelist()` | Built-in APOGEE linelist |
+| `linelist.jl` | `get_GES_linelist()` | Built-in GES linelist |
+| `linelist.jl` | `approximate_line_strength(line, T)` | Quick line strength estimate (used by `prune_linelist`) |
+
+### Priority 3 — Molecular Opacity
+
+| Julia file | Function(s) | Notes |
+|-----------|------------|-------|
+| `molecular_cross_sections.jl` | `MolecularCrossSection` | Precomputed molecular opacity grid (struct + constructor) |
+| `molecular_cross_sections.jl` | `interpolate_molecular_cross_sections!(α, ...)` | Add molecular opacity to total α |
+| `molecular_cross_sections.jl` | `save_molecular_cross_section` / `read_molecular_cross_section` | Serialization |
+
+### Priority 4 — Alternative RT Solver
+
+| Julia file | Function(s) | Notes |
+|-----------|------------|-------|
+| `RadiativeTransfer/RadiativeTransfer.jl` | `compute_tau_bezier!(τ, s, α)` | Bezier scheme for optical depth integration (more accurate than linear at coarse grids) |
+
+### Priority 5 — Atmosphere Readers
+
+| Julia file | Function(s) | Notes |
+|-----------|------------|-------|
+| `atmosphere.jl` | `_read_phoenix_model_atmosphere(fname)` | Phoenix model atmosphere reader |
+| `lazy_multilinear_interpolation.jl` | `lazy_multilinear_interpolation(params, nodes, grid)` | Used internally by MARCS interpolation |
+
+### Priority 6 — Fitting & Analysis
+
+| Julia file | Function(s) | Notes |
+|-----------|------------|-------|
+| `Fit/fit_via_synthesis.jl` | `fit_spectrum(obs_wls, obs_flux, obs_err, linelist, ...)` | Main stellar parameter fitting via spectrum comparison |
+| `Fit/fit_via_synthesis.jl` | `synthetic_spectrum`, `postprocessed_synthetic_spectrum`, `validate_params` | Helpers for `fit_spectrum` |
+| `qfactors.jl` | `Qfactor(synth_flux, ...)` | Spectral quality factor for RV precision estimation |
+| `qfactors.jl` | `RV_prec_from_Q`, `RV_prec_from_noise` | RV precision from Q factor or noise |
+
+### Not Planned (Julia-specific)
+
+| Julia file | Notes |
+|-----------|-------|
+| `autodiffable_conv.jl` | ForwardDiff-compatible convolution; JAX handles AD natively, not needed |
+
+---
+
 ## Summary
 
 | Level | Total | Converted | Tested (no JIT) | Tested (JIT) |

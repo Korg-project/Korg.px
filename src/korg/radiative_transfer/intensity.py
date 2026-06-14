@@ -5,15 +5,162 @@ Implements various schemes for computing emergent intensity from optical depth
 and source function profiles. The main schemes are:
 
 1. Linear interpolation (fast, accurate)
-2. Bezier interpolation (more accurate, slower)
+2. Bezier interpolation (more accurate, numerically stable at large tau)
 3. Exponential integral optimization (fastest for flux-only)
 
-Reference: Korg.jl RadiativeTransfer module
+Reference: Korg.jl RadiativeTransfer module and de la Cruz Rodríguez & Piskunov (2013)
 """
 
+import jax
 import jax.numpy as jnp
 from jax import jit
 from .expint import exponential_integral_2
+
+
+@jit
+def fritsch_butland_C(x, y):
+    """
+    Compute Bezier control points using Fritsch & Butland (1984) method.
+
+    This method ensures monotonicity-preserving interpolation, which is
+    important for physical source functions.
+
+    Parameters
+    ----------
+    x : array, shape (n,)
+        Independent variable (typically optical depth τ)
+    y : array, shape (n,)
+        Dependent variable (typically source function S)
+
+    Returns
+    -------
+    C : array, shape (n,)
+        Bezier control points at each segment midpoint
+
+    Notes
+    -----
+    Reference: Fritsch & Butland (1984), SIAM J. Sci. Stat. Comput., 5, 300
+    As used in de la Cruz Rodríguez & Piskunov (2013), ApJ, 764, 33
+
+    The control points C[k] define the Bezier curve between points k and k+1.
+    """
+    # Step sizes: h[k] = x[k+1] - x[k]
+    h = jnp.diff(x)
+
+    # Slopes at midpoints: d[k] = (y[k+1] - y[k]) / h[k]
+    d = jnp.diff(y) / h
+
+    # Weight factor α[k] for interior points (k=1 to n-2)
+    # α[k] = 1/3 * (1 + h[k] / (h[k] + h[k-1]))
+    alpha = (1.0/3.0) * (1.0 + h[1:] / (h[1:] + h[:-1]))
+
+    # Derivative estimate at interior points using weighted harmonic mean
+    # yprime[k] = (d[k-1] * d[k]) / (α[k] * d[k] + (1-α[k]) * d[k-1])
+    # Handle division by zero case
+    numerator = d[:-1] * d[1:]
+    denominator = alpha * d[1:] + (1.0 - alpha) * d[:-1]
+    # Avoid division by zero - if denominator is zero, set yprime to zero
+    yprime = jnp.where(
+        jnp.abs(denominator) > 1e-20,
+        numerator / denominator,
+        0.0
+    )
+
+    # Control points at interior segments
+    # C0[k] = y[k+1] + h[k] * yprime[k] / 2   for k = 0 to n-3
+    # C1[k] = y[k+1] - h[k+1] * yprime[k] / 2 for k = 0 to n-3
+    C0 = y[1:-1] + h[:-1] * yprime / 2.0
+    C1 = y[1:-1] - h[1:] * yprime / 2.0
+
+    # Average C0 and C1 to get final control points
+    # Julia: ([C0; C1[end]] .+ [C0[1]; C1]) ./ 2
+    # This creates pairs: (C0[i], C0[i]) for first, (C0[i], C1[i-1]) for middle, (C1[i], C1[i]) for last
+    part1 = jnp.concatenate([C0, C1[-1:]])  # [C0; C1[end]]
+    part2 = jnp.concatenate([C0[:1], C1])   # [C0[1]; C1]
+    C = (part1 + part2) / 2.0
+
+    return C
+
+
+@jit
+def compute_I_bezier(tau, S):
+    """
+    Compute emergent intensity using Bezier interpolation.
+
+    Uses quadratic Bezier interpolation of the source function, which is
+    more numerically stable at large optical depths than linear interpolation.
+    The Bezier curve ensures smooth, monotonic interpolation between layers.
+
+    Parameters
+    ----------
+    tau : array, shape (n_layers,)
+        Optical depth at each layer (increasing into atmosphere)
+    S : array, shape (n_layers,)
+        Source function at each layer [erg cm⁻² s⁻¹ sr⁻¹ Hz⁻¹]
+
+    Returns
+    -------
+    I_surface : float
+        Emergent intensity at surface [erg cm⁻² s⁻¹ sr⁻¹ Hz⁻¹]
+
+    Notes
+    -----
+    Reference: de la Cruz Rodríguez & Piskunov (2013), ApJ, 764, 33
+
+    The formal solution of the transfer equation with Bezier interpolation
+    involves integration coefficients α, β, γ that depend on the optical
+    depth step Δτ. These are computed analytically.
+
+    The recursion proceeds from bottom to top:
+    I[k] = I[k+1] * exp(-Δτ) + α*S[k] + β*S[k+1] + γ*C[k]
+
+    where C[k] is the Bezier control point.
+    """
+    n = len(tau)
+
+    # Handle edge case
+    if n <= 1:
+        return 0.0
+
+    # Compute Bezier control points
+    C = fritsch_butland_C(tau, S)
+
+    # Initialize intensity array
+    I = jnp.zeros(n)
+    # I[end] = 0 (no incoming radiation from depth)
+
+    # Integrate from bottom to top using recursion
+    # Work backwards from deepest layer to surface
+    def body_fn(i, I_val):
+        k = n - 2 - i  # Count down from n-2 to 0
+
+        delta = tau[k+1] - tau[k]
+
+        # Bezier integration coefficients (analytically derived)
+        # These handle the integral of Bezier curve times exp(-τ)
+        exp_neg_delta = jnp.exp(-delta)
+        delta_sq = delta * delta
+
+        # Use small value for division by zero protection, but keep original delta in numerators
+        delta_sq_safe = jnp.where(jnp.abs(delta_sq) > 1e-30, delta_sq, 1e-30)
+
+        alpha = (2.0 + delta_sq - 2.0*delta - 2.0*exp_neg_delta) / delta_sq_safe
+        beta = (2.0 - (2.0 + 2.0*delta + delta_sq)*exp_neg_delta) / delta_sq_safe
+        gamma = (2.0*delta - 4.0 + (2.0*delta + 4.0)*exp_neg_delta) / delta_sq_safe
+
+        # Recursion relation
+        I_new = I_val[k+1] * exp_neg_delta + alpha*S[k] + beta*S[k+1] + gamma*C[k]
+
+        return I_val.at[k].set(I_new)
+
+    # Run recursion
+    I = jax.lax.fori_loop(0, n-1, body_fn, I)
+
+    # Apply correction for non-zero surface tau
+    # (Necessary if tau[0] != 0)
+    I_surface = I[0] * jnp.exp(-tau[0])
+
+    return I_surface
 
 
 def compute_I_linear_flux_only(tau, S):

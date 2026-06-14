@@ -2,7 +2,7 @@
 Atomic data: symbols, masses, and solar abundances.
 """
 
-import numpy as np
+import jax.numpy as jnp
 from .constants import amu_cgs
 
 # Atomic symbols for elements H through U
@@ -25,7 +25,7 @@ MAX_ATOMIC_NUMBER = len(atomic_symbols)
 atomic_numbers = {symbol: i+1 for i, symbol in enumerate(atomic_symbols)}
 
 # Atomic masses in grams (already multiplied by amu_cgs in Julia)
-atomic_masses = np.array([
+atomic_masses = jnp.array([
     1.008, 4.003, 6.941, 9.012, 10.81, 12.01, 14.01, 16.00, 19.00, 20.18,
     22.99, 24.31, 26.98, 28.08, 30.97, 32.06, 35.45, 39.95, 39.10, 40.08,
     44.96, 47.90, 50.94, 52.00, 54.94, 55.85, 58.93, 58.71, 63.55, 65.37,
@@ -39,7 +39,7 @@ atomic_masses = np.array([
 ]) * amu_cgs
 
 # Solar/meteoritic abundances per Asplund et al. (2009, Ann. Rev. Ast. Ap., 47, 481)
-asplund_2009_solar_abundances = np.array([
+asplund_2009_solar_abundances = jnp.array([
     12.00, 10.93, 1.05, 1.38, 2.70, 8.43, 7.83, 8.69, 4.56, 7.93,
     6.24, 7.60, 6.45, 7.51, 5.41, 7.12, 5.50, 6.40, 5.03, 6.34,
     3.15, 4.95, 3.93, 5.64, 5.43, 7.50, 4.99, 6.22, 4.19, 4.56,
@@ -53,7 +53,7 @@ asplund_2009_solar_abundances = np.array([
 ])
 
 # Solar/meteoritic abundances per Asplund et al. A&A 653, A141 (2021)
-asplund_2020_solar_abundances = np.array([
+asplund_2020_solar_abundances = jnp.array([
     12.00, 10.91, 0.96, 1.38, 2.70, 8.46, 7.83, 8.69, 4.40, 8.06,
     6.22, 7.55, 6.43, 7.51, 5.41, 7.12, 5.31, 6.38, 5.07, 6.30,
     3.14, 4.97, 3.90, 5.62, 5.42, 7.46, 4.94, 6.20, 4.18, 4.56,
@@ -67,7 +67,7 @@ asplund_2020_solar_abundances = np.array([
 ])
 
 # Solar abundances per Grevesse et al. Space Sci Rev (2007) 130: 105–114
-grevesse_2007_solar_abundances = np.array([
+grevesse_2007_solar_abundances = jnp.array([
     12.00, 10.93, 1.05, 1.38, 2.70, 8.39, 7.78, 8.66, 4.56, 7.84,
     6.17, 7.53, 6.37, 7.51, 5.36, 7.14, 5.50, 6.18, 5.08, 6.31,
     3.17, 4.90, 4.00, 5.64, 5.39, 7.45, 4.92, 6.23, 4.21, 4.60,
@@ -83,7 +83,7 @@ grevesse_2007_solar_abundances = np.array([
 # Solar abundances from Bergemann, Lodders, and Palme (2025)
 # https://zenodo.org/records/14988840
 # Solar convective-zone abundances are used when available, chondritic abundances are used otherwise
-bergemann_2025_solar_abundances = np.array([
+bergemann_2025_solar_abundances = jnp.array([
     12.0, 10.922, 1.04, 1.21, 2.7, 8.51, 7.94, 8.76, 4.4, 8.15,
     6.29, 7.58, 6.43, 7.56, 5.44, 7.16, 5.43, 6.5, 5.09, 6.35,
     3.13, 4.97, 3.89, 5.74, 5.52, 7.51, 4.95, 6.24, 4.24, 4.55,
@@ -99,7 +99,8 @@ bergemann_2025_solar_abundances = np.array([
 # Solar abundances per Magg et al. A&A 661, A140 (2022)
 # doi:10.1051/0004-6361/202140401
 # Those not specified in Magg et al. are taken from Bergemann et al. (2025)
-magg_2022_solar_abundances = bergemann_2025_solar_abundances.copy()
+# Use JAX's immutable array update API
+magg_2022_solar_abundances = bergemann_2025_solar_abundances
 magg_photospheric = {
     "C": 8.56,
     "N": 7.98,
@@ -126,7 +127,8 @@ magg_photospheric = {
     "Ni": 6.24
 }
 for symbol, abundance in magg_photospheric.items():
-    magg_2022_solar_abundances[atomic_numbers[symbol] - 1] = abundance
+    idx = atomic_numbers[symbol] - 1
+    magg_2022_solar_abundances = magg_2022_solar_abundances.at[idx].set(abundance)
 
 # Korg's default solar abundances
 default_solar_abundances = bergemann_2025_solar_abundances

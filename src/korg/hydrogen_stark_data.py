@@ -5,7 +5,6 @@ This module loads pre-computed Stark-broadened hydrogen line profiles
 from Stehlé & Hutcheon (1999).
 """
 
-import numpy as np
 import jax.numpy as jnp
 import h5py
 from scipy.interpolate import RegularGridInterpolator
@@ -117,20 +116,20 @@ def _load_stark_profiles(fname: str) -> Dict[str, StarkProfileLine]:
             log_gf = float(grp.attrs['log_gf'])
 
             # Create log profile, handling -Inf values
-            with np.errstate(divide='ignore', invalid='ignore'):
-                logP = np.log(P)
+            #with jnp.errstate(divide='ignore', invalid='ignore'):
+            logP = jnp.log(P)
             # Clipping to -700 (slightly larger than log(floatmin)) to avoid NaNs
-            logP = np.where(np.isfinite(logP), logP, -700.0)
+            logP = jnp.where(jnp.isfinite(logP), logP, -700.0)
 
             # Prepare grid for interpolation
             # Julia uses: (temps, nes, [-floatmax; log.(delta_nu_over_F0[2:end])])
             # For the first delta_nu_over_F0 (which is 0), use -floatmax equivalent
-            log_delta_nu = np.log(delta_nu_over_F0[1:])  # Skip first element (0)
-            log_delta_nu_grid = np.concatenate([[-1e308], log_delta_nu])
+            log_delta_nu = jnp.log(delta_nu_over_F0[1:])  # Skip first element (0)
+            log_delta_nu_grid = jnp.concatenate([[-1e308], log_delta_nu])
 
             # Transpose logP to match interpolator convention: (temps, nes, delta_nu)
             # HDF5 has shape (delta_nu, ne, temps), we need (temps, nes, delta_nu)
-            logP_transposed = np.transpose(logP, (2, 1, 0))
+            logP_transposed = jnp.transpose(logP, (2, 1, 0))
 
             # Create 3D interpolator for profile
             # Uses flat extrapolation (values outside bounds use nearest boundary value)

@@ -303,7 +303,7 @@ def load_marcs_grid(
 def interpolate_marcs(
     Teff: float,
     logg: float,
-    M_H: float = 0.0,
+    M_H_or_A_X=0.0,
     alpha_M: float = 0.0,
     C_M: float = 0.0,
     spherical: Optional[bool] = None,
@@ -369,6 +369,29 @@ def interpolate_marcs(
     """
     if spherical is None:
         spherical = (logg < 3.5)
+
+    # Accept either M_H (scalar) or A_X (92-element abundance vector) as third arg.
+    # This matches Julia's two-method dispatch for interpolate_marcs.
+    import numpy as _np
+    M_H_or_A_X_arr = _np.asarray(M_H_or_A_X)
+    if M_H_or_A_X_arr.ndim == 0:
+        # Scalar: treat as M_H directly
+        M_H = float(M_H_or_A_X)
+    else:
+        # Array: assume it's A_X; derive M_H, alpha_M, C_M from it
+        from .abundances import (
+            get_metals_H, get_alpha_H, GREVESSE_2007_SOLAR_ABUNDANCES, DEFAULT_ALPHA_ELEMENTS
+        )
+        A_X = _np.asarray(M_H_or_A_X, dtype=float)
+        solar = GREVESSE_2007_SOLAR_ABUNDANCES
+        # Julia excludes C (Z=6) from metals calculation, same as alpha elements
+        alpha_and_C = list(DEFAULT_ALPHA_ELEMENTS) + [6]
+        M_H = get_metals_H(A_X, solar_abundances=solar, ignore_alpha=True,
+                           alpha_elements=alpha_and_C)
+        alpha_H = get_alpha_H(A_X, solar_abundances=solar)
+        alpha_M = alpha_H - M_H
+        C_H = A_X[5] - solar[5]  # Z=6 carbon (0-indexed)
+        C_M = C_H - M_H
 
     # Reference wavelength for MARCS models
     reference_wavelength = 5e-5  # 5000 Å in cm
