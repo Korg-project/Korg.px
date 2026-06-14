@@ -128,6 +128,7 @@ def _synthetic_spectrum(synthesis_wls, linelist, LSF_matrix, params, synthesis_k
     sol = synthesize(atm, linelist, wl_angstrom, A_X,
                      vmic=params.get("vmic", 1.0),
                      line_buffer=0,
+                     verbose=False,
                      **synthesis_kwargs)
 
     # Continuum rectification with optional linear correction
@@ -135,13 +136,13 @@ def _synthetic_spectrum(synthesis_wls, linelist, LSF_matrix, params, synthesis_k
     cntm_adj = (1.0
                 - params.get("cntm_offset", 0.0)
                 - params.get("cntm_slope", 0.0) * (sol.wavelengths - central_wl))
-    F = sol.flux / (sol.continuum * cntm_adj)
+    F = np.asarray(sol.flux / (sol.continuum * cntm_adj))
 
     # Rotational broadening
     vsini = params.get("vsini", 0.0)
     epsilon = params.get("epsilon", 0.6)
     if vsini > 0:
-        F = apply_rotation(F, sol.wavelengths, vsini, epsilon)
+        F = apply_rotation(F, np.asarray(sol.wavelengths), vsini, epsilon)
 
     return LSF_matrix @ F
 
