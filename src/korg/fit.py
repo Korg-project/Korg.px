@@ -727,3 +727,380 @@ def ews_to_abundances(atm, linelist, A_X, measured_EWs, ew_window_size=2.0, wl_s
         abundances[i] = A_cur
 
     return abundances, dA_d_log_EW
+
+
+def ews_to_abundances_approx(atm, linelist, A_X, measured_EWs, ew_window_size=2.0,
+                             wl_step=0.01, blend_warn_threshold=0.01, **synthesize_kwargs):
+    """
+    Fast approximate per-line abundances from equivalent widths.
+
+    Assumes all lines are on the linear part of the curve of growth.
+    Port of Korg.jl ews_to_abundances_approx.
+
+    Parameters
+    ----------
+    atm : PlanarAtmosphere or ShellAtmosphere
+    linelist : list of Line, sorted by wavelength
+    A_X : array, shape (92,)
+    measured_EWs : array, shape (n_lines,), observed EWs in mÅ
+    ew_window_size : float, optional, default 2.0
+    wl_step : float, optional, default 0.01
+    blend_warn_threshold : float, optional, default 0.01
+    **synthesize_kwargs : extra keyword args for synthesize()
+
+    Returns
+    -------
+    abundances : ndarray, shape (n_lines,)
+        A(X) = log10(n_X/n_H) + 12 for each line.
+    """
+    from .atomic_data import atomic_numbers
+
+    lines = list(linelist)
+    measured_EWs = np.asarray(measured_EWs, dtype=float)
+    A_X = np.asarray(A_X, dtype=float)
+
+    if len(lines) != len(measured_EWs):
+        raise ValueError("linelist and measured_EWs must have the same length")
+
+    EWs_synth = calculate_EWs(atm, lines, A_X,
+                              ew_window_size=ew_window_size, wl_step=wl_step,
+                              blend_warn_threshold=blend_warn_threshold,
+                              **synthesize_kwargs)
+
+    atoms = []
+    for line in lines:
+        Z = 1
+        if hasattr(line, "species") and hasattr(line.species, "formula"):
+            atom_list = line.species.formula.atoms
+            Z = atom_list[0] if atom_list else 1
+        atoms.append(Z)
+    atoms = np.array(atoms)
+
+    A0 = A_X[atoms - 1]
+    log_ratio = np.where(EWs_synth > 1e-10,
+                         np.log10(np.maximum(measured_EWs, 1e-10)) - np.log10(EWs_synth),
+                         0.0)
+    return A0 + log_ratio
+
+
+# ---------------------------------------------------------------------------
+# Stellar parameter fitting from equivalent widths
+# ---------------------------------------------------------------------------
+
+def _get_slope(xs, ys):
+    """Slope of best-fit line through (xs, ys) with no intercept term (demeaned)."""
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    dx = xs - np.mean(xs)
+    dy = ys - np.mean(ys)
+    denom = np.sum(dx ** 2)
+    return float(np.sum(dx * dy) / denom) if denom > 1e-30 else 0.0
+
+
+def _get_slope_uncertainty(xs):
+    """Propagated uncertainty in slope given xs scatter."""
+    xs = np.asarray(xs, dtype=float)
+    n = len(xs)
+    denom = np.sum(xs ** 2) - np.sum(xs) ** 2 / n
+    return float(np.sqrt(1.0 / denom)) if denom > 1e-30 else np.inf
+
+
+def _ews_stellar_param_residuals(params, linelist, measured_EWs, abundance_adjustments,
+                                 solar_abundances, fix_params, callback, approx, synthesize_kwargs):
+    """Compute the four excitation/ionization balance residuals."""
+    Teff, logg, vmic, M_H = params
+
+    A_X = format_A_X(M_H, solar_abundances=solar_abundances)
+    try:
+        atm = interpolate_marcs(Teff, logg, A_X)
+    except Exception as e:
+        raise ValueError(f"interpolate_marcs failed: {e}")
+
+    if approx:
+        A = ews_to_abundances_approx(atm, linelist, A_X, measured_EWs,
+                                     blend_warn_threshold=np.inf,
+                                     **synthesize_kwargs)
+    else:
+        A, _ = ews_to_abundances(atm, linelist, A_X, measured_EWs,
+                                 blend_warn_threshold=1.0,  # suppress warnings
+                                 **synthesize_kwargs)
+
+    A = A + np.asarray(abundance_adjustments)
+
+    neutrals = np.array([l.species.charge == 0 for l in linelist])
+    REWs = np.log10(np.asarray(measured_EWs) / np.array([l.wl * 1e8 for l in linelist]))
+
+    finite = np.isfinite(A)
+    if np.mean(finite) < 0.7:
+        raise ValueError("Less than 70% of lines converged.")
+    if neutrals[~neutrals].size > 0 and np.mean(finite[~neutrals]) < 0.5:
+        raise ValueError("Less than 50% of ion lines converged.")
+
+    neutral_finite = neutrals & finite
+    ion_finite = ~neutrals & finite
+
+    E_lower = np.array([l.E_lower for l in linelist])
+    teff_res = _get_slope(E_lower[neutral_finite], A[neutral_finite])
+    logg_res = float(np.mean(A[neutral_finite]) - np.mean(A[ion_finite]))
+
+    vmic_res = _get_slope(REWs[neutral_finite], A[neutral_finite])
+
+    Z = 1
+    atoms_list = linelist[0].species.formula.atoms if hasattr(linelist[0].species, "formula") else [1]
+    Z = atoms_list[0] if atoms_list else 1
+    feh_res = float(np.mean(A[finite]) - (M_H + solar_abundances[Z - 1]))
+
+    residuals = np.array([teff_res, logg_res, vmic_res, feh_res])
+    residuals[np.array(fix_params, dtype=bool)] = 0.0
+
+    callback(params, residuals, A)
+    return residuals
+
+
+def ews_to_stellar_parameters_direct(linelist, measured_EWs,
+                                     measured_EW_err=None,
+                                     Teff0=5000.0, logg0=3.5, vmic0=1.0, M_H0=0.0,
+                                     precision=1e-5, time_limit=500.0,
+                                     solar_abundances=None,
+                                     verbose=False, **synthesize_kwargs):
+    """
+    Find stellar parameters from EWs by forward modelling (chi-squared minimization).
+
+    Port of Korg.jl ews_to_stellar_parameters_direct.
+
+    Parameters
+    ----------
+    linelist : list of Line
+    measured_EWs : array, shape (n_lines,), in mÅ
+    measured_EW_err : array, shape (n_lines,), optional; default ones
+    Teff0, logg0, vmic0, M_H0 : float, initial guesses
+    precision : float, BFGS gtol; default 1e-5
+    time_limit : float, wall time limit in seconds; default 500
+    solar_abundances : array (92,), optional
+    verbose : bool
+    **synthesize_kwargs : extra kwargs for synthesize()
+
+    Returns
+    -------
+    params : ndarray, shape (4,), [Teff, logg, vmic, M_H]
+    uncertainties : ndarray, shape (4,4), approximate covariance from BFGS Hessian
+    """
+    from .abundances import get_solar_abundances
+
+    if solar_abundances is None:
+        solar_abundances = get_solar_abundances()
+    lines = list(linelist)
+    measured_EWs = np.asarray(measured_EWs, dtype=float)
+    if measured_EW_err is None:
+        measured_EW_err = np.ones(len(measured_EWs))
+    measured_EW_err = np.asarray(measured_EW_err, dtype=float)
+
+    from datetime import datetime
+    start = datetime.now()
+
+    def cost(p):
+        Teff, logg, vmic, M_H = p[0] * 1e3, p[1], p[2], p[3]
+        A_X = format_A_X(M_H, solar_abundances=solar_abundances)
+        try:
+            atm = interpolate_marcs(Teff, logg, A_X)
+            EWs = calculate_EWs(atm, lines, A_X, verbose=False, **synthesize_kwargs)
+        except Exception:
+            return 1e10
+        chi2 = float(np.sum(((EWs - measured_EWs) / measured_EW_err) ** 2))
+        if verbose:
+            print(f"  Teff={Teff:.0f}, logg={logg:.2f}, vmic={vmic:.2f}, M_H={M_H:.2f}"
+                  f"  chi2={chi2:.3f}")
+        if (datetime.now() - start).total_seconds() > time_limit:
+            raise StopIteration("time limit")
+        return chi2
+
+    p0 = np.array([Teff0 / 1e3, logg0, vmic0, M_H0])
+    try:
+        res = minimize(cost, p0, method="BFGS",
+                       options={"gtol": precision, "maxiter": 5000})
+    except StopIteration:
+        from scipy.optimize import OptimizeResult
+        res = OptimizeResult(x=p0, success=False, message="Time limit",
+                             hess_inv=np.eye(4))
+
+    params = res.x.copy()
+    params[0] *= 1e3  # back to Kelvin
+
+    # scale uncertainty from (Teff/1e3, logg, vmic, M_H) to (Teff, logg, vmic, M_H)
+    scales = np.array([1e3, 1.0, 1.0, 1.0])
+    try:
+        H_inv = np.asarray(res.hess_inv)
+        uncertainties = H_inv * np.outer(scales, scales)
+    except Exception:
+        uncertainties = np.full((4, 4), np.nan)
+
+    return params, uncertainties
+
+
+def ews_to_stellar_parameters(linelist, measured_EWs,
+                              abundance_adjustments=None,
+                              Teff0=5000.0, logg0=3.5, vmic0=1.0, M_H0=0.0,
+                              tolerances=None,
+                              max_step_sizes=None,
+                              parameter_ranges=None,
+                              fix_params=None,
+                              solar_abundances=None,
+                              verbose=False,
+                              callback=None,
+                              max_iterations=30,
+                              **synthesize_kwargs):
+    """
+    Find stellar parameters from EWs by excitation/ionization balance.
+
+    The solver finds Teff, logg, vmic, [m/H] that simultaneously satisfy:
+
+    - slope of A vs E_lower = 0  (excitation balance → Teff)
+    - mean(A neutral) - mean(A ionized) = 0  (ionization balance → logg)
+    - slope of A vs log10(EW/λ) = 0  (microturbulence balance → vmic)
+    - mean(A) - (M_H + solar_A[Z]) = 0  (self-consistency → M_H)
+
+    Port of Korg.jl ews_to_stellar_parameters.
+
+    Parameters
+    ----------
+    linelist : list of Line, all from the same element, sorted by wavelength
+    measured_EWs : array, shape (n_lines,), in mÅ
+    abundance_adjustments : array, shape (n_lines,), optional abundance offsets
+    Teff0, logg0, vmic0, M_H0 : float, initial guesses
+    tolerances : list of 4 floats, default [1e-3, 1e-3, 1e-4, 1e-3]
+    max_step_sizes : list of 4 floats, default [1000.0, 1.0, 0.3, 0.5]
+    parameter_ranges : list of 4 (lo, hi) tuples
+    fix_params : list of 4 bools, default [False, False, False, False]
+    solar_abundances : array (92,), optional
+    verbose : bool
+    callback : callable(params, residuals, abundances), optional
+    max_iterations : int, default 30
+    **synthesize_kwargs
+
+    Returns
+    -------
+    params : ndarray, shape (4,), [Teff, logg, vmic, M_H]
+    uncertainties : ndarray, shape (4,), parameter uncertainties
+    """
+    from .abundances import get_solar_abundances
+
+    if solar_abundances is None:
+        solar_abundances = get_solar_abundances()
+    if tolerances is None:
+        tolerances = [1e-3, 1e-3, 1e-4, 1e-3]
+    if max_step_sizes is None:
+        max_step_sizes = [1000.0, 1.0, 0.3, 0.5]
+    if parameter_ranges is None:
+        parameter_ranges = [(2800.0, 8000.0), (-0.5, 5.5), (1e-3, 10.0), (-2.5, 1.0)]
+    if fix_params is None:
+        fix_params = [False, False, False, False]
+    fix_params = np.array(fix_params, dtype=bool)
+
+    lines = list(linelist)
+    measured_EWs = np.asarray(measured_EWs, dtype=float)
+    if abundance_adjustments is None:
+        abundance_adjustments = np.zeros(len(lines))
+    abundance_adjustments = np.asarray(abundance_adjustments, dtype=float)
+
+    # Validate inputs
+    if len(lines) != len(measured_EWs):
+        raise ValueError("linelist and measured_EWs must have the same length")
+    if any(hasattr(l, "species") and hasattr(l.species, "formula")
+           and len(l.species.formula.atoms) > 1 for l in lines):
+        raise ValueError("All lines must be atomic (no molecules).")
+    neutrals = np.array([l.species.charge == 0 for l in lines])
+    if neutrals.sum() < 3 or (~neutrals).sum() < 1:
+        raise ValueError("Need at least 3 neutral lines and 1 ion line.")
+
+    if verbose and callback is None:
+        def callback(p, res, A):
+            print(f"Teff={p[0]:.0f} logg={p[1]:.2f} vmic={p[2]:.3f} M_H={p[3]:.2f}"
+                  f" | res={np.array2string(np.array(res), precision=4)}")
+    elif callback is None:
+        callback = lambda p, r, A: None
+
+    # Clamp initial guess
+    params = np.array([Teff0, logg0, vmic0, M_H0], dtype=float)
+    for i, (lo, hi) in enumerate(parameter_ranges):
+        params[i] = np.clip(params[i], lo, hi)
+
+    tolerances = np.asarray(tolerances, dtype=float)
+    max_step_sizes = np.asarray(max_step_sizes, dtype=float)
+
+    def _phase(approx, tol_scale):
+        nonlocal params
+        for _iter in range(max_iterations):
+            # Compute Jacobian numerically
+            eps = np.array([1.0, 0.01, 0.01, 0.01])  # finite difference step per param
+            try:
+                r0 = _ews_stellar_param_residuals(
+                    params, lines, measured_EWs, abundance_adjustments,
+                    solar_abundances, fix_params, callback, approx, synthesize_kwargs)
+            except Exception as e:
+                warnings.warn(f"Residual evaluation failed: {e}")
+                return False
+
+            if np.all(np.abs(r0[~fix_params]) < tolerances[~fix_params] * tol_scale):
+                return True  # converged
+
+            # Build Jacobian column by column
+            J = np.zeros((4, 4))
+            for j in range(4):
+                if fix_params[j]:
+                    continue
+                p_plus = params.copy()
+                p_plus[j] += eps[j]
+                try:
+                    r_plus = _ews_stellar_param_residuals(
+                        p_plus, lines, measured_EWs, abundance_adjustments,
+                        solar_abundances, fix_params, callback, approx, synthesize_kwargs)
+                    J[:, j] = (r_plus - r0) / eps[j]
+                except Exception:
+                    J[:, j] = 0.0
+
+            # Newton step
+            free = ~fix_params
+            try:
+                step = np.zeros(4)
+                step[free] = -np.linalg.solve(J[np.ix_(free, free)], r0[free])
+            except np.linalg.LinAlgError:
+                step = np.zeros(4)
+
+            step = np.clip(step, -max_step_sizes, max_step_sizes)
+            params = params + step
+            for i, (lo, hi) in enumerate(parameter_ranges):
+                params[i] = np.clip(params[i], lo, hi)
+
+        warnings.warn(f"ews_to_stellar_parameters did not converge after {max_iterations} iterations")
+        return False
+
+    # Phase 1: approximate (fast)
+    _phase(approx=True, tol_scale=10.0)
+
+    if verbose:
+        print("Approximate solve done. Starting exact solve.")
+
+    # Phase 2: exact
+    converged = _phase(approx=False, tol_scale=1.0)
+
+    # Estimate uncertainties from line-to-line scatter
+    A_X = format_A_X(float(params[3]), solar_abundances=solar_abundances)
+    try:
+        atm_final = interpolate_marcs(float(params[0]), float(params[1]), A_X)
+        A_final, _ = ews_to_abundances(atm_final, lines, A_X, measured_EWs,
+                                       blend_warn_threshold=1.0, **synthesize_kwargs)
+        A_final = A_final + abundance_adjustments
+        finite = np.isfinite(A_final)
+        neutral_finite = neutrals & finite
+        E_lower = np.array([l.E_lower for l in lines])
+        REWs = np.log10(measured_EWs / np.array([l.wl * 1e8 for l in lines]))
+        estimated_err = float(np.std(A_final[finite])) if finite.sum() > 1 else np.inf
+        n_finite = int(finite.sum())
+        sigma_mean = estimated_err / np.sqrt(n_finite) if n_finite > 0 else np.inf
+        teff_unc = estimated_err * _get_slope_uncertainty(E_lower[neutral_finite])
+        vmic_unc = estimated_err * _get_slope_uncertainty(REWs[neutral_finite])
+        uncertainties = np.array([teff_unc, sigma_mean, vmic_unc, sigma_mean])
+    except Exception:
+        uncertainties = np.full(4, np.nan)
+
+    return params, uncertainties

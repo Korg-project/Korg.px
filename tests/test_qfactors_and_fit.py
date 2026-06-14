@@ -7,6 +7,7 @@ from korg.qfactors import Qfactor, RV_prec_from_Q, RV_prec_from_noise
 from korg.fit import (
     _tan_scale, _tan_unscale, _scale_params, _unscale_params,
     validate_params, _merge_windows, _numerical_dp_dscaled,
+    _get_slope, _get_slope_uncertainty, ews_to_abundances_approx,
 )
 from korg.constants import c_cgs
 
@@ -179,3 +180,62 @@ class TestMergeWindows:
         """Windows 5000-5050 and 5100-5200 with buffer=100 should merge."""
         result = _merge_windows([(5000, 5050), (5100, 5200)], buffer=100.0)
         assert len(result) == 1
+
+
+class TestStellarParamHelpers:
+    """Tests for stellar parameter helper functions."""
+
+    def test_get_slope_perfect_line(self):
+        """slope of y = 2x + c should be 2."""
+        xs = np.array([1.0, 2.0, 3.0, 4.0])
+        ys = 2.0 * xs + 5.0
+        assert abs(_get_slope(xs, ys) - 2.0) < 1e-10
+
+    def test_get_slope_flat(self):
+        """Flat y → slope 0."""
+        xs = np.linspace(0, 1, 10)
+        ys = np.ones(10)
+        assert abs(_get_slope(xs, ys)) < 1e-10
+
+    def test_get_slope_negative(self):
+        """Negative correlation → negative slope."""
+        xs = np.array([1.0, 2.0, 3.0])
+        ys = -xs + 10.0
+        assert _get_slope(xs, ys) < 0.0
+
+    def test_get_slope_uncertainty_increases_with_spread(self):
+        """Wider xs spread → smaller uncertainty (better constrained)."""
+        xs_narrow = np.array([0.1, 0.2, 0.3])
+        xs_wide = np.array([0.0, 1.0, 2.0])
+        assert _get_slope_uncertainty(xs_narrow) > _get_slope_uncertainty(xs_wide)
+
+    def test_ews_to_abundances_approx_linear_part(self):
+        """On linear CoG, doubling EW → +1 dex log10(measured/synth)."""
+        # Mock: just test the arithmetic, not actual synthesis
+        from unittest.mock import patch
+        import numpy as np
+
+        # Pretend calculate_EWs returns [100.0, 50.0] mÅ
+        mock_EWs = np.array([100.0, 50.0])
+        measured = np.array([200.0, 25.0])  # 2× and 0.5× the synth values
+
+        # Build minimal mock objects
+        class MockFormula:
+            atoms = [26]  # Fe
+        class MockSpecies:
+            formula = MockFormula()
+            charge = 0
+        class MockLine:
+            wl = 5000.0 / 1e8  # cm
+            species = MockSpecies()
+        lines = [MockLine(), MockLine()]
+
+        A_X = np.zeros(92)
+        A_X[25] = 7.5  # A(Fe)
+
+        with patch("korg.fit.calculate_EWs", return_value=mock_EWs):
+            result = ews_to_abundances_approx(None, lines, A_X, measured)
+
+        # A0 + log10(measured/synth)
+        expected = np.array([7.5 + np.log10(2.0), 7.5 + np.log10(0.5)])
+        np.testing.assert_allclose(result, expected, rtol=1e-10)

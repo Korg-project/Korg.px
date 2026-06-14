@@ -374,15 +374,17 @@ These Julia functions/modules have no Python equivalent. Listed in dependency or
 
 **Note**: `fit_spectrum` uses scipy BFGS in place of Julia's Optim.jl BFGS. Each synthesis call costs ~120 s in Python (vs ~0.1 s in Julia), making multi-parameter fits very slow. The API is otherwise identical.
 
-### Priority 7 — Equivalent Width Fitting (not yet started)
+### Priority 7 — Equivalent Width Fitting ✅ COMPLETE
 
-| Julia file | Function(s) | Notes |
-|-----------|------------|-------|
-| `Fit/fit_via_EWs.jl` | `calculate_EWs(atm, linelist, A_X)` | Synthesise EWs for each line via integration |
-| `Fit/fit_via_EWs.jl` | `ews_to_abundances(atm, linelist, A_X, measured_EWs)` | Fit per-element abundances from observed EWs |
-| `Fit/fit_via_EWs.jl` | `ews_to_abundances_approx(...)` | Fast approximate version using linear response |
-| `Fit/fit_via_EWs.jl` | `ews_to_stellar_parameters(linelist, measured_EWs, ...)` | Fit Teff/logg/M_H/vmic from iron EW excitation/ionization balance |
-| `Fit/fit_via_EWs.jl` | `ews_to_stellar_parameters_direct(...)` | Direct Newton solver variant |
+| Julia file | Function(s) | Python location | Status |
+|-----------|------------|-----------------|--------|
+| `Fit/fit_via_EWs.jl` | `calculate_EWs(atm, linelist, A_X)` | `fit.py` | ✅ Implemented |
+| `Fit/fit_via_EWs.jl` | `ews_to_abundances(atm, linelist, A_X, measured_EWs)` | `fit.py` | ✅ Implemented |
+| `Fit/fit_via_EWs.jl` | `ews_to_abundances_approx(...)` | `fit.py` | ✅ Implemented |
+| `Fit/fit_via_EWs.jl` | `ews_to_stellar_parameters(linelist, measured_EWs, ...)` | `fit.py` | ✅ Implemented |
+| `Fit/fit_via_EWs.jl` | `ews_to_stellar_parameters_direct(...)` | `fit.py` | ✅ Implemented |
+
+**Note**: `ews_to_stellar_parameters` uses numerical finite differences for the Jacobian (Julia uses ForwardDiff). The two-phase solver (approx → exact) matches Julia's structure. Due to ~120 s/synthesis overhead, a full stellar parameter fit will take many hours; the function is correct but impractical without a faster synthesis backend.
 
 ### Not Planned (Julia-specific)
 
@@ -403,7 +405,8 @@ These Julia functions/modules have no Python equivalent. Listed in dependency or
 | 4     | 14    | 14        | 12              | 9            |
 | 5     | 15    | 15        | 10              | 0            |
 | 6 (fit) | 8  | 8         | 8               | N/A          |
-| **Total** | **111** | **110** | **101** | **64** |
+| 7 (EW fit) | 5 | 5        | 5               | N/A          |
+| **Total** | **116** | **115** | **106** | **64** |
 
 Notes:
 - Level 1 Interval utilities (4 items) are marked N/A for JIT as they use Python classes.
@@ -421,7 +424,7 @@ Notes:
 ## Test Results Summary
 
 Tests run against Julia reference data and JIT compatibility (`tests/test_julia_reference.py`, `tests/test_atmosphere.py`, `tests/test_radiative_transfer.py`, `tests/test_line_absorption_jit.py`, `tests/test_hydrogen_brackett_jit.py`, `tests/test_hydrogen_full_jit.py`, and `tests/test_synthesis_jit.py`):
-- **198 passed** (matching Julia to better than 1e-6 precision, or 1% for E2 approximation)
+- **335 passed** (matching Julia to better than 1e-6 precision, or 1% for E2 approximation)
   - Includes 20 line_absorption tests with full JIT compatibility testing
   - Includes 5 hydrogen_line_absorption Brackett-only tests with full JIT compatibility
   - Full hydrogen_line_absorption (Stehlé + Brackett) is now fully JIT-compatible

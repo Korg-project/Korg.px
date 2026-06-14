@@ -70,7 +70,9 @@ from .molecular_cross_sections import (
 from .atmosphere import read_model_atmosphere
 
 # Fitting
-from .fit import fit_spectrum, validate_params, calculate_EWs, ews_to_abundances
+from .fit import (fit_spectrum, validate_params, calculate_EWs, ews_to_abundances,
+                  ews_to_abundances_approx, ews_to_stellar_parameters,
+                  ews_to_stellar_parameters_direct)
 
 # Q-factors / RV precision
 from .qfactors import Qfactor, RV_prec_from_Q, RV_prec_from_noise
@@ -136,6 +138,9 @@ __all__ = [
     "validate_params",
     "calculate_EWs",
     "ews_to_abundances",
+    "ews_to_abundances_approx",
+    "ews_to_stellar_parameters",
+    "ews_to_stellar_parameters_direct",
     # Q-factors
     "Qfactor",
     "RV_prec_from_Q",
