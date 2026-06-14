@@ -25,6 +25,7 @@ from .species import Species
 from .line_absorption import line_absorption
 from .hydrogen_line_absorption import hydrogen_line_absorption
 from .atomic_data import atomic_masses
+from .abundances import A_X_to_absolute
 
 
 @dataclass
@@ -404,6 +405,14 @@ def synthesize_spectrum(
     # Reference wavelength for optical depth (5000 Å for MARCS models)
     lambda_ref_cm = 5e-5  # 5000 Å in cm
 
+    # Convert A(X) format abundances to linear number fractions for chemical_equilibrium.
+    # Julia's format_A_X() returns A(X) = log10(N_X/N_H) + 12; chemical_equilibrium
+    # expects N(X)/N_total (values summing to ~1). Detect A(X) by H abundance > 1.
+    if abundances[0] > 1.0:
+        abs_abundances = A_X_to_absolute(np.asarray(abundances))
+    else:
+        abs_abundances = np.asarray(abundances)
+
     # Store chemical equilibrium results
     electron_densities = np.zeros(n_layers)
     alpha_ref = np.zeros(n_layers)  # Absorption at reference wavelength
@@ -428,7 +437,7 @@ def synthesize_spectrum(
         if profile:
             t0 = time.time()
         ne_calc, n_dict = chemical_equilibrium(
-            T_i, n_i, ne_i, abundances,
+            T_i, n_i, ne_i, abs_abundances,
             ionization_energies_dict,
             partition_funcs,
             log_equilibrium_constants,
