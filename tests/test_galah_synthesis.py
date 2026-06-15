@@ -38,6 +38,9 @@ from korg.atmosphere import PlanarAtmosphere, PlanarAtmosphereLayer
 from korg.abundances import format_A_X
 from korg.constants import kboltz_cgs
 
+# Test fixture: solar MARCS model atmosphere, committed under tests/data/.
+SUN_MOD = Path(__file__).parent / "data" / "sun.mod"
+
 
 def read_marcs_model(filename: str) -> PlanarAtmosphere:
     """
@@ -216,8 +219,8 @@ def read_galah_linelist_hdf5(filename: str, wl_min: float = None, wl_max: float 
 
 
 @pytest.mark.skipif(
-    not os.path.exists("sun.mod"),
-    reason="sun.mod MARCS model not available in working directory",
+    not SUN_MOD.exists(),
+    reason=f"MARCS model fixture not found: {SUN_MOD}",
 )
 @pytest.mark.skipif(
     shutil.which("julia") is None,
@@ -244,7 +247,7 @@ def test_galah_solar_synthesis():
 
     # Load MARCS solar model
     print("\nLoading solar MARCS model...")
-    atm = read_marcs_model("sun.mod")
+    atm = read_marcs_model(str(SUN_MOD))
     print(f"  ✓ Loaded {len(atm.layers)} layers")
     print(f"  Temperature range: {min(l.temperature for l in atm.layers):.0f} - "
           f"{max(l.temperature for l in atm.layers):.0f} K")
@@ -329,7 +332,7 @@ using Korg
 using HDF5
 
 println("Loading atmosphere...")
-atm = Korg.read_model_atmosphere("sun.mod")
+atm = Korg.read_model_atmosphere("{SUN_MOD}")
 println("  ✓ Loaded ", length(atm.layers), " layers")
 println("\\nLoading GALAH linelist...")
 full_linelist = Korg.get_GALAH_DR3_linelist()
@@ -402,7 +405,6 @@ println("\\n✓ Saved to julia_galah_synthesis.h5")
         print("\n✓ Julia results loaded")
 
     finally:
-        import os
         os.unlink(julia_script_path)
 
     # Compare
