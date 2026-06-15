@@ -20,6 +20,8 @@ Output:
     - galah_synthesis_comparison.png: Comparison plot
     - julia_galah_synthesis.h5: Julia synthesis results
 """
+import os
+import shutil
 import time
 import numpy as np
 import h5py
@@ -27,6 +29,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import subprocess
 import tempfile
+
+import pytest
 
 from korg.linelist import Line, Species
 from korg.synthesis import synthesize
@@ -211,6 +215,14 @@ def read_galah_linelist_hdf5(filename: str, wl_min: float = None, wl_max: float 
     return lines
 
 
+@pytest.mark.skipif(
+    not os.path.exists("sun.mod"),
+    reason="sun.mod MARCS model not available in working directory",
+)
+@pytest.mark.skipif(
+    shutil.which("julia") is None,
+    reason="julia executable not available for reference synthesis",
+)
 def test_galah_solar_synthesis():
     """
     Test solar synthesis with GALAH linelist comparing Python and Julia.
