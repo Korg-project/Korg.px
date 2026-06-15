@@ -6,7 +6,10 @@ Regression test for Barklem, Piskunov & O'Mara (2000) ABO p-d resonant
 Without this contribution the Python port underestimates the Balmer line cores
 by roughly a factor of two. The reference HDF5 file was produced from Korg.jl
 (see tests/gen_balmer_abo_reference.jl) by calling
-``Korg.hydrogen_line_absorption!`` directly over Hα and Hβ windows.
+``Korg.hydrogen_line_absorption!`` directly over Hα, Hβ and Hγ windows.
+
+Hγ (upper==5, ~4341 Å) shares the identical code path and ABO params with Hα/Hβ
+but is pinned here explicitly so it cannot silently regress.
 """
 
 import os
