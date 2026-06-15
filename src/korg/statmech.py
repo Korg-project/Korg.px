@@ -1103,6 +1103,91 @@ def chemical_equilibrium_fast(T, n_total, ne_model, absolute_abundances, data, m
     return ne, number_densities, raw_arrays
 
 
+# Vmapped batch version — processes all atmosphere layers in one XLA call
+_chemical_equilibrium_batch_jit = jax.jit(
+    jax.vmap(chemical_equilibrium_jit, in_axes=(0, 0, 0, None, None))
+)
+_compute_mol_densities_batch_jit = jax.jit(
+    jax.vmap(_compute_mol_densities_jit, in_axes=(0, 0, 0, None, 0, None))
+)
+_compute_saha_weights_batch_jit = jax.jit(
+    jax.vmap(_compute_saha_weights_jit, in_axes=(0, 0, None))
+)
+
+
+def chemical_equilibrium_all_layers(T_arr, n_total_arr, ne_model_arr,
+                                     absolute_abundances, data, mol_species):
+    """
+    Process all atmosphere layers at once using vmapped JAX.
+
+    Much faster than calling chemical_equilibrium_fast 56 times because:
+    - Single XLA dispatch instead of 56
+    - XLA can vectorize operations across layers
+    - Avoids 56× dict-building overhead
+
+    Returns
+    -------
+    tuple: (electron_densities, number_densities, raw_arrays_list)
+        - electron_densities: (n_layers,) numpy array
+        - number_densities: dict mapping Species → (n_layers,) arrays
+        - raw_arrays_list: list of per-layer raw array dicts
+    """
+    from .species import Species, Formula
+    abs_abund_jax = jnp.asarray(absolute_abundances, dtype=jnp.float64)
+    T_jax = jnp.asarray(T_arr, dtype=jnp.float64)
+    n_total_jax = jnp.asarray(n_total_arr, dtype=jnp.float64)
+    ne_model_jax = jnp.asarray(ne_model_arr, dtype=jnp.float64)
+
+    # Batch Picard iteration — all layers at once
+    ne_sol_all, neutral_fracs_all = _chemical_equilibrium_batch_jit(
+        T_jax, n_total_jax, ne_model_jax, abs_abund_jax, data
+    )
+
+    # Batch molecular densities
+    mol_dens_all = _compute_mol_densities_batch_jit(
+        T_jax, n_total_jax, ne_sol_all, abs_abund_jax, neutral_fracs_all, data
+    )
+
+    # Batch Saha weights for ionized/doubly ionized densities
+    wII_all, wIII_all = _compute_saha_weights_batch_jit(T_jax, ne_sol_all, data)
+
+    # Convert to numpy (single sync point for all layers)
+    ne_np = np.asarray(ne_sol_all)               # (n_layers,)
+    nf_np = np.asarray(neutral_fracs_all)         # (n_layers, 92)
+    wII_np = np.asarray(wII_all)                  # (n_layers, 92)
+    wIII_np = np.asarray(wIII_all)                # (n_layers, 92)
+    mol_np = np.asarray(mol_dens_all)             # (n_layers, n_mols)
+
+    n_layers = len(ne_np)
+    atom_dens = (n_total_arr[:, None] - ne_np[:, None]) * absolute_abundances[None, :]
+    neutral_dens_all = atom_dens * nf_np          # (n_layers, 92)
+    ionized_dens_all = wII_np * neutral_dens_all
+    doubly_dens_all = wIII_np * neutral_dens_all
+
+    # Build number_densities dict — only once, not per layer
+    number_densities = {}
+    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
+        f = Formula(int(Z))
+        number_densities[Species(f, 0)] = neutral_dens_all[:, Z-1]
+        number_densities[Species(f, 1)] = ionized_dens_all[:, Z-1]
+        number_densities[Species(f, 2)] = doubly_dens_all[:, Z-1]
+    for i, mol in enumerate(mol_species):
+        number_densities[mol] = mol_np[:, i]
+
+    # Build raw_arrays_list for continuum batch
+    raw_arrays_list = [
+        {
+            'neutral_dens': neutral_dens_all[i],
+            'ionized_dens': ionized_dens_all[i],
+            'doubly_ionized_dens': doubly_dens_all[i],
+            'mol_dens': mol_np[i],
+        }
+        for i in range(n_layers)
+    ]
+
+    return ne_np, number_densities, raw_arrays_list
+
+
 def chemical_equilibrium(T, n_total, ne_model, absolute_abundances,
                         ionization_energies, partition_funcs,
                         log_equilibrium_constants,

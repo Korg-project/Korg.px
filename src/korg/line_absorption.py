@@ -20,6 +20,22 @@ from .line_profiles import voigt_hjerting
 from .atomic_data import atomic_masses
 from jax.scipy.special import gamma as gamma_function
 
+# Numpy scalar constants for the fast Python-loop implementation
+kboltz_cgs_np = None  # filled lazily
+c_cgs_np = None
+amu_cgs_np = None
+hplanck_eV_np = None
+
+def _init_np_consts():
+    global kboltz_cgs_np, c_cgs_np, amu_cgs_np, hplanck_eV_np
+    if kboltz_cgs_np is None:
+        from .constants import kboltz_cgs, c_cgs, amu_cgs, hplanck_eV
+        kboltz_cgs_np = float(kboltz_cgs)
+        c_cgs_np = float(c_cgs)
+        amu_cgs_np = float(amu_cgs)
+        hplanck_eV_np = float(hplanck_eV)
+_init_np_consts()
+
 
 def inverse_gaussian_density(rho: float, sigma: float) -> float:
     """
@@ -188,6 +204,27 @@ def line_profile(wavelength_center: float, sigma: float, gamma: float,
 # JIT-compatible implementation
 # ============================================================================
 
+def _vdW_to_tuple(vdW):
+    """Convert vdW field (scalar, tuple, or None) to (gamma_or_sigma, alpha) pair."""
+    if vdW is None:
+        return (0.0, -1.0)
+    if isinstance(vdW, (tuple, list)):
+        return (float(vdW[0]), float(vdW[1]))
+    v = float(vdW)
+    if v < 0:
+        return (10**v, -1.0)   # log10(gamma_vdW) → linear
+    if v == 0:
+        return (0.0, -1.0)
+    if v < 20:
+        return (v, -1.0)       # fudge factor; scaled_vdW treats [1] == -1 as simple scaling
+    # ABO encoding: integer part = sigma/a0^2, fractional part = alpha
+    import math
+    sigma_over_a0sq = math.floor(v)
+    alpha = v - sigma_over_a0sq
+    from .constants import bohr_radius_cgs
+    return (sigma_over_a0sq * bohr_radius_cgs**2, alpha)
+
+
 def prepare_linelist_arrays(
     linelist: List[Line],
     unique_species: List[Species]
@@ -227,8 +264,8 @@ def prepare_linelist_arrays(
         'species_ids': jnp.array([species_to_id[line.species] for line in linelist], dtype=jnp.int32),
         'E_lowers': jnp.array([line.E_lower for line in linelist]),
         'gamma_rads': jnp.array([line.gamma_rad for line in linelist]),
-        'gamma_starks': jnp.array([line.gamma_stark for line in linelist]),
-        'vdW_params': jnp.array([line.vdW for line in linelist]),  # (n_lines, 2)
+        'gamma_starks': jnp.array([line.gamma_stark if line.gamma_stark is not None else 0.0 for line in linelist]),
+        'vdW_params': jnp.array([_vdW_to_tuple(line.vdW) for line in linelist]),  # (n_lines, 2)
         'masses': jnp.array([line.species.get_mass() for line in linelist]),
         'is_molecule': jnp.array([line.species.formula.is_molecule() for line in linelist], dtype=bool)
     }
@@ -439,7 +476,7 @@ def line_absorption(
         Absorption coefficient array of shape (n_layers, n_wavelengths) in cm⁻¹
     """
     if len(linelist) == 0:
-        return jnp.zeros((len(temperatures), len(wavelengths)))
+        return np.zeros((len(temperatures), len(wavelengths)))
 
     # Get unique species
     unique_species = list(set([line.species for line in linelist]))
@@ -457,61 +494,199 @@ def line_absorption(
             cutoff_threshold
         )
 
-    # === JIT path: prepare data ===
-
-    # Convert linelist to arrays
-    line_arrays = prepare_linelist_arrays(linelist, unique_species)
-
-    # Convert number_densities dict to 2D array
-    n_species = len(unique_species)
-    n_layers = len(temperatures)
-    species_to_id = {sp: i for i, sp in enumerate(unique_species)}
-
-    number_densities_array = jnp.zeros((n_species, n_layers))
-    for sp, idx in species_to_id.items():
-        if sp in number_densities:
-            number_densities_array = number_densities_array.at[idx].set(
-                number_densities[sp]
-            )
-
-    # Pre-evaluate partition functions
-    log_temps = jnp.log(temperatures)
-    partition_funcs_array = jnp.zeros((n_species, n_layers))
-    for sp, idx in species_to_id.items():
-        if sp in partition_functions:
-            U_vals = jnp.array([partition_functions[sp](lt) for lt in log_temps])
-            partition_funcs_array = partition_funcs_array.at[idx].set(U_vals)
-
-    # Pre-evaluate continuum opacity at all line centers
-    continuum_opacities = jnp.array([
-        continuum_opacity(line.wl) for line in linelist
-    ])  # (n_lines, n_layers)
-
-    # Get H I densities
-    H_I_species = Species("H_I")
-    H_I_densities = number_densities.get(H_I_species, jnp.zeros(n_layers))
-
-    # Call JIT-compiled core
-    return line_absorption_core(
-        line_wls=line_arrays['wls'],
-        line_log_gfs=line_arrays['log_gfs'],
-        line_species_ids=line_arrays['species_ids'],
-        line_E_lowers=line_arrays['E_lowers'],
-        line_gamma_rads=line_arrays['gamma_rads'],
-        line_gamma_starks=line_arrays['gamma_starks'],
-        line_vdW_params=line_arrays['vdW_params'],
-        line_masses=line_arrays['masses'],
-        line_is_molecule=line_arrays['is_molecule'],
-        wavelengths=wavelengths,
-        temperatures=temperatures,
-        electron_densities=electron_densities,
-        number_densities_array=number_densities_array,
-        partition_funcs_array=partition_funcs_array,
-        H_I_densities=H_I_densities,
-        continuum_opacities=continuum_opacities,
-        xi=xi,
-        cutoff_threshold=cutoff_threshold
+    return _line_absorption_fast(
+        linelist, unique_species, wavelengths, temperatures, electron_densities,
+        number_densities, partition_functions, xi, continuum_opacity, cutoff_threshold
     )
+
+
+# Module-level cache: (tuple of line ids) → (unique_species, per-line numpy arrays)
+_LINELIST_PREP_CACHE = {}
+
+def _line_absorption_fast(
+    linelist, unique_species, wavelengths, temperatures, electron_densities,
+    number_densities, partition_functions, xi, continuum_opacity, cutoff_threshold
+):
+    """
+    Fast numpy+scipy implementation of line absorption.
+
+    Processes each line individually in a Python loop but only evaluates the
+    Voigt profile within each line's wavelength window (like Julia does).
+    Uses scipy.special.voigt_profile (Faddeeva-based, fast C code).
+    """
+    from scipy.special import voigt_profile as scipy_voigt
+
+    n_layers = len(temperatures)
+    n_wl = len(wavelengths)
+    wl_np = np.asarray(wavelengths)
+    T_np = np.asarray(temperatures)
+    ne_np = np.asarray(electron_densities)
+
+    # Cache line arrays keyed by tuple of Line object ids
+    cache_key = tuple(id(l) for l in linelist)
+    if cache_key not in _LINELIST_PREP_CACHE:
+        _LINELIST_PREP_CACHE[cache_key] = _build_line_data(linelist, unique_species)
+    ld = _LINELIST_PREP_CACHE[cache_key]
+
+    # Number densities for each unique species: (n_species, n_layers)
+    n_species = len(unique_species)
+    nd_arr = np.zeros((n_species, n_layers))
+    for sp, idx in ld['species_to_id'].items():
+        if sp in number_densities:
+            nd_arr[idx] = np.asarray(number_densities[sp])
+
+    # Partition functions: (n_species, n_layers)
+    log_T_np = np.log(T_np)
+    pf_arr = np.zeros((n_species, n_layers))
+    for sp, idx in ld['species_to_id'].items():
+        if sp in partition_functions:
+            pf = partition_functions[sp]
+            if hasattr(pf, 'numpy_eval'):
+                pf_arr[idx] = pf.numpy_eval(log_T_np)
+            else:
+                for j, lt in enumerate(log_T_np):
+                    pf_arr[idx, j] = float(pf(lt))
+
+    # H I densities for vdW broadening
+    H_I_species = Species("H_I")
+    nH_I = np.asarray(number_densities.get(H_I_species, np.zeros(n_layers)))
+
+    # Continuum opacities at all line centers: batch if possible
+    wl_centers = ld['wls']  # (n_lines,) numpy array
+    try:
+        cntm_opac = np.asarray(continuum_opacity(wl_centers))  # (n_lines, n_layers)
+        if cntm_opac.shape != (len(linelist), n_layers):
+            raise ValueError("unexpected shape")
+    except Exception:
+        cntm_opac = np.stack([np.asarray(continuum_opacity(w)) for w in wl_centers])
+
+    # Precomputed constants
+    pi_e2_mc = np.pi * float(electron_charge_cgs)**2 / (float(electron_mass_cgs) * float(c_cgs))
+    beta = 1.0 / (float(kboltz_eV) * T_np)  # (n_layers,)
+    sqrt2pi = np.sqrt(2 * np.pi)
+    inv_10000 = 1.0 / 10_000.0
+
+    # --- Vectorized pre-computation over all lines ---
+    wls = ld['wls']         # (n_lines,)
+    masses = ld['masses']   # (n_lines,)
+    is_mol = ld['is_molecule']  # (n_lines,) bool
+    vdW_arr = ld['vdW_params']  # (n_lines, 2)
+
+    # Doppler width: (n_lines, n_layers)
+    sigma_all = wls[:, None] * np.sqrt(
+        kboltz_cgs_np * T_np[None, :] / masses[:, None] + xi**2 / 2
+    ) / c_cgs_np
+
+    # Damping Γ (n_lines, n_layers) — start with gamma_rad
+    Gamma_all = ld['gamma_rads'][:, None] * np.ones((1, n_layers))  # broadcast copy
+
+    # Stark: only for non-molecules
+    stark_contrib = (ld['gamma_starks'][:, None] *
+                     ne_np[None, :] * (T_np[None, :] * inv_10000)**(1/6))
+    Gamma_all += np.where(is_mol[:, None], 0.0, stark_contrib)
+
+    # vdW: separate simple (vdW[:,1] == -1) vs ABO
+    simple_mask = (vdW_arr[:, 1] == -1.0) & ~is_mol
+    abo_mask = (vdW_arr[:, 1] != -1.0) & ~is_mol
+
+    if np.any(simple_mask):
+        vdW_simple = vdW_arr[simple_mask, 0:1]  # (n_simple, 1)
+        vdW_contrib = vdW_simple * nH_I[None, :] * (T_np[None, :] * inv_10000)**0.3
+        Gamma_all[simple_mask] += vdW_contrib
+
+    if np.any(abo_mask):
+        from scipy.special import gamma as gamma_fn
+        v0 = 1e6
+        for idx in np.where(abo_mask)[0]:
+            alpha_abo = vdW_arr[idx, 1]
+            sigma_abo = vdW_arr[idx, 0]
+            inv_mu = 1.0 / (1.008 * amu_cgs_np) + 1.0 / masses[idx]
+            vbar = np.sqrt(8 * kboltz_cgs_np * T_np / np.pi * inv_mu)
+            Gamma_all[idx] += nH_I * (2 * (4/np.pi)**(alpha_abo/2) *
+                                       gamma_fn((4 - alpha_abo) / 2) *
+                                       v0 * sigma_abo * (vbar / v0)**(1 - alpha_abo))
+
+    # Convert Γ → wavelength HWHM in cm: (n_lines, n_layers)
+    gamma_wl_all = Gamma_all * wls[:, None]**2 / (c_cgs_np * 4 * np.pi)
+
+    # Amplitude: (n_lines, n_layers)
+    sigma_ln_all = pi_e2_mc * wls**2 / c_cgs_np  # (n_lines,)
+    E_upper_all = ld['E_lowers'] + c_cgs_np * hplanck_eV_np / wls  # (n_lines,)
+    levels_all = (np.exp(-beta[None, :] * ld['E_lowers'][:, None]) -
+                  np.exp(-beta[None, :] * E_upper_all[:, None]))  # (n_lines, n_layers)
+    n_sp_all = nd_arr[ld['species_ids']]   # (n_lines, n_layers)
+    U_sp_all = pf_arr[ld['species_ids']]   # (n_lines, n_layers)
+    amplitude_all = (10.0**ld['log_gfs'][:, None] * sigma_ln_all[:, None] *
+                     levels_all * n_sp_all / np.maximum(U_sp_all, 1e-300))  # (n_lines, n_layers)
+
+    # Window sizes: (n_lines, n_layers)
+    rho_crit_all = (cntm_opac * cutoff_threshold /
+                    np.maximum(np.abs(amplitude_all), 1e-300))  # (n_lines, n_layers)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        log_arg = np.sqrt(2 * np.pi) * sigma_all * rho_crit_all
+        win_G_all = np.where(log_arg >= 1.0, 0.0,
+                             sigma_all * np.sqrt(-2 * np.log(np.maximum(log_arg, 1e-300))))
+        win_L_all = np.where(rho_crit_all >= 1.0 / (np.pi * gamma_wl_all), 0.0,
+                             np.sqrt(np.maximum(gamma_wl_all / (np.pi * rho_crit_all) -
+                                                gamma_wl_all**2, 0.0)))
+    # Max window per line: (n_lines,)
+    max_wins = np.max(np.sqrt(win_G_all**2 + win_L_all**2), axis=1)
+
+    # --- Voigt computation with thread parallelism ---
+    from concurrent.futures import ThreadPoolExecutor
+
+    n_lines = len(linelist)
+    n_threads = min(4, n_lines)
+
+    # Partition lines into thread chunks
+    chunks = [np.arange(i, n_lines, n_threads) for i in range(n_threads)]
+    alpha_parts = [np.zeros((n_layers, n_wl)) for _ in range(n_threads)]
+
+    def _process_chunk(chunk_indices, alpha_out):
+        for i_line in chunk_indices:
+            max_win = max_wins[i_line]
+            wl0 = wls[i_line]
+            wl_mask = np.abs(wl_np - wl0) <= max_win
+            if not np.any(wl_mask):
+                continue
+            wl_win = wl_np[wl_mask]
+            sigma = sigma_all[i_line]
+            gamma_wl = gamma_wl_all[i_line]
+            amplitude = amplitude_all[i_line]
+            delta = wl_win[None, :] - wl0
+            profiles = scipy_voigt(delta, sigma[:, None], gamma_wl[:, None])
+            alpha_out[:, wl_mask] += amplitude[:, None] * profiles
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        futures = [pool.submit(_process_chunk, chunks[i], alpha_parts[i])
+                   for i in range(n_threads)]
+        for f in futures:
+            f.result()
+
+    return sum(alpha_parts)
+
+
+def _build_line_data(linelist, unique_species):
+    """Build numpy arrays from linelist (cached per unique linelist)."""
+    species_to_id = {sp: i for i, sp in enumerate(unique_species)}
+    n = len(linelist)
+    wls = np.array([l.wl for l in linelist])
+    log_gfs = np.array([l.log_gf for l in linelist])
+    species_ids = np.array([species_to_id[l.species] for l in linelist], dtype=np.int32)
+    E_lowers = np.array([l.E_lower for l in linelist])
+    gamma_rads = np.array([l.gamma_rad for l in linelist])
+    gamma_starks = np.array([l.gamma_stark if l.gamma_stark is not None else 0.0
+                              for l in linelist])
+    vdW_params = np.array([_vdW_to_tuple(l.vdW) for l in linelist])  # (n, 2)
+    masses = np.array([l.species.get_mass() for l in linelist])
+    is_molecule = np.array([l.species.formula.is_molecule() for l in linelist])
+    return {
+        'wls': wls, 'log_gfs': log_gfs, 'species_ids': species_ids,
+        'E_lowers': E_lowers, 'gamma_rads': gamma_rads,
+        'gamma_starks': gamma_starks, 'vdW_params': vdW_params,
+        'masses': masses, 'is_molecule': is_molecule,
+        'species_to_id': species_to_id,
+    }
 
 
 # ============================================================================

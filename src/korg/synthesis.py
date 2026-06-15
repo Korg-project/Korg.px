@@ -15,7 +15,8 @@ from typing import Optional, Tuple, List, Dict, Callable, Union
 from scipy.interpolate import interp1d
 
 from .atmosphere import PlanarAtmosphere, ShellAtmosphere
-from .statmech import chemical_equilibrium, chemical_equilibrium_fast
+from .statmech import (chemical_equilibrium, chemical_equilibrium_fast,
+                       chemical_equilibrium_all_layers)
 from .data_loader import (ionization_energies, default_partition_funcs,
                           default_log_equilibrium_constants,
                           default_chem_eq_data, default_mol_species)
@@ -436,17 +437,19 @@ def synthesize_spectrum(
     # Pass 1: chemical equilibrium for all layers
     if profile:
         t0 = time.time()
-    for i in range(n_layers):
-        T_i = T[i]
-        ne_i = ne_model[i]
-        n_i = n_total[i]
-        if using_defaults:
-            ne_calc, n_dict, raw_arr = chemical_equilibrium_fast(
-                T_i, n_i, ne_i, abs_abundances,
+    if using_defaults:
+        # Batch all layers at once: single XLA dispatch, avoids 56× dict overhead
+        electron_densities, number_densities_batch, raw_arrays_list = \
+            chemical_equilibrium_all_layers(
+                T, n_total, ne_model, abs_abundances,
                 default_chem_eq_data, default_mol_species
             )
-            raw_arrays_list.append(raw_arr)
-        else:
+        number_densities_list = None  # not used in fast path
+    else:
+        for i in range(n_layers):
+            T_i = T[i]
+            ne_i = ne_model[i]
+            n_i = n_total[i]
             ne_calc, n_dict = chemical_equilibrium(
                 T_i, n_i, ne_i, abs_abundances,
                 ionization_energies_dict,
@@ -454,8 +457,8 @@ def synthesize_spectrum(
                 log_equilibrium_constants,
                 electron_density_warn_threshold=1.0
             )
-        electron_densities[i] = ne_calc
-        number_densities_list.append(n_dict)
+            electron_densities[i] = ne_calc
+            number_densities_list.append(n_dict)
     if profile:
         t_chem_eq = time.time() - t0
 
@@ -500,14 +503,18 @@ def synthesize_spectrum(
     if profile:
         t_source_fn = time.time() - t0
 
-    # Convert number densities from list of dicts to dict of arrays
-    all_species = set()
-    for n_dict in number_densities_list:
-        all_species.update(n_dict.keys())
-    number_densities = {
-        spec: np.array([n_dict.get(spec, 0.0) for n_dict in number_densities_list])
-        for spec in all_species
-    }
+    # Build combined number_densities dict
+    if using_defaults:
+        # Already built as (n_layers,) arrays in chemical_equilibrium_all_layers
+        number_densities = number_densities_batch
+    else:
+        all_species = set()
+        for n_dict in number_densities_list:
+            all_species.update(n_dict.keys())
+        number_densities = {
+            spec: np.array([n_dict.get(spec, 0.0) for n_dict in number_densities_list])
+            for spec in all_species
+        }
 
     if profile:
         timings['layer_loop'] = t_chem_eq + t_cntm_abs + t_source_fn
@@ -584,9 +591,11 @@ def synthesize_spectrum(
             t_line_abs_start = time.time()
 
         # Create continuum opacity callable for line_absorption
+        # Accepts scalar or 1D array of wavelengths; returns (n_layers,) or (n_wl, n_layers)
         def continuum_opacity(wl_cm):
-            """Return continuum opacity at all layers for a given wavelength."""
-            return np.array([alpha_cntm_interps[i](wl_cm) for i in range(n_layers)])
+            wl_arr = np.atleast_1d(wl_cm)
+            result = np.stack([alpha_cntm_interps[i](wl_arr) for i in range(n_layers)], axis=-1)
+            return result if np.ndim(wl_cm) > 0 else result[0]
 
         # Compute line absorption
         alpha_lines = line_absorption(
