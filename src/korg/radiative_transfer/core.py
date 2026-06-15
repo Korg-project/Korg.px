@@ -311,8 +311,26 @@ def radiative_transfer(
     return fluxes, intensities
 
 
+def _compute_tau_anchored_planar(alpha, log_tau_ref, alpha_ref):
+    """
+    Trapezoidal anchored optical depth (planar geometry, JIT-compatible).
+
+    Matches Julia's compute_tau_anchored!: integrates d(tau)/d(ln tau_ref) = alpha/alpha_ref * tau_ref
+    using the trapezoidal rule in log tau_ref space.
+
+    tau[i] = sum_{j<i} 0.5*(f[j]+f[j+1]) * (ln tau_ref[j+1] - ln tau_ref[j])
+    where f[j] = alpha[j] * tau_ref[j] / alpha_ref[j]
+    """
+    tau_ref = 10.0 ** log_tau_ref
+    integrand = alpha * tau_ref / jnp.clip(alpha_ref, 1e-30, jnp.inf)
+    delta_log_tau = jnp.diff(log_tau_ref) * jnp.log(10.0)  # convert log10 to natural log steps
+    integrand_avg = 0.5 * (integrand[:-1] + integrand[1:])
+    dtau = integrand_avg * delta_log_tau
+    return jnp.concatenate([jnp.array([0.0]), jnp.cumsum(dtau)])
+
+
 @jit
-def radiative_transfer_single_wavelength_jit(alpha, S, tau_ref, alpha_ref):
+def radiative_transfer_single_wavelength_jit(alpha, S, log_tau_ref, alpha_ref):
     """
     JIT-compatible single wavelength radiative transfer.
 
@@ -324,8 +342,8 @@ def radiative_transfer_single_wavelength_jit(alpha, S, tau_ref, alpha_ref):
         Absorption coefficient [cm⁻¹]
     S : array, shape (n_layers,)
         Source function [erg cm⁻² s⁻¹ sr⁻¹ Hz⁻¹]
-    tau_ref : array, shape (n_layers,)
-        Reference optical depth (NOT log)
+    log_tau_ref : array, shape (n_layers,)
+        log10(reference optical depth) at each layer
     alpha_ref : array, shape (n_layers,)
         Reference absorption coefficient [cm⁻¹]
 
@@ -334,12 +352,8 @@ def radiative_transfer_single_wavelength_jit(alpha, S, tau_ref, alpha_ref):
     flux : float
         Emergent flux
     """
-    # Compute optical depth using anchored scheme
-    tau = tau_ref * alpha / jnp.clip(alpha_ref, 1e-30, jnp.inf)
-
-    # Use exponential integral flux method
+    tau = _compute_tau_anchored_planar(alpha, log_tau_ref, alpha_ref)
     flux = 2.0 * jnp.pi * compute_F_flux_only_expint(tau, S)
-
     return flux
 
 
@@ -365,7 +379,7 @@ def radiative_transfer_jit(
     spatial_coord : array, shape (n_layers,)
         Spatial coordinates (not used in current implementation)
     log_tau_ref : array, shape (n_layers,)
-        Reference optical depth (log scale)
+        Reference optical depth (log10 scale)
     alpha_ref : array, shape (n_layers,)
         Reference absorption coefficient
 
@@ -376,11 +390,9 @@ def radiative_transfer_jit(
     intensities : None
         Placeholder for API compatibility
     """
-    tau_ref = 10.0 ** log_tau_ref
-
     # Vectorize over wavelengths using vmap
     def solve_one_wavelength(alpha_wl, S_wl):
-        return radiative_transfer_single_wavelength_jit(alpha_wl, S_wl, tau_ref, alpha_ref)
+        return radiative_transfer_single_wavelength_jit(alpha_wl, S_wl, log_tau_ref, alpha_ref)
 
     fluxes = jax.vmap(solve_one_wavelength)(alpha_grid, S_grid)
 
