@@ -6,10 +6,11 @@ Covers:
 - compute_I_linear_flux_only: emergent flux via linear interpolation
 - compute_F_flux_only_expint: emergent flux via exponential integrals
 - blackbody: Planck function B_λ(T)
+- compute_tau_anchored: anchored optical depth integration
 
 Reference data lives in tests/julia_reference_data.json.
 To regenerate:
-    julia --project=/tmp/Korg.jl tests/generate_julia_reference.jl
+    julia --project=. tests/generate_julia_reference.jl
 """
 
 import json
@@ -377,3 +378,136 @@ class TestBlackbodyReference:
         vals = blackbody(5778.0, wls)
         assert vals.shape == (3,), f"expected shape (3,), got {vals.shape}"
         assert jnp.all(vals > 0), "all blackbody values should be positive"
+
+
+# ---------------------------------------------------------------------------
+# compute_tau_anchored
+# ---------------------------------------------------------------------------
+
+class TestComputeTauAnchored:
+    """Tests for compute_tau_anchored against Julia reference values."""
+
+    @pytest.fixture
+    def tau_inputs(self):
+        """Shared log10-based inputs matching the Julia reference generator."""
+        n = 12
+        tau_ref = 10.0 ** np.linspace(-4, 2, n)
+        alpha_ref = 1.0 + 0.5 * np.sin(np.linspace(0, np.pi, n))
+        alpha_constant = alpha_ref * 1.5
+        alpha_varying  = alpha_ref * (1.0 + 0.3 * np.cos(np.linspace(0, 2 * np.pi, n)))
+        log_tau_ref_log10 = np.log10(tau_ref)
+        spatial_coord = np.zeros(n)
+        return {
+            "tau_ref": tau_ref,
+            "alpha_ref": alpha_ref,
+            "alpha_constant": alpha_constant,
+            "alpha_varying": alpha_varying,
+            "log_tau_ref": log_tau_ref_log10,
+            "spatial_coord": spatial_coord,
+        }
+
+    # --- Julia comparison ---
+
+    def test_constant_ratio(self, reference_data, tau_inputs):
+        """Constant α/α_ref ratio case matches Julia."""
+        from korg.radiative_transfer.optical_depth import compute_tau_anchored
+
+        ref = np.array(reference_data["compute_tau_anchored"]["outputs"]["constant_ratio"])
+        tau = np.asarray(compute_tau_anchored(
+            jnp.array(tau_inputs["alpha_constant"]),
+            jnp.array(tau_inputs["spatial_coord"]),
+            jnp.array(tau_inputs["log_tau_ref"]),
+            jnp.array(tau_inputs["alpha_ref"]),
+        ))
+        np.testing.assert_allclose(tau, ref, rtol=1e-6,
+                                   err_msg="constant-ratio tau does not match Julia")
+
+    def test_varying_ratio(self, reference_data, tau_inputs):
+        """Wavelength-varying α/α_ref ratio case matches Julia."""
+        from korg.radiative_transfer.optical_depth import compute_tau_anchored
+
+        ref = np.array(reference_data["compute_tau_anchored"]["outputs"]["varying_ratio"])
+        tau = np.asarray(compute_tau_anchored(
+            jnp.array(tau_inputs["alpha_varying"]),
+            jnp.array(tau_inputs["spatial_coord"]),
+            jnp.array(tau_inputs["log_tau_ref"]),
+            jnp.array(tau_inputs["alpha_ref"]),
+        ))
+        np.testing.assert_allclose(tau, ref, rtol=1e-6,
+                                   err_msg="varying-ratio tau does not match Julia")
+
+    # --- Self-consistency ---
+
+    def test_first_layer_is_zero(self, tau_inputs):
+        """tau[0] must be exactly 0 (top of atmosphere)."""
+        from korg.radiative_transfer.optical_depth import compute_tau_anchored
+
+        tau = compute_tau_anchored(
+            jnp.array(tau_inputs["alpha_constant"]),
+            jnp.array(tau_inputs["spatial_coord"]),
+            jnp.array(tau_inputs["log_tau_ref"]),
+            jnp.array(tau_inputs["alpha_ref"]),
+        )
+        assert float(tau[0]) == 0.0
+
+    def test_monotonically_increasing(self, tau_inputs):
+        """tau must be non-decreasing (opacity is non-negative)."""
+        from korg.radiative_transfer.optical_depth import compute_tau_anchored
+
+        tau = np.asarray(compute_tau_anchored(
+            jnp.array(tau_inputs["alpha_constant"]),
+            jnp.array(tau_inputs["spatial_coord"]),
+            jnp.array(tau_inputs["log_tau_ref"]),
+            jnp.array(tau_inputs["alpha_ref"]),
+        ))
+        assert np.all(np.diff(tau) >= 0), "tau should be non-decreasing"
+
+    def test_proportional_to_alpha(self, tau_inputs):
+        """Doubling α everywhere should double tau at every layer."""
+        from korg.radiative_transfer.optical_depth import compute_tau_anchored
+
+        alpha = jnp.array(tau_inputs["alpha_constant"])
+        s = jnp.array(tau_inputs["spatial_coord"])
+        ltr = jnp.array(tau_inputs["log_tau_ref"])
+        aref = jnp.array(tau_inputs["alpha_ref"])
+
+        tau1 = np.asarray(compute_tau_anchored(alpha, s, ltr, aref))
+        tau2 = np.asarray(compute_tau_anchored(alpha * 2, s, ltr, aref))
+
+        # tau[0] = 0 in both; check remaining layers
+        np.testing.assert_allclose(tau2[1:], tau1[1:] * 2, rtol=1e-10)
+
+    def test_equal_alpha_recovers_tau_ref_fine_grid(self):
+        """When α == α_ref on a fine grid, result closely follows τ_ref - τ_ref[0]."""
+        from korg.radiative_transfer.optical_depth import compute_tau_anchored
+
+        # Fine grid: 200 points, low dynamic range so trapezoidal error is small
+        n = 200
+        tau_ref = 10.0 ** np.linspace(-1, 1, n)
+        alpha_ref = np.ones(n)  # Constant opacity → exact trapz even on coarse grid
+        log_tau_ref = np.log10(tau_ref)
+        spatial_coord = np.zeros(n)
+
+        tau = np.asarray(compute_tau_anchored(
+            jnp.array(alpha_ref), jnp.array(spatial_coord),
+            jnp.array(log_tau_ref), jnp.array(alpha_ref),
+        ))
+        expected = tau_ref - tau_ref[0]
+        # Trapezoidal error is small for constant opacity on a fine grid
+        np.testing.assert_allclose(tau[1:], expected[1:], rtol=2e-3)
+
+    # --- JIT compatibility ---
+
+    def test_jit(self, tau_inputs):
+        """compute_tau_anchored must be jax.jit-compatible."""
+        from korg.radiative_transfer.optical_depth import compute_tau_anchored
+
+        jit_fn = jax.jit(compute_tau_anchored)
+        tau = jit_fn(
+            jnp.array(tau_inputs["alpha_constant"]),
+            jnp.array(tau_inputs["spatial_coord"]),
+            jnp.array(tau_inputs["log_tau_ref"]),
+            jnp.array(tau_inputs["alpha_ref"]),
+        )
+        assert tau.shape == (12,)
+        assert jnp.all(jnp.isfinite(tau))

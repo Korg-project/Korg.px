@@ -59,3 +59,5 @@ results_*.json.tmp
 # CLOD
 .claude
 CLAUDE.md
+
+run_tests.sh

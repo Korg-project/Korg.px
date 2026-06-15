@@ -1093,6 +1093,43 @@ let
 end
 
 # =============================================================================
+# compute_tau_anchored
+# =============================================================================
+println("  - compute_tau_anchored...")
+let
+    n_layers = 12
+    tau_ref = Float64.(10 .^ range(-4, 2, length=n_layers))
+    log_tau_ref = log.(tau_ref)  # Julia uses natural log
+
+    # Realistic opacity profile peaking in the middle
+    alpha_ref = Float64.(1.0 .+ 0.5 .* sin.(range(0, π, length=n_layers)))
+
+    alpha_constant = Float64.(alpha_ref .* 1.5)
+    alpha_varying  = Float64.(alpha_ref .* (1.0 .+ 0.3 .* cos.(range(0, 2π, length=n_layers))))
+
+    integrand_buffer = zeros(n_layers)
+    tau_out = Dict{String, Vector{Float64}}()
+
+    for (label, alpha_v) in [("constant_ratio", alpha_constant), ("varying_ratio", alpha_varying)]
+        integrand_factor = tau_ref ./ alpha_ref
+        tau_buf = zeros(n_layers)
+        Korg.RadiativeTransfer.compute_tau_anchored!(tau_buf, alpha_v, integrand_factor,
+                                                     log_tau_ref, integrand_buffer)
+        tau_out[label] = Float64.(tau_buf)
+    end
+
+    reference_data["compute_tau_anchored"] = Dict(
+        "inputs" => Dict(
+            "tau_ref"        => tau_ref,
+            "alpha_ref"      => alpha_ref,
+            "alpha_constant" => alpha_constant,
+            "alpha_varying"  => alpha_varying,
+        ),
+        "outputs" => tau_out
+    )
+end
+
+# =============================================================================
 # Blackbody / Planck function
 # =============================================================================
 println("  - blackbody...")
