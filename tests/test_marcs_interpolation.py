@@ -103,7 +103,7 @@ class TestArtifactSystem:
 
 
 @pytest.mark.skipif(
-    os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS'),
+    bool(os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS')),
     reason="Skipping download tests in CI"
 )
 class TestMARCSDownload:
@@ -138,7 +138,7 @@ class TestMARCSInterpolation:
     """Test MARCS atmosphere interpolation."""
 
     @pytest.mark.skipif(
-        os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS'),
+        bool(os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS')),
         reason="Requires actual MARCS data (not placeholder)"
     )
     def test_interpolate_solar(self):
@@ -161,7 +161,7 @@ class TestMARCSInterpolation:
         assert np.all(tau_refs >= 0), "Optical depths should be non-negative"
 
     @pytest.mark.skipif(
-        os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS'),
+        bool(os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS')),
         reason="Requires actual MARCS data (not placeholder)"
     )
     def test_interpolate_giant(self):
@@ -175,7 +175,7 @@ class TestMARCSInterpolation:
         assert atm.R_photosphere > 0
 
     @pytest.mark.skipif(
-        os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS'),
+        bool(os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS')),
         reason="Requires actual MARCS data (not placeholder)"
     )
     def test_interpolate_metal_poor(self):
@@ -187,7 +187,7 @@ class TestMARCSInterpolation:
         assert len(atm.layers) > 0
 
     @pytest.mark.skipif(
-        os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS'),
+        bool(os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS')),
         reason="Requires actual MARCS data (not placeholder)"
     )
     def test_out_of_bounds_raises(self):
@@ -201,7 +201,7 @@ class TestMARCSInterpolation:
             interpolate_marcs(10000, 4.0, 0.0, 0.0, 0.0)
 
     @pytest.mark.skipif(
-        os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS'),
+        bool(os.environ.get('CI') or os.environ.get('GITHUB_ACTIONS')),
         reason="Requires actual MARCS data (not placeholder)"
     )
     def test_spherical_parameter(self):
