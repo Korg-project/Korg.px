@@ -286,6 +286,8 @@ _HOLTSMARK_BETA_KNOTS = jnp.array([
     5.012, 6.310, 7.943, 10.0, 12.59, 15.85, 19.95, 25.12
 ])
 
+griem_1960_Knm = greim_1960_Knm
+
 
 def holtsmark_profile(beta: float, P: float) -> float:
     """

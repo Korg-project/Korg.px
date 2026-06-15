@@ -618,6 +618,497 @@ reference_data["isotopic_data"] = Dict(
 )
 
 # =============================================================================
+# Saha Ion Weights
+# =============================================================================
+println("  - Saha ion weights...")
+saha_outputs = Dict{String, Any}()
+for (T, ne, Z) in [
+    (5000.0, 1e13, 1), (5777.0, 1e14, 1), (5777.0, 1e14, 26),
+    (8000.0, 1e14, 26), (4000.0, 1e12, 20), (6000.0, 1e13, 26),
+    (10000.0, 1e15, 1), (4500.0, 1e12, 12)
+]
+    wII, wIII = Korg.saha_ion_weights(T, ne, Z, Korg.ionization_energies, Korg.default_partition_funcs)
+    saha_outputs["$(T)_$(ne)_$(Z)"] = Dict("wII" => Float64(wII), "wIII" => Float64(wIII))
+end
+reference_data["saha_ion_weights"] = Dict("outputs" => saha_outputs)
+
+# =============================================================================
+# Get log nK (molecular equilibrium constants)
+# =============================================================================
+println("  - get_log_nK...")
+get_log_nK_outputs = Dict{String, Any}()
+mol_names = ["CO", "H2", "OH", "CN", "MgH", "CH"]
+for mol_str in mol_names
+    try
+        mol = Korg.Species(mol_str)
+        if mol in keys(Korg.default_log_equilibrium_constants)
+            get_log_nK_outputs[mol_str] = Dict{String, Float64}()
+            for T in [4000.0, 5000.0, 5777.0, 7000.0, 8000.0]
+                log_nK = Korg.get_log_nK(mol, T, Korg.default_log_equilibrium_constants)
+                get_log_nK_outputs[mol_str][string(T)] = Float64(log_nK)
+            end
+        end
+    catch e
+        println("    Warning: could not compute get_log_nK for $mol_str: $e")
+    end
+end
+reference_data["get_log_nK"] = Dict("outputs" => get_log_nK_outputs)
+
+# =============================================================================
+# Exponential Integral E2
+# =============================================================================
+println("  - exponential_integral_2...")
+e2_test_values = [0.01, 0.1, 0.5, 1.0, 1.1, 2.0, 2.5, 5.0, 10.0, 20.0, 50.0, 100.0]
+e2_outputs = Dict{String, Float64}()
+for x in e2_test_values
+    e2_outputs[string(x)] = Float64(Korg.RadiativeTransfer.exponential_integral_2(x))
+end
+reference_data["exponential_integral_2"] = Dict(
+    "inputs" => Dict("test_values" => e2_test_values),
+    "outputs" => e2_outputs
+)
+
+# =============================================================================
+# Expint Transfer Integral Core
+# =============================================================================
+println("  - expint_transfer_integral_core...")
+expint_core_outputs = Dict{String, Float64}()
+for (tau, m, b) in [
+    (0.1, 0.5, 1.0), (1.0, 0.5, 1.0), (5.0, 0.5, 1.0),
+    (0.1, 1.0, 2.0), (1.0, 1.0, 2.0), (2.0, 0.3, 0.5),
+    (0.5, 0.8, 1.5), (3.0, 0.2, 0.8)
+]
+    val = Korg.RadiativeTransfer.expint_transfer_integral_core(tau, m, b)
+    expint_core_outputs["$(tau)_$(m)_$(b)"] = Float64(val)
+end
+reference_data["expint_transfer_integral_core"] = Dict("outputs" => expint_core_outputs)
+
+# =============================================================================
+# H I bound-free absorption
+# =============================================================================
+println("  - H_I_bf...")
+let
+    T_hi = 5778.0
+    nH_I_hi = 1e17
+    nHe_I_hi = 9e15
+    ne_hi = 1.5e14
+    h_neutral = Korg.Species("H I")
+    invU_H_hi = 1.0 / Korg.default_partition_funcs[h_neutral](log(T_hi))
+
+    hi_bf_outputs = Dict{String, Float64}()
+    for wl_A in [3000.0, 3646.0, 4000.0, 5000.0, 8204.0, 10000.0, 20000.0]
+        nu = Korg.c_cgs / (wl_A * 1e-8)
+        val = Korg.ContinuumAbsorption.H_I_bf([nu], T_hi, nH_I_hi, nHe_I_hi, ne_hi, invU_H_hi; n_max_MHD=6)[1]
+        hi_bf_outputs[string(wl_A)] = Float64(val)
+    end
+
+    reference_data["H_I_bf"] = Dict(
+        "inputs" => Dict("T" => T_hi, "nH_I" => nH_I_hi, "nHe_I" => nHe_I_hi,
+                         "ne" => ne_hi, "invU_H" => invU_H_hi),
+        "outputs" => hi_bf_outputs
+    )
+end
+
+# =============================================================================
+# H2+ bound-free and free-free absorption
+# =============================================================================
+println("  - H2plus_bf_and_ff...")
+let
+    T_h2p = 6000.0
+    nH_I_h2p = 1e16
+    nH_II_h2p = 1e11
+
+    # Wavelength variation at fixed T
+    wl_outputs = Dict{String, Float64}()
+    for wl_A in [2500.0, 5000.0, 10000.0, 20000.0, 50000.0, 100000.0]
+        nu = Korg.c_cgs / (wl_A * 1e-8)
+        val = Korg.ContinuumAbsorption._H2plus_bf_and_ff(nu, T_h2p, nH_I_h2p, nH_II_h2p)
+        wl_outputs[string(wl_A)] = Float64(val)
+    end
+
+    # Temperature variation at fixed wavelength (5000 A)
+    wl_test_A = 5000.0
+    nu_test = Korg.c_cgs / (wl_test_A * 1e-8)
+    T_outputs = Dict{String, Float64}()
+    for T in [3000.0, 4000.0, 5000.0, 6000.0, 8000.0, 10000.0]
+        val = Korg.ContinuumAbsorption._H2plus_bf_and_ff(nu_test, T, nH_I_h2p, nH_II_h2p)
+        T_outputs[string(T)] = Float64(val)
+    end
+
+    reference_data["H2plus_bf_and_ff"] = Dict(
+        "inputs" => Dict("T" => T_h2p, "nH_I" => nH_I_h2p, "nH_II" => nH_II_h2p,
+                         "temperature_test_wavelength_angstrom" => wl_test_A),
+        "wavelength_outputs" => wl_outputs,
+        "temperature_outputs" => T_outputs
+    )
+end
+
+# =============================================================================
+# Line class construction (approximate broadening)
+# =============================================================================
+println("  - line_class...")
+let
+    line_inputs = [
+        (5000.0, -1.5, "Fe 1", 1.01),
+        (6563.0, 0.71, "H 1", 10.2),
+        (3933.0, 0.135, "Ca 2", 0.0),
+        (5172.0, -0.45, "Mg 1", 2.712),
+        (6707.0, 0.174, "Li 1", 0.0),
+    ]
+
+    line_outputs = Dict{String, Any}()
+    for (i, (wl_A, log_gf, spec_str, E_lower)) in enumerate(line_inputs)
+        wl_cm = wl_A * 1e-8
+        try
+            sp = Korg.Species(spec_str)
+            line = Korg.Line(wl_cm, log_gf, sp, E_lower)
+            line_outputs[string(i)] = Dict(
+                "wl" => Float64(line.wl),
+                "log_gf" => Float64(line.log_gf),
+                "E_lower" => Float64(line.E_lower),
+                "species_charge" => Int(sp.charge),
+                "gamma_rad" => Float64(line.gamma_rad),
+                "gamma_stark" => Float64(line.gamma_stark),
+                "vdW" => [Float64(line.vdW[1]), Float64(line.vdW[2])],
+            )
+        catch e
+            println("    Warning: line_class failed for $spec_str: $e")
+        end
+    end
+
+    # Store inputs as list of lists (JSON-friendly)
+    line_inputs_json = [[wl_A, log_gf, spec_str, E_lower] for (wl_A, log_gf, spec_str, E_lower) in line_inputs]
+
+    reference_data["line_class"] = Dict(
+        "inputs" => line_inputs_json,
+        "outputs" => line_outputs
+    )
+end
+
+# =============================================================================
+# approximate_radiative_gamma
+# =============================================================================
+println("  - approximate_radiative_gamma...")
+let
+    radgamma_outputs = Dict{String, Float64}()
+    for (wl_cm, log_gf) in [
+        (5.0e-5, -1.5), (5.0e-5, 0.0), (5.0e-5, 1.0),
+        (4.0e-5, -2.0), (6.0e-5, 0.5), (3.0e-5, -0.5),
+        (8.0e-5, -1.0), (1.0e-4, -3.0),
+    ]
+        val = Korg.approximate_radiative_gamma(wl_cm, log_gf)
+        radgamma_outputs["$(wl_cm)_$(log_gf)"] = Float64(val)
+    end
+    reference_data["approximate_radiative_gamma"] = Dict("outputs" => radgamma_outputs)
+end
+
+# =============================================================================
+# approximate_gammas
+# =============================================================================
+println("  - approximate_gammas...")
+let
+    approx_gammas_outputs = Dict{String, Any}()
+    test_cases = [
+        (5.0e-5, "Fe I", 1.01),
+        (5.0e-5, "Fe II", 3.0),
+        (6.5e-5, "Ca I", 0.0),
+        (4.0e-5, "Mg I", 2.712),
+        (3.9e-5, "Ca II", 1.69),
+        (5.0e-5, "Mn I", 0.0),
+    ]
+    for (wl_cm, spec_str, E_lower) in test_cases
+        try
+            sp = Korg.Species(spec_str)
+            gamma_stark, log_gamma_vdW = Korg.approximate_gammas(wl_cm, sp, E_lower)
+            # Key format must be parseable as: rsplit("_",1) -> [wl_species, E_lower]
+            # then split("_",1) -> [wl, species]
+            # Species with space like "Fe I" works fine since we split on "_" not " "
+            key = "$(wl_cm)_$(spec_str)_$(E_lower)"
+            approx_gammas_outputs[key] = Dict(
+                "gamma_stark" => Float64(gamma_stark),
+                "log_gamma_vdW" => Float64(log_gamma_vdW)
+            )
+        catch e
+            println("    Warning: approximate_gammas failed for $spec_str: $e")
+        end
+    end
+    reference_data["approximate_gammas"] = Dict("outputs" => approx_gammas_outputs)
+end
+
+# =============================================================================
+# Line with explicit broadening parameters
+# =============================================================================
+println("  - line_explicit_broadening...")
+let
+    # Each test case: [wl_A, log_gf, species_str, E_lower, gamma_rad, gamma_stark, vdW]
+    # vdW is a tuple [gamma, alpha]; gamma_rad in s^-1, gamma_stark in s^-1
+    explicit_inputs = [
+        [5000.0, -1.5, "Fe 1", 1.01, 1e8, 1e-6, [-7.5, 0.3]],
+        [4227.0, 0.265, "Ca 1", 0.0, 2e8, 4e-7, [-7.3, 0.3]],
+        [3933.0, 0.135, "Ca 2", 0.0, 1.5e8, 3e-7, [-7.2, 0.25]],
+    ]
+
+    explicit_outputs = Dict{String, Any}()
+    for (i, tc) in enumerate(explicit_inputs)
+        wl_A, log_gf, spec_str, E_lower, gamma_rad, gamma_stark, vdW_arr = tc
+        wl_cm = wl_A * 1e-8
+        try
+            sp = Korg.Species(spec_str)
+            vdW_tup = (vdW_arr[1], vdW_arr[2])
+            line = Korg.Line(wl_cm, log_gf, sp, E_lower, gamma_rad, gamma_stark, vdW_tup)
+            explicit_outputs[string(i)] = Dict(
+                "wl" => Float64(line.wl),
+                "gamma_rad" => Float64(line.gamma_rad),
+                "gamma_stark" => Float64(line.gamma_stark),
+                "vdW" => [Float64(line.vdW[1]), Float64(line.vdW[2])],
+            )
+        catch e
+            println("    Warning: line_explicit_broadening failed: $e")
+        end
+    end
+
+    reference_data["line_explicit_broadening"] = Dict(
+        "inputs" => explicit_inputs,
+        "outputs" => explicit_outputs
+    )
+end
+
+# =============================================================================
+# Chemical Equilibrium
+# =============================================================================
+println("  - chemical_equilibrium (this may take a moment)...")
+let
+    A_X = Korg.format_A_X()
+    # Julia convention: abs_abundances = 10^(A_X - 12) = N_X/N_H (H=1)
+    abs_abundances = @. 10.0^(A_X - 12)
+
+    # Use normalized convention (N_X/N_total, sum=1) to match Python's A_X_to_absolute
+    abs_abundances_normalized = abs_abundances ./ sum(abs_abundances)
+
+    cases = [
+        ("solar_tau1",  5778.0,  2.0e17, 1.5e14),
+        ("solar_deep",  9000.0,  5.0e17, 5.0e15),
+    ]
+
+    chem_eq_data = Dict{String, Any}()
+    for (label, T, n_total, ne_model) in cases
+        try
+            nₑ, number_densities = Korg.chemical_equilibrium(
+                T, n_total, ne_model, abs_abundances_normalized,
+                Korg.ionization_energies, Korg.default_partition_funcs,
+                Korg.default_log_equilibrium_constants
+            )
+            chem_eq_data[label] = Dict(
+                "T" => T, "n_total" => n_total, "ne_model" => ne_model,
+                "ne_result" => Float64(nₑ),
+                "n_H_I"  => Float64(number_densities[Korg.Species("H I")]),
+                "n_H_II" => Float64(number_densities[Korg.Species("H II")]),
+                "n_Fe_I" => Float64(number_densities[Korg.Species("Fe I")]),
+                "n_Fe_II"=> Float64(number_densities[Korg.Species("Fe II")]),
+            )
+        catch e
+            println("    Warning: chemical_equilibrium failed for $label: $e")
+        end
+    end
+    reference_data["chemical_equilibrium"] = chem_eq_data
+end
+
+# =============================================================================
+# Total Continuum Absorption
+# =============================================================================
+println("  - total_continuum_absorption...")
+let
+    T_cntm = 5778.0
+    ne_cntm = 1.5e14
+    nH_I_cntm  = 1.8e17
+    nH_II_cntm = 1.0e11
+    nHe_I_cntm = 1.6e16
+    nHe_II_cntm = 1.0e9
+    nH2_cntm   = 1.0e12
+
+    number_densities_cntm = Dict(
+        Korg.species"H_I"  => nH_I_cntm,
+        Korg.species"H_II" => nH_II_cntm,
+        Korg.species"He_I" => nHe_I_cntm,
+        Korg.species"He_II"=> nHe_II_cntm,
+        Korg.species"H2"   => nH2_cntm,
+    )
+
+    wavelengths_A = [3000.0, 4000.0, 5000.0, 6000.0, 8000.0, 10000.0]
+    cntm_outputs = Dict{String, Float64}()
+    for wl_A in wavelengths_A
+        nu = Korg.c_cgs / (wl_A * 1e-8)
+        val = Korg.ContinuumAbsorption.total_continuum_absorption(
+            [nu], T_cntm, ne_cntm, number_densities_cntm, Korg.default_partition_funcs
+        )[1]
+        cntm_outputs[string(wl_A)] = Float64(val)
+    end
+
+    reference_data["total_continuum_absorption"] = Dict(
+        "solar_layer" => Dict(
+            "T" => T_cntm, "ne" => ne_cntm,
+            "nH_I" => nH_I_cntm, "nH_II" => nH_II_cntm,
+            "nHe_I" => nHe_I_cntm, "nHe_II" => nHe_II_cntm, "nH2" => nH2_cntm,
+            "wavelengths_A" => wavelengths_A,
+            "outputs" => cntm_outputs
+        )
+    )
+end
+
+# =============================================================================
+# Hydrogen Line Absorption
+# =============================================================================
+println("  - hydrogen_line_absorption...")
+let
+    # Brackett oscillator strengths (n=4, m=5..12)
+    brackett_outputs = Dict{String, Float64}()
+    for m in 5:12
+        f = Korg.brackett_oscillator_strength(4, m)
+        brackett_outputs[string(m)] = Float64(f)
+    end
+
+    # Hummer-Mihalas occupation probability
+    T_hmw = 5778.0
+    nH_hmw = 1.8e17
+    nHe_hmw = 1.6e16
+    ne_hmw = 1.5e14
+    hmw_outputs = Dict{String, Float64}()
+    for n_eff in [2.0, 3.0, 5.0, 10.0, 20.0, 50.0]
+        w = Korg.hummer_mihalas_w(T_hmw, n_eff, nH_hmw, nHe_hmw, ne_hmw)
+        hmw_outputs[string(n_eff)] = Float64(w)
+    end
+
+    # Griem 1960 Knm constants
+    greim_outputs = Dict{String, Float64}()
+    for (n, m) in [(2,3), (2,4), (3,4), (3,5), (4,5), (4,6), (2,5)]
+        K = Korg.greim_1960_Knm(n, m)
+        greim_outputs["$(n)_$(m)"] = Float64(K)
+    end
+
+    # Holtsmark profile
+    P_holt = 0.5
+    holt_outputs = Dict{String, Float64}()
+    for beta in [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
+        H = Korg.holtsmark_profile(beta, P_holt)
+        holt_outputs[string(beta)] = Float64(H)
+    end
+
+    reference_data["hydrogen_line_absorption"] = Dict(
+        "brackett_oscillator_strength" => brackett_outputs,
+        "hummer_mihalas_w" => Dict(
+            "T" => T_hmw, "nH" => nH_hmw, "nHe" => nHe_hmw, "ne" => ne_hmw,
+            "outputs" => hmw_outputs
+        ),
+        "griem_1960_Knm" => greim_outputs,
+        "holtsmark_profile" => Dict("P" => P_holt, "outputs" => holt_outputs)
+    )
+end
+
+# =============================================================================
+# LSF and Rotation
+# =============================================================================
+println("  - lsf_rotation...")
+let
+    wl_start = 5000.0
+    wl_stop  = 5050.0
+    wl_step  = 0.1
+
+    # Synthetic spectrum: mostly flat with a few absorption features
+    n_pts = round(Int, (wl_stop - wl_start) / wl_step) + 1
+    wls = range(wl_start, wl_stop, length=n_pts)
+    flux = ones(n_pts)
+    # Add a Gaussian absorption feature at 5025 A
+    for (i, wl) in enumerate(wls)
+        flux[i] = 1.0 - 0.5 * exp(-0.5 * ((wl - 5025.0) / 1.0)^2)
+        flux[i] -= 0.3 * exp(-0.5 * ((wl - 5010.0) / 0.5)^2)
+    end
+    flux = clamp.(flux, 0.0, 1.0)
+
+    synth_wls = (wl_start, wl_stop, wl_step)
+
+    # apply_LSF at various R values
+    lsf_outputs = Dict{String, Vector{Float64}}()
+    for R in [5000.0, 10000.0, 50000.0]
+        result = Korg.apply_LSF(flux, synth_wls, R)
+        lsf_outputs[string(R)] = Float64.(result)
+    end
+
+    # apply_rotation at various vsini values
+    rot_outputs = Dict{String, Vector{Float64}}()
+    for vsini in [5.0, 20.0, 50.0]
+        result = Korg.apply_rotation(flux, synth_wls, vsini)
+        rot_outputs[string(vsini)] = Float64.(result)
+    end
+
+    # compute_LSF_matrix
+    obs_wls = collect(range(5010.0, 5040.0, length=31))
+    lsf_R = 10000.0
+    lsf_matrix = Korg.compute_LSF_matrix(synth_wls, obs_wls, lsf_R; verbose=false)
+    lsf_matrix_result = Float64.(lsf_matrix * flux)
+
+    reference_data["lsf_rotation"] = Dict(
+        "inputs" => Dict(
+            "wl_start" => wl_start, "wl_stop" => wl_stop, "wl_step" => wl_step,
+            "flux" => Float64.(flux),
+            "obs_wls" => Float64.(obs_wls),
+            "lsf_matrix_R" => lsf_R
+        ),
+        "apply_lsf" => lsf_outputs,
+        "apply_rotation" => rot_outputs,
+        "lsf_matrix_result" => lsf_matrix_result
+    )
+end
+
+# =============================================================================
+# Radiative Transfer Utilities
+# =============================================================================
+println("  - radiative_transfer utilities...")
+let
+    # generate_mu_grid — returns (μ_grid, μ_weights)
+    mu_grid_outputs = Dict{String, Any}()
+    for n in [2, 3, 5, 7]
+        μ_grid, μ_weights = Korg.RadiativeTransfer.generate_mu_grid(n)
+        mu_grid_outputs[string(n)] = Dict(
+            "mu" => Float64.(μ_grid),
+            "weights" => Float64.(μ_weights)
+        )
+    end
+    reference_data["generate_mu_grid"] = Dict("outputs" => mu_grid_outputs)
+
+    # compute_I_linear_flux_only and compute_F_flux_only_expint
+    # Build simple test case: increasing optical depth with linear source function
+    n_layers = 20
+    tau_vals = Float64.(10 .^ range(-2, 1, length=n_layers))  # τ from 0.01 to 10
+    S_vals = Float64.(1.0 .+ 0.5 .* tau_vals)  # S = 1 + 0.5*τ
+
+    F_linear = Korg.RadiativeTransfer.compute_I_linear_flux_only(tau_vals, S_vals)
+    F_expint = Korg.RadiativeTransfer.compute_F_flux_only_expint(tau_vals, S_vals)
+
+    reference_data["rt_formal_solution"] = Dict(
+        "tau" => tau_vals,
+        "S" => S_vals,
+        "F_linear_flux_only" => Float64(F_linear),
+        "F_expint_flux_only" => Float64(F_expint)
+    )
+end
+
+# =============================================================================
+# Blackbody / Planck function
+# =============================================================================
+println("  - blackbody...")
+let
+    bb_outputs = Dict{String, Float64}()
+    for (T, wl_cm) in [
+        (5778.0, 5.0e-5), (5778.0, 3.0e-5), (5778.0, 1.0e-4),
+        (4000.0, 5.0e-5), (8000.0, 5.0e-5), (3000.0, 1.0e-4),
+    ]
+        val = Korg.blackbody(T, wl_cm)
+        bb_outputs["$(T)_$(wl_cm)"] = Float64(val)
+    end
+    reference_data["blackbody"] = Dict("outputs" => bb_outputs)
+end
+
+# =============================================================================
 # Save to JSON
 # =============================================================================
 println("\nSaving to $output_file...")

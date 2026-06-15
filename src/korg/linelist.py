@@ -181,6 +181,10 @@ def create_line(
     if wl >= 1:
         wl = wl * 1e-8
 
+    # Normalize list → tuple for vdW (JSON deserializes tuples as lists)
+    if isinstance(vdW, list):
+        vdW = tuple(vdW)
+
     # Approximate missing broadening parameters
     # Note: Julia treats both 0 and 1 as flags to approximate (missing/placeholder values)
     need_stark = (gamma_stark is None or np.isnan(gamma_stark) or
