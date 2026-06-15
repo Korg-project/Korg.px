@@ -637,38 +637,21 @@ def _line_absorption_fast(
     # Max window per line: (n_lines,)
     max_wins = np.max(np.sqrt(win_G_all**2 + win_L_all**2), axis=1)
 
-    # --- Voigt computation with thread parallelism ---
-    from concurrent.futures import ThreadPoolExecutor
-
+    # --- Voigt computation ---
     n_lines = len(linelist)
-    n_threads = min(4, n_lines)
+    alpha = np.zeros((n_layers, n_wl))
 
-    # Partition lines into thread chunks
-    chunks = [np.arange(i, n_lines, n_threads) for i in range(n_threads)]
-    alpha_parts = [np.zeros((n_layers, n_wl)) for _ in range(n_threads)]
+    for i_line in range(n_lines):
+        max_win = max_wins[i_line]
+        wl0 = wls[i_line]
+        wl_mask = np.abs(wl_np - wl0) <= max_win
+        if not np.any(wl_mask):
+            continue
+        delta = wl_np[wl_mask][None, :] - wl0
+        profiles = scipy_voigt(delta, sigma_all[i_line, :, None], gamma_wl_all[i_line, :, None])
+        alpha[:, wl_mask] += amplitude_all[i_line, :, None] * profiles
 
-    def _process_chunk(chunk_indices, alpha_out):
-        for i_line in chunk_indices:
-            max_win = max_wins[i_line]
-            wl0 = wls[i_line]
-            wl_mask = np.abs(wl_np - wl0) <= max_win
-            if not np.any(wl_mask):
-                continue
-            wl_win = wl_np[wl_mask]
-            sigma = sigma_all[i_line]
-            gamma_wl = gamma_wl_all[i_line]
-            amplitude = amplitude_all[i_line]
-            delta = wl_win[None, :] - wl0
-            profiles = scipy_voigt(delta, sigma[:, None], gamma_wl[:, None])
-            alpha_out[:, wl_mask] += amplitude[:, None] * profiles
-
-    with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        futures = [pool.submit(_process_chunk, chunks[i], alpha_parts[i])
-                   for i in range(n_threads)]
-        for f in futures:
-            f.result()
-
-    return sum(alpha_parts)
+    return alpha
 
 
 def _build_line_data(linelist, unique_species):
