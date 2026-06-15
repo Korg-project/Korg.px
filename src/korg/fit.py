@@ -125,11 +125,14 @@ def _synthetic_spectrum(synthesis_wls, linelist, LSF_matrix, params, synthesis_k
         wl_angstrom = np.asarray(synthesis_wls)
 
     # synthesize signature: (atmosphere, linelist, wavelengths_angstrom, abundances, ...)
+    # Strip keys that _synthetic_spectrum controls so callers can safely pass them.
+    _synth_kw = {k: v for k, v in synthesis_kwargs.items()
+                 if k not in ("verbose", "line_buffer")}
     sol = synthesize(atm, linelist, wl_angstrom, A_X,
                      vmic=params.get("vmic", 1.0),
                      line_buffer=0,
                      verbose=False,
-                     **synthesis_kwargs)
+                     **_synth_kw)
 
     # Continuum rectification with optional linear correction
     central_wl = (sol.wavelengths[0] + sol.wavelengths[-1]) / 2.0
@@ -679,11 +682,13 @@ def ews_to_abundances(atm, linelist, A_X, measured_EWs, ew_window_size=2.0, wl_s
     dA_d_log_EW = np.zeros(len(lines))
 
     for i, (line, ew_obs) in enumerate(zip(lines, measured_EWs)):
-        # Identify the element (Z) from the line species
-        Z = line.species.formula.atoms[0] if hasattr(line.species, "formula") else 1
+        # Identify the element (Z) from the line species.
+        # formula.atoms is a fixed-size tuple padded with zeros; the first non-zero
+        # entry is the atomic number of the principal (or only) atom.
+        Z = 1
         if hasattr(line, "species") and hasattr(line.species, "formula"):
             atoms = line.species.formula.atoms
-            Z = atoms[0] if atoms else 1
+            Z = next((int(a) for a in atoms if a != 0), 1)
 
         A_X_mod = A_X.copy()
 
@@ -772,7 +777,7 @@ def ews_to_abundances_approx(atm, linelist, A_X, measured_EWs, ew_window_size=2.
         Z = 1
         if hasattr(line, "species") and hasattr(line.species, "formula"):
             atom_list = line.species.formula.atoms
-            Z = atom_list[0] if atom_list else 1
+            Z = next((int(a) for a in atom_list if a != 0), 1)
         atoms.append(Z)
     atoms = np.array(atoms)
 
