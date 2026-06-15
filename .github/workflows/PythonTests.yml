@@ -99,6 +99,10 @@ jobs:
           pytest tests/ --cov --cov-branch --cov-report=xml
 
       - name: Upload coverage reports to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          slug: Korg-project/Korg.px
+          fail_ci_if_error: true
