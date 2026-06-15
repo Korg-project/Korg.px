@@ -6,6 +6,7 @@ from Stehlé & Hutcheon (1999).
 """
 
 import jax.numpy as jnp
+import numpy as np
 import h5py
 from scipy.interpolate import RegularGridInterpolator
 from typing import Dict, Tuple
@@ -37,6 +38,16 @@ class StarkProfileLine:
                  log_delta_nu_grid=None, profile_data=None, lambda0_data_array=None):
         self.temps = jnp.array(temps)
         self.electron_number_densities = jnp.array(nes)
+        # Concrete Python-float grid bounds. These are used for the (data-dependent,
+        # control-flow) in-bounds check on T/ne. Keeping them as plain floats means
+        # the check never creates JAX tracers, even when prepare_stark_profiles_for_jit
+        # runs inside an enclosing jax.jit trace.
+        _temps_np = np.asarray(temps, dtype=np.float64)
+        _nes_np = np.asarray(nes, dtype=np.float64)
+        self.temp_min = float(_temps_np.min())
+        self.temp_max = float(_temps_np.max())
+        self.ne_min = float(_nes_np.min())
+        self.ne_max = float(_nes_np.max())
         self.lower = lower
         self.upper = upper
         self.Kalpha = Kalpha
@@ -125,7 +136,7 @@ def _load_stark_profiles(fname: str) -> Dict[str, StarkProfileLine]:
             # Julia uses: (temps, nes, [-floatmax; log.(delta_nu_over_F0[2:end])])
             # For the first delta_nu_over_F0 (which is 0), use -floatmax equivalent
             log_delta_nu = jnp.log(delta_nu_over_F0[1:])  # Skip first element (0)
-            log_delta_nu_grid = jnp.concatenate([[-1e308], log_delta_nu])
+            log_delta_nu_grid = jnp.concatenate([jnp.array([-1e308]), log_delta_nu])
 
             # Transpose logP to match interpolator convention: (temps, nes, delta_nu)
             # HDF5 has shape (delta_nu, ne, temps), we need (temps, nes, delta_nu)
@@ -166,7 +177,7 @@ def _load_stark_profiles(fname: str) -> Dict[str, StarkProfileLine]:
 
 
 # Load profiles at module import
-_data_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'data')
+_data_dir = os.path.join(os.path.dirname(__file__), 'data')
 _stark_profile_path = os.path.join(_data_dir, 'Stehle-Hutchson-hydrogen-profiles.h5')
 
 if os.path.exists(_stark_profile_path):
