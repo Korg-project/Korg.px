@@ -41,6 +41,20 @@ from korg.constants import kboltz_cgs
 # Test fixture: solar MARCS model atmosphere, committed under tests/data/.
 SUN_MOD = Path(__file__).parent / "data" / "sun.mod"
 
+# Tolerances for the Python-vs-Julia galah synthesis comparison.
+#
+# These are intentionally GENEROUS for now so the test passes at the current
+# level of agreement -- they bound how far Python may drift from the Julia
+# reference, not a target accuracy. Tighten them over time as the port's
+# accuracy improves (e.g. once ABO p-d resonant broadening and other gaps are
+# closed). Current measured agreement (4930-4950 Å solar window):
+#   max |cnorm_py - cnorm_jl| ~ 0.234, mean ~ 0.018
+#   max flux rel diff ~ 0.73,   mean ~ 0.039
+GALAH_TOL_CNORM_MAX_ABS = 0.30    # max |cnorm_py - cnorm_jl|
+GALAH_TOL_CNORM_MEAN_ABS = 0.03   # mean |cnorm_py - cnorm_jl|
+GALAH_TOL_FLUX_MAX_REL = 1.0      # max |flux_py - flux_jl| / flux_jl
+GALAH_TOL_FLUX_MEAN_REL = 0.06    # mean |flux_py - flux_jl| / flux_jl
+
 
 def read_marcs_model(filename: str) -> PlanarAtmosphere:
     """
@@ -433,6 +447,25 @@ println("\\n✓ Saved to julia_galah_synthesis.h5")
     print(f"  Wavelength: {wavelengths[i_deepest]:.2f} Å")
     print(f"  Python depth: {(1-cnorm_py[i_deepest])*100:.2f}%")
     print(f"  Julia depth: {(1-cnorm_jl[i_deepest])*100:.2f}%")
+
+    # Assert Python agrees with Julia within the (currently generous) tolerances.
+    cnorm_max_abs = float(cnorm_diff.max())
+    cnorm_mean_abs = float(cnorm_diff.mean())
+    flux_max_rel = float(flux_rel_diff.max())
+    flux_mean_rel = float(flux_rel_diff.mean())
+
+    assert cnorm_max_abs <= GALAH_TOL_CNORM_MAX_ABS, (
+        f"Max continuum-normalized abs diff {cnorm_max_abs:.4f} exceeds "
+        f"tolerance {GALAH_TOL_CNORM_MAX_ABS}")
+    assert cnorm_mean_abs <= GALAH_TOL_CNORM_MEAN_ABS, (
+        f"Mean continuum-normalized abs diff {cnorm_mean_abs:.6f} exceeds "
+        f"tolerance {GALAH_TOL_CNORM_MEAN_ABS}")
+    assert flux_max_rel <= GALAH_TOL_FLUX_MAX_REL, (
+        f"Max flux relative diff {flux_max_rel:.4f} exceeds "
+        f"tolerance {GALAH_TOL_FLUX_MAX_REL}")
+    assert flux_mean_rel <= GALAH_TOL_FLUX_MEAN_REL, (
+        f"Mean flux relative diff {flux_mean_rel:.4f} exceeds "
+        f"tolerance {GALAH_TOL_FLUX_MEAN_REL}")
 
     # Plot
     print("\n" + "="*70)
