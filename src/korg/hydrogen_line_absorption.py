@@ -1107,3 +1107,167 @@ def precompute_hummer_ws(T_arr, nH_I_arr, nHe_I_arr, ne_arr):
         jnp.asarray(nHe_I_arr, dtype=jnp.float64),
         jnp.asarray(ne_arr, dtype=jnp.float64),
     )
+
+
+@jax.jit
+def _interp_lambda0_all_layers_jit(T_arr, ne_arr, temps_grid, nes_grid, lambda0_data):
+    """Batch 2-D interpolation of line-centre wavelength over all atmosphere layers."""
+    return jax.vmap(
+        lambda T_i, ne_i: _interp_linear_2d_jax(T_i, ne_i, temps_grid, nes_grid, lambda0_data)
+    )(T_arr, ne_arr)
+
+
+@jax.jit
+def _process_stehle_line_all_layers_jit(
+    wavelengths,           # (n_wl,)
+    T_arr,                 # (n_layers,)
+    ne_arr,                # (n_layers,)
+    nH_I_arr,              # (n_layers,)
+    UH_I_arr,              # (n_layers,)
+    lambda0_arr,           # (n_layers,) interpolated line centre per layer
+    lambda0_stehle_arr,    # (n_layers,) Stark profile centre (= ABO centre for Balmer, else = lambda0)
+    valid_mask,            # (n_layers,) bool — False for layers where T/ne out of grid bounds
+    window_size,           # scalar [cm]
+    xi,                    # scalar [cm/s]
+    ws_all,                # (n_layers, N_MAX_HUMMER)
+    lower,                 # int
+    upper,                 # int
+    log_gf,                # scalar
+    sigma_abo,             # scalar — ABO sigma * a0^2 [cm^2] (0 if not active)
+    alpha_abo,             # scalar — ABO alpha (0 if not active)
+    abo_active,            # scalar — 1.0 if ABO active, 0.0 otherwise
+    temps_grid,            # (n_T,)
+    nes_grid,              # (n_ne,)
+    log_delta_nu_grid,     # (n_delta,)
+    profile_3d_data,       # (n_T, n_ne, n_delta)
+):
+    """Process one Stehlé Stark line for all atmospheric layers using vmap.
+
+    Avoids O(n_layers) JAX dispatch calls by batching the layer loop into a
+    single vmap. Returns shape (n_layers, n_wl).
+    """
+    def per_layer(T_i, ne_i, nH_I_i, UH_I_i, lam0_i, lam0_stehle_i, ws_i, valid_i):
+        contrib = _process_one_stehle_line(
+            wavelengths, T_i, ne_i, nH_I_i, UH_I_i, window_size, xi, ws_i,
+            lower, upper, log_gf, lam0_i, lam0_stehle_i,
+            sigma_abo, alpha_abo, abo_active,
+            temps_grid, nes_grid, log_delta_nu_grid, profile_3d_data,
+        )
+        return jnp.where(valid_i, contrib, jnp.zeros_like(contrib))
+
+    return jax.vmap(per_layer)(
+        T_arr, ne_arr, nH_I_arr, UH_I_arr,
+        lambda0_arr, lambda0_stehle_arr, ws_all, valid_mask
+    )
+
+
+def hydrogen_line_absorption_stark_batched(
+    wavelengths_cm,
+    T_arr,
+    ne_arr,
+    nH_I_arr,
+    UH_I_arr,
+    window_size,
+    xi,
+    ws_all,
+    stark_profiles,
+):
+    """Compute Stehlé Stark hydrogen line absorption for ALL layers at once.
+
+    Replaces the O(n_layers × n_lines) per-layer loop with O(n_lines) JIT
+    dispatches by vmapping ``_process_one_stehle_line`` over the layer axis.
+
+    Parameters
+    ----------
+    wavelengths_cm : array (n_wl,) — wavelengths [cm]
+    T_arr, ne_arr, nH_I_arr, UH_I_arr : arrays (n_layers,)
+    window_size : float — line window [cm]
+    xi : float — microturbulence [cm/s]
+    ws_all : JAX array (n_layers, N_MAX_HUMMER)
+    stark_profiles : dict — pre-filtered StarkProfileLine dict
+
+    Returns
+    -------
+    alpha : numpy array (n_layers, n_wl)
+    """
+    if not stark_profiles:
+        return np.zeros((len(T_arr), len(wavelengths_cm)))
+
+    n_layers = len(T_arr)
+    wavelengths_jax = jnp.asarray(wavelengths_cm)
+    T_jax = jnp.asarray(T_arr, dtype=jnp.float64)
+    ne_jax = jnp.asarray(ne_arr, dtype=jnp.float64)
+    nH_I_jax = jnp.asarray(nH_I_arr, dtype=jnp.float64)
+    UH_I_jax = jnp.asarray(UH_I_arr, dtype=jnp.float64)
+
+    alpha = np.zeros((n_layers, len(wavelengths_cm)))
+
+    for _transition, line in stark_profiles.items():
+        # Per-layer validity (T and ne must be within the profile grid bounds)
+        valid = np.array(
+            [line.temp_min < T_arr[i] < line.temp_max and
+             line.ne_min < ne_arr[i] < line.ne_max
+             for i in range(n_layers)],
+            dtype=bool
+        )
+        if not np.any(valid):
+            continue
+
+        # Batch-interpolate line centres for all layers at once (avoids 56 per-layer
+        # JAX dispatches; invalid layers are masked out below).
+        lambda0_all = _interp_lambda0_all_layers_jit(
+            T_jax, ne_jax,
+            jnp.asarray(line.temps, dtype=jnp.float64),
+            jnp.asarray(line.electron_number_densities, dtype=jnp.float64),
+            jnp.asarray(line.lambda0_data, dtype=jnp.float64),
+        )
+        lambda0_arr_np = np.asarray(lambda0_all) * valid.astype(np.float64)  # zero invalid layers
+
+        # ABO Stark centre: constant (ABO centre) for lower Balmer lines,
+        # otherwise equals the interpolated λ0 per layer.
+        if line.lower == 2 and line.upper in _BALMER_ABO_PARAMS:
+            lam0_abo, sigma_abo_a0, alpha_abo_val = _BALMER_ABO_PARAMS[line.upper]
+            lambda0_stehle_np = np.full(n_layers, lam0_abo)
+            sigma_abo_val = float(sigma_abo_a0 * bohr_radius_cgs**2)
+            abo_active_val = 1.0
+            lam0_ref = lam0_abo  # use constant ABO center for slicing
+        else:
+            lambda0_stehle_np = lambda0_arr_np.copy()
+            sigma_abo_val = 0.0
+            alpha_abo_val = 0.0
+            abo_active_val = 0.0
+            # Use the median λ0 across valid layers as the window reference
+            lam0_ref = float(np.median(lambda0_arr_np[valid]))
+
+        # Slice wavelengths to the line window to avoid interpolating
+        # at wavelengths that contribute nothing. This reduces the work by
+        # n_wl / n_wl_in_window (often 10× or more for optical synthesis).
+        wl_lo = max(0, int(np.searchsorted(wavelengths_cm, lam0_ref - window_size)) - 1)
+        wl_hi = min(len(wavelengths_cm), int(np.searchsorted(wavelengths_cm, lam0_ref + window_size)) + 1)
+        if wl_lo >= wl_hi:
+            continue
+
+        wl_slice = wavelengths_jax[wl_lo:wl_hi]
+
+        contribs_slice = _process_stehle_line_all_layers_jit(
+            wl_slice,
+            T_jax, ne_jax, nH_I_jax, UH_I_jax,
+            jnp.asarray(lambda0_arr_np),
+            jnp.asarray(lambda0_stehle_np),
+            jnp.asarray(valid),
+            jnp.asarray(window_size, dtype=jnp.float64),
+            jnp.asarray(xi, dtype=jnp.float64),
+            ws_all,
+            line.lower, line.upper,
+            jnp.asarray(line.log_gf, dtype=jnp.float64),
+            jnp.asarray(sigma_abo_val, dtype=jnp.float64),
+            jnp.asarray(alpha_abo_val, dtype=jnp.float64),
+            jnp.asarray(abo_active_val, dtype=jnp.float64),
+            jnp.asarray(line.temps, dtype=jnp.float64),
+            jnp.asarray(line.electron_number_densities, dtype=jnp.float64),
+            jnp.asarray(line.log_delta_nu_grid, dtype=jnp.float64),
+            jnp.asarray(line.profile_data, dtype=jnp.float64),
+        )  # (n_layers, wl_hi - wl_lo)
+        alpha[:, wl_lo:wl_hi] += np.asarray(contribs_slice)
+
+    return alpha

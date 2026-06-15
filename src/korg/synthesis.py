@@ -26,7 +26,9 @@ from .radiative_transfer import radiative_transfer, radiative_transfer_jit
 from .linelist import Line
 from .species import Species
 from .line_absorption import line_absorption
-from .hydrogen_line_absorption import hydrogen_line_absorption, precompute_hummer_ws
+from .hydrogen_line_absorption import (hydrogen_line_absorption, precompute_hummer_ws,
+                                       hline_stark_profiles,
+                                       hydrogen_line_absorption_stark_batched)
 from .atomic_data import atomic_masses
 from .abundances import A_X_to_absolute
 
@@ -554,6 +556,21 @@ def synthesize_spectrum(
         if profile:
             t_h_lines_start = time.time()
 
+        # Pre-filter Stark profiles to only those near the synthesis wavelength range.
+        # Approximate vacuum line centers via Rydberg formula; profiles whose center is
+        # more than h_line_window_cm outside the range contribute exactly zero and are
+        # skipped entirely (avoids O(84 × n_layers) JIT dispatches when the range
+        # contains no H lines, e.g. 5000–5100 Å contains only the far wing of Hβ).
+        _RYDBERG_CM = 1.0973731568539e5
+        wl_min_cm = wavelengths_cm[0]
+        wl_max_cm = wavelengths_cm[-1]
+        nearby_stark = {
+            k: v for k, v in hline_stark_profiles.items()
+            if (wl_min_cm - h_line_window_cm
+                <= 1.0 / (_RYDBERG_CM * (1.0/v.lower**2 - 1.0/v.upper**2))
+                <= wl_max_cm + h_line_window_cm)
+        }
+
         # Batch-precompute occupation probabilities for all layers (much faster than per-layer)
         if raw_arrays_list:
             nH_I_arr = np.array([ra['neutral_dens'][0] for ra in raw_arrays_list])
@@ -570,16 +587,32 @@ def synthesize_spectrum(
             U_H_I_arr = pf_H_I.numpy_eval(log_T_arr)
         else:
             U_H_I_arr = np.array([float(pf_H_I(lt)) for lt in log_T_arr])
-        for i in range(n_layers):
-            T_i = T[i]
-            ne_i = electron_densities[i]
-            xi = vmic_cm_s
-            alpha_H = hydrogen_line_absorption(
-                wavelengths_cm, T_i, ne_i, nH_I_arr[i], nHe_I_arr[i],
-                float(U_H_I_arr[i]), xi,
-                h_line_window_cm, use_MHD=True, ws=ws_all[i]
+
+        # Stehlé Stark profiles: process all layers at once (1 JIT dispatch per nearby line)
+        if nearby_stark:
+            alpha_stark = hydrogen_line_absorption_stark_batched(
+                wavelengths_cm, T, electron_densities, nH_I_arr, U_H_I_arr,
+                h_line_window_cm, vmic_cm_s, ws_all, nearby_stark
             )
-            alpha[i, :] += alpha_H
+            alpha += alpha_stark
+
+        # Brackett series (lower=4): all series lines are in the IR (>1.4 μm), so skip
+        # the per-layer loop entirely when the synthesis range is in the optical/UV.
+        brackett_in_range = any(
+            wl_min_cm - h_line_window_cm
+            <= 1.0 / (_RYDBERG_CM * (1.0/16.0 - 1.0/m**2))
+            <= wl_max_cm + h_line_window_cm
+            for m in range(5, 31)
+        )
+        if brackett_in_range:
+            for i in range(n_layers):
+                alpha_H = hydrogen_line_absorption(
+                    wavelengths_cm, T[i], electron_densities[i], nH_I_arr[i], nHe_I_arr[i],
+                    float(U_H_I_arr[i]), vmic_cm_s,
+                    h_line_window_cm, use_MHD=True, ws=ws_all[i],
+                    stark_profiles={}   # Stark already handled above
+                )
+                alpha[i, :] += alpha_H
         if profile:
             timings['hydrogen_lines'] = time.time() - t_h_lines_start
 
