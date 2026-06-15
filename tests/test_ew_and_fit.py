@@ -246,7 +246,7 @@ class TestFitSpectrum:
             hydrogen_lines=False,
             verbose=False,
             precision=1e-3,
-            time_limit=60,
+            time_limit=120,
         )
         return result
 

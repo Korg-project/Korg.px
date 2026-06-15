@@ -7,7 +7,10 @@ for spectral synthesis, validated against Korg.jl.
 Reference: Korg.jl src/atmosphere.jl and src/lazy_multilinear_interpolation.jl
 """
 
+import functools
+
 import numpy as np
+import jax
 import jax.numpy as jnp
 import h5py
 import os
@@ -300,6 +303,154 @@ def load_marcs_grid(
         raise RuntimeError(f"Failed to load MARCS grid from {path}: {e}") from e
 
 
+# ---------------------------------------------------------------------------
+# JIT-compatible MARCS interpolation kernel
+# ---------------------------------------------------------------------------
+
+# Module-level cache for JIT data (nodes_padded, nodes_lengths, grid)
+_marcs_jit_cache: dict = {}
+
+
+def _get_marcs_jit_data() -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Return (nodes_padded, nodes_lengths, grid), computing and caching on first call.
+
+    nodes_padded : shape (5, max_node_len) float64
+        Grid node values for each parameter, padded with +inf so that
+        searchsorted ignores the padding region.
+    nodes_lengths : shape (5,) int32 — actual node count per dimension
+    grid : shape (n_layers, 5, n_Teff, n_logg, n_MH, n_alpha, n_C) float64
+
+    Notes
+    -----
+    This is a convenience function used by external callers (e.g. tests) that
+    want direct access to the JIT-ready arrays.  ``interpolate_marcs`` manages
+    the cache itself so it can re-detect when ``load_marcs_grid()`` returns a
+    different grid object (e.g. after the environment changes in tests).
+    """
+    if "data" not in _marcs_jit_cache:
+        nodes, grid = load_marcs_grid()
+        lengths = [len(n) for n in nodes]
+        max_len = max(lengths)
+        # Pad with +inf so searchsorted naturally stops at the valid region
+        nodes_padded = jnp.array(
+            np.array([
+                np.concatenate([np.asarray(n), np.full(max_len - len(n), np.inf)])
+                for n in nodes
+            ]),
+            dtype=jnp.float64
+        )
+        nodes_lengths = jnp.array(lengths, dtype=jnp.int32)
+        _marcs_jit_cache["data"] = (nodes_padded, nodes_lengths, grid)
+        _marcs_jit_cache["grid_id"] = id(grid)
+    return _marcs_jit_cache["data"]
+
+
+@functools.partial(jax.jit, static_argnums=())
+def _interpolate_marcs_jit(
+    params: jnp.ndarray,
+    nodes_padded: jnp.ndarray,
+    nodes_lengths: jnp.ndarray,
+    grid: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    JIT-compiled multilinear interpolation kernel for the MARCS atmosphere grid.
+
+    This is an inner function called by ``interpolate_marcs``.  It contains no
+    Python-level conditionals on traced values and is fully differentiable.
+
+    Parameters
+    ----------
+    params : jnp.ndarray, shape (5,)
+        [Teff, logg, M_H, alpha_M, C_M] — values to interpolate at.
+    nodes_padded : jnp.ndarray, shape (5, max_node_len)
+        Grid node values for each parameter, padded with +inf to uniform length.
+    nodes_lengths : jnp.ndarray, shape (5,) int32
+        Actual number of nodes in each dimension.
+    grid : jnp.ndarray, shape (n_layers, 5, n_Teff, n_logg, n_MH, n_alpha, n_C)
+        Full MARCS atmosphere grid (5 quantities: T, log_ne, log_n, tau_ref, asinh_z).
+
+    Returns
+    -------
+    jnp.ndarray, shape (n_layers, 5)
+        Interpolated atmosphere quantities (NaN rows where the grid is masked).
+
+    Notes
+    -----
+    The 5-dimensional multilinear interpolation is unrolled over all 2^5 = 32
+    corners at Python trace time, so the compiled XLA graph is a fixed-size
+    weighted sum — no dynamic loops or conditionals at runtime.
+    """
+    N_PARAMS = 5  # static: number of interpolation dimensions
+
+    # --- 1. Perturb params that sit exactly on a grid node ---
+    # We nudge by a tiny relative amount so that searchsorted(side='right')
+    # places the value strictly inside a bracket rather than on a node.
+    # Using a relative epsilon (1e-10 * scale) keeps this differentiable:
+    # jnp.where is differentiable everywhere except where its condition changes,
+    # but on_node being True only at exact grid nodes, and the nudge being a
+    # linear function of params[i], makes the Jacobian well-defined almost
+    # everywhere in practice.
+    params = params.astype(jnp.float64)
+    _NUDGE = jnp.finfo(jnp.float64).eps * 4.0  # ~8.9e-16, very small
+    for i in range(N_PARAMS):
+        node_row = nodes_padded[i]  # shape (max_node_len,)
+        n_nodes = nodes_lengths[i]
+        # Check if params[i] exactly matches any valid node
+        # (nodes_padded uses +inf for padding so invalid entries are ignored)
+        diffs = jnp.abs(node_row - params[i])
+        on_node = jnp.min(diffs) < 1e-10
+        # Nudge: use a small absolute offset based on the interval spacing
+        last_node = node_row[n_nodes - 1]
+        first_node = node_row[0]
+        scale = last_node - first_node  # total grid span for this dimension
+        nudge_abs = jnp.where(scale > 0.0, _NUDGE * scale, _NUDGE)
+        nudged = params[i] + nudge_abs
+        # If nudge pushed past the last node, nudge downward instead
+        nudged = jnp.where(nudged > last_node, params[i] - nudge_abs, nudged)
+        params = params.at[i].set(jnp.where(on_node, nudged, params[i]))
+
+    # --- 2. Find bracket indices via searchsorted (all JIT-safe) ---
+    # upper[i] is the index of the first node > params[i], clamped to [1, n_nodes-1].
+    upper = jnp.stack([
+        jnp.searchsorted(nodes_padded[i], params[i], side='right')
+          .clip(1, nodes_lengths[i] - 1)
+        for i in range(N_PARAMS)
+    ])  # shape (5,)
+
+    # --- 3. Compute interpolation weights ---
+    # weight[i] = (params[i] - lower_node) / (upper_node - lower_node)
+    lower_vals = jnp.stack([nodes_padded[i, upper[i] - 1] for i in range(N_PARAMS)])
+    upper_vals = jnp.stack([nodes_padded[i, upper[i]]     for i in range(N_PARAMS)])
+    weights = (params - lower_vals) / (upper_vals - lower_vals)  # shape (5,)
+
+    # --- 4. Accumulate over all 2^5 = 32 corners (static Python loop) ---
+    # grid shape: (n_layers, 5, d0, d1, d2, d3, d4)
+    n_layers = grid.shape[0]
+    n_quant = grid.shape[1]
+    result = jnp.zeros((n_layers, n_quant), dtype=jnp.float64)
+
+    for corner in range(1 << N_PARAMS):
+        # bits[i] ∈ {0, 1}: whether to use the upper node in dimension i
+        bits = jnp.array([(corner >> i) & 1 for i in range(N_PARAMS)], dtype=jnp.int32)
+
+        # Corner weight: product of (w if upper, (1-w) if lower)
+        w_corner = jnp.prod(jnp.where(bits, weights, 1.0 - weights))
+
+        # Gather grid value at this corner using jnp.take (traced-index safe)
+        # We sequentially index each parameter dimension; after each take the
+        # consumed dimension is gone and the next parameter is always at axis 2.
+        val = grid  # (n_layers, n_quant, d0, d1, d2, d3, d4)
+        for i in range(N_PARAMS):
+            idx_i = upper[i] - 1 + bits[i]  # traced int32 scalar
+            val = jnp.take(val, idx_i, axis=2)
+        # val now has shape (n_layers, n_quant)
+
+        result = result + w_corner * val
+
+    return result
+
+
 def interpolate_marcs(
     Teff: float,
     logg: float,
@@ -323,8 +474,9 @@ def interpolate_marcs(
         Effective temperature [K]
     logg : float
         Surface gravity log10(g [cm/s²])
-    M_H : float, optional
-        Metallicity [M/H] (default: 0.0 = solar)
+    M_H_or_A_X : float or array, optional
+        Metallicity [M/H] (default: 0.0 = solar), or a 92-element A(X) abundance
+        vector from which M_H, alpha_M, and C_M are derived.
     alpha_M : float, optional
         Alpha enhancement [α/M] (default: 0.0)
     C_M : float, optional
@@ -367,8 +519,9 @@ def interpolate_marcs(
     ---------
     Korg.jl src/atmosphere.jl interpolate_marcs()
     """
+    # Python-level decision — not traced by JAX
     if spherical is None:
-        spherical = (logg < 3.5)
+        spherical = float(logg) < 3.5
 
     # Accept either M_H (scalar) or A_X (92-element abundance vector) as third arg.
     # This matches Julia's two-method dispatch for interpolate_marcs.
@@ -396,44 +549,89 @@ def interpolate_marcs(
     # Reference wavelength for MARCS models
     reference_wavelength = 5e-5  # 5000 Å in cm
 
-    # Load MARCS grid
+    # Load MARCS grid — this handles placeholder / CI detection and emits warnings.
+    # Always call load_marcs_grid() first so warnings are raised and the CI
+    # compatibility path is exercised regardless of the JIT data cache.
     nodes, grid = load_marcs_grid()
 
-    # Parameters for interpolation
-    params = jnp.array([Teff, logg, M_H, alpha_M, C_M])
+    # Python-level bounds check (matches the original lazy_multilinear_interpolation
+    # behaviour, which raised AtmosphereInterpolationError for out-of-bounds params).
+    param_vals  = [float(Teff), float(logg), float(M_H), float(alpha_M), float(C_M)]
     param_names = ["Teff", "log(g)", "[M/H]", "[α/M]", "[C/metals]"]
+    for i, (pv, pname, pnodes) in enumerate(zip(param_vals, param_names, nodes)):
+        lo = float(pnodes[0])
+        hi = float(pnodes[-1])
+        if not (lo <= pv <= hi):
+            raise AtmosphereInterpolationError(
+                f"Can't interpolate grid. {pname} is out of bounds. "
+                f"({pv} ∉ [{lo}, {hi}])"
+            )
 
-    # Perform multilinear interpolation
-    atm_quants = lazy_multilinear_interpolation(
-        params, nodes, grid,
-        param_names=param_names,
-        perturb_at_grid_values=perturb_at_grid_values
-    )
+    # Build (or retrieve) JIT-compatible padded node arrays from the same grid.
+    # Use the module-level cache keyed on grid identity to avoid re-computing.
+    grid_id = id(grid)
+    if "data" not in _marcs_jit_cache or _marcs_jit_cache.get("grid_id") != grid_id:
+        lengths = [len(n) for n in nodes]
+        max_len = max(lengths)
+        nodes_padded = jnp.array(
+            np.array([
+                np.concatenate([np.asarray(n), np.full(max_len - len(n), np.inf)])
+                for n in nodes
+            ]),
+            dtype=jnp.float64
+        )
+        nodes_lengths = jnp.array(lengths, dtype=jnp.int32)
+        _marcs_jit_cache["data"] = (nodes_padded, nodes_lengths, grid)
+        _marcs_jit_cache["grid_id"] = grid_id
+    nodes_padded, nodes_lengths, grid = _marcs_jit_cache["data"]
 
-    # Filter out NaN layers (MARCS uses NaN to mark invalid layers)
-    nanmask = ~jnp.isnan(atm_quants[:, 3])  # Check tau_ref column
+    # Build parameter vector (float64)
+    params = jnp.array([Teff, logg, M_H, alpha_M, C_M], dtype=jnp.float64)
 
-    # Extract and transform quantities
-    # Grid stores: [T, log_ne, log_n, tau_ref, asinh_z]
-    T = atm_quants[nanmask, 0]
-    log_ne = atm_quants[nanmask, 1]
-    log_n = atm_quants[nanmask, 2]
-    tau_ref = atm_quants[nanmask, 3]
-    asinh_z = atm_quants[nanmask, 4]
+    # --- JIT kernel: multilinear interpolation ---
+    # perturb_at_grid_values is handled inside the JIT kernel when True.
+    # When False, we skip the nudge by using params as-is (the kernel always
+    # nudges, but calling with perturb_at_grid_values=False on non-exact points
+    # is a no-op).  To faithfully honour the flag, we run the old path for the
+    # False case (which is rare) and the JIT path for the common True case.
+    if perturb_at_grid_values:
+        atm_quants = _interpolate_marcs_jit(params, nodes_padded, nodes_lengths, grid)
+    else:
+        # Legacy path: use original non-JIT code (avoids perturbation)
+        param_names = ["Teff", "log(g)", "[M/H]", "[α/M]", "[C/metals]"]
+        atm_quants = lazy_multilinear_interpolation(
+            params, nodes, grid,
+            param_names=param_names,
+            perturb_at_grid_values=False
+        )
+
+    # Back in Python: strip NaN layers and build atmosphere object
+    atm_quants_np = np.asarray(atm_quants)
+    valid = ~np.isnan(atm_quants_np[:, 3])  # tau_ref column
+
+    T       = atm_quants_np[valid, 0]
+    log_ne  = atm_quants_np[valid, 1]
+    log_n   = atm_quants_np[valid, 2]
+    tau_ref = atm_quants_np[valid, 3]
+    asinh_z = atm_quants_np[valid, 4]
 
     # Transform back to physical values
-    ne = jnp.exp(log_ne)
-    n = jnp.exp(log_n)
-    z = jnp.sinh(asinh_z)
+    ne = np.exp(log_ne)
+    n  = np.exp(log_n)
+    z  = np.sinh(asinh_z)
 
-    # Create atmosphere structure
-    n_layers = int(jnp.sum(nanmask))
+    n_layers = int(valid.sum())
+
+    # Check for negative optical depths (indicates unreliable interpolation)
+    if np.any(tau_ref < 0):
+        raise AtmosphereInterpolationError(
+            "Interpolated atmosphere has negative optical depths and is not reliable."
+        )
 
     if spherical:
-        # Calculate photospheric radius
-        # R = sqrt(G * M_sun / g)
+        # Calculate photospheric radius: R = sqrt(G * M_sun / g)
         solar_mass_cgs = 1.9885e33  # grams
-        R_phot = jnp.sqrt(G_cgs * solar_mass_cgs / (10**logg))
+        R_phot = float(np.sqrt(G_cgs * solar_mass_cgs / (10.0 ** float(logg))))
 
         layers = [
             ShellAtmosphereLayer(
@@ -448,7 +646,7 @@ def interpolate_marcs(
 
         atm = ShellAtmosphere(
             layers=layers,
-            R_photosphere=float(R_phot),
+            R_photosphere=R_phot,
             reference_wavelength=reference_wavelength
         )
     else:
@@ -466,12 +664,6 @@ def interpolate_marcs(
         atm = PlanarAtmosphere(
             layers=layers,
             reference_wavelength=reference_wavelength
-        )
-
-    # Check for negative optical depths (indicates unreliable interpolation)
-    if jnp.any(tau_ref < 0):
-        raise AtmosphereInterpolationError(
-            "Interpolated atmosphere has negative optical depths and is not reliable."
         )
 
     return atm

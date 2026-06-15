@@ -457,10 +457,17 @@ def fit_spectrum(obs_wls, obs_flux, obs_err, linelist, initial_guesses, fixed_pa
             options={"gtol": precision, "maxiter": 10_000},
         )
     except StopIteration:
-        # Build a minimal result so we can still return something
+        # Return the best-seen point from the trace rather than the initial guess.
         from scipy.optimize import OptimizeResult
+        best_chi2 = min((t["chi2"] for t in trace), default=np.inf)
+        if trace and np.isfinite(best_chi2):
+            best_t = min(trace, key=lambda t: t.get("chi2", np.inf))
+            best_x = _scale_params({k: best_t[k] for k in params_to_fit})
+            best_x = np.array([best_x[k] for k in params_to_fit])
+        else:
+            best_x, best_chi2 = p0, np.inf
         res = OptimizeResult(
-            x=p0, fun=np.inf, success=False, message="Time limit reached",
+            x=best_x, fun=best_chi2, success=False, message="Time limit reached",
             nit=len(trace), hess_inv=np.eye(len(p0)),
         )
 
