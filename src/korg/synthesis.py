@@ -15,15 +15,17 @@ from typing import Optional, Tuple, List, Dict, Callable, Union
 from scipy.interpolate import interp1d
 
 from .atmosphere import PlanarAtmosphere, ShellAtmosphere
-from .statmech import chemical_equilibrium
+from .statmech import chemical_equilibrium, chemical_equilibrium_fast
 from .data_loader import (ionization_energies, default_partition_funcs,
-                          default_log_equilibrium_constants)
+                          default_log_equilibrium_constants,
+                          default_chem_eq_data, default_mol_species)
+from .continuum import prepare_continuum_batch, prepare_continuum_batch_fast, batch_continuum_absorption
 from .constants import electron_mass_cgs, c_cgs, kboltz_eV, hplanck_eV, hplanck_cgs, kboltz_cgs
-from .radiative_transfer import radiative_transfer
+from .radiative_transfer import radiative_transfer, radiative_transfer_jit
 from .linelist import Line
 from .species import Species
 from .line_absorption import line_absorption
-from .hydrogen_line_absorption import hydrogen_line_absorption
+from .hydrogen_line_absorption import hydrogen_line_absorption, precompute_hummer_ws
 from .atomic_data import atomic_masses
 from .abundances import A_X_to_absolute
 
@@ -346,6 +348,8 @@ def synthesize_spectrum(
     timings = {} if profile else None
     t_start = time.time() if profile else None
 
+    using_defaults = (partition_funcs is None and ionization_energies_dict is None
+                      and log_equilibrium_constants is None)
     if partition_funcs is None:
         partition_funcs = default_partition_funcs
     if ionization_energies_dict is None:
@@ -417,6 +421,7 @@ def synthesize_spectrum(
     electron_densities = np.zeros(n_layers)
     alpha_ref = np.zeros(n_layers)  # Absorption at reference wavelength
     number_densities_list = []
+    raw_arrays_list = []  # Raw numpy arrays from fast chemical equilibrium
     alpha_cntm_interps = []  # Continuum interpolators for each layer
 
     # Compute chemical equilibrium and continuum for each layer
@@ -428,54 +433,72 @@ def synthesize_spectrum(
         t_cntm_abs = 0.0
         t_source_fn = 0.0
 
+    # Pass 1: chemical equilibrium for all layers
+    if profile:
+        t0 = time.time()
     for i in range(n_layers):
         T_i = T[i]
         ne_i = ne_model[i]
         n_i = n_total[i]
-
-        # Chemical equilibrium
-        if profile:
-            t0 = time.time()
-        ne_calc, n_dict = chemical_equilibrium(
-            T_i, n_i, ne_i, abs_abundances,
-            ionization_energies_dict,
-            partition_funcs,
-            log_equilibrium_constants,
-            electron_density_warn_threshold=1.0
-        )
-        if profile:
-            t_chem_eq += time.time() - t0
-
+        if using_defaults:
+            ne_calc, n_dict, raw_arr = chemical_equilibrium_fast(
+                T_i, n_i, ne_i, abs_abundances,
+                default_chem_eq_data, default_mol_species
+            )
+            raw_arrays_list.append(raw_arr)
+        else:
+            ne_calc, n_dict = chemical_equilibrium(
+                T_i, n_i, ne_i, abs_abundances,
+                ionization_energies_dict,
+                partition_funcs,
+                log_equilibrium_constants,
+                electron_density_warn_threshold=1.0
+            )
         electron_densities[i] = ne_calc
         number_densities_list.append(n_dict)
+    if profile:
+        t_chem_eq = time.time() - t0
 
-        # Compute continuum at coarse grid
-        if profile:
-            t0 = time.time()
-        alpha_cntm_coarse = compute_continuum_absorption(
-            cntm_wavelengths_cm, T_i, ne_calc, n_dict, partition_funcs
-        )
-        if profile:
-            t_cntm_abs += time.time() - t0
+    # Pass 2: continuum absorption — batch all layers at once
+    if profile:
+        t0 = time.time()
+    if using_defaults:
+        # Fast path: vmapped JIT continuum over all layers
+        cntm_frequencies = c_cgs / cntm_wavelengths_cm
+        batch = prepare_continuum_batch_fast(raw_arrays_list, partition_funcs, T)
+        alpha_cntm_all = np.array(batch_continuum_absorption(
+            jnp.asarray(cntm_frequencies),
+            jnp.asarray(T, dtype=np.float64),
+            jnp.asarray(electron_densities, dtype=np.float64),
+            batch
+        ))
+        for i in range(n_layers):
+            alpha_cntm_interp = interp1d(cntm_wavelengths_cm, alpha_cntm_all[i],
+                                          kind='linear', fill_value='extrapolate')
+            alpha_cntm_interps.append(alpha_cntm_interp)
+            alpha[i, :] = alpha_cntm_interp(wavelengths_cm)
+            alpha_ref[i] = alpha_cntm_interp(lambda_ref_cm)
+    else:
+        for i in range(n_layers):
+            alpha_cntm_coarse = compute_continuum_absorption(
+                cntm_wavelengths_cm, T[i], electron_densities[i],
+                number_densities_list[i], partition_funcs
+            )
+            alpha_cntm_interp = interp1d(cntm_wavelengths_cm, alpha_cntm_coarse,
+                                          kind='linear', fill_value='extrapolate')
+            alpha_cntm_interps.append(alpha_cntm_interp)
+            alpha[i, :] = alpha_cntm_interp(wavelengths_cm)
+            alpha_ref[i] = alpha_cntm_interp(lambda_ref_cm)
+    if profile:
+        t_cntm_abs = time.time() - t0
 
-        # Create interpolator for this layer's continuum
-        alpha_cntm_interp = interp1d(cntm_wavelengths_cm, alpha_cntm_coarse,
-                                      kind='linear', fill_value='extrapolate')
-        alpha_cntm_interps.append(alpha_cntm_interp)
-
-        # Interpolate continuum to synthesis wavelengths
-        alpha[i, :] = alpha_cntm_interp(wavelengths_cm)
-
-        # Compute absorption at reference wavelength (5000 Å)
-        alpha_ref[i] = alpha_cntm_interp(lambda_ref_cm)
-
-        # Source function = Planck blackbody function B_λ(T)
-        # Using wavelength-based Planck function to match Julia's convention
-        if profile:
-            t0 = time.time()
-        source_function[:, i] = blackbody(T_i, wavelengths_cm)
-        if profile:
-            t_source_fn += time.time() - t0
+    # Source function (fast: vectorized blackbody over all layers and wavelengths)
+    if profile:
+        t0 = time.time()
+    for i in range(n_layers):
+        source_function[:, i] = blackbody(T[i], wavelengths_cm)
+    if profile:
+        t_source_fn = time.time() - t0
 
     # Convert number densities from list of dicts to dict of arrays
     all_species = set()
@@ -487,7 +510,7 @@ def synthesize_spectrum(
     }
 
     if profile:
-        timings['layer_loop'] = time.time() - t_loop_start
+        timings['layer_loop'] = t_chem_eq + t_cntm_abs + t_source_fn
         timings['chemical_equilibrium'] = t_chem_eq
         timings['continuum_absorption'] = t_cntm_abs
         timings['source_function'] = t_source_fn
@@ -498,16 +521,18 @@ def synthesize_spectrum(
     if return_continuum:
         if verbose:
             print(f"Computing continuum spectrum...")
-        flux_cntm, _ = radiative_transfer(
-            alpha.T,  # Transpose to (n_wavelengths, n_layers)
-            source_function,
-            spatial_coord,
-            log_tau_ref,
-            alpha_ref=alpha_ref,
-            spherical=spherical,
-            intensity_scheme="linear_flux_only",
-            use_expint_flux=True
-        )
+        if using_defaults and not spherical:
+            flux_cntm, _ = radiative_transfer_jit(
+                jnp.asarray(alpha.T), jnp.asarray(source_function),
+                jnp.asarray(spatial_coord), jnp.asarray(log_tau_ref),
+                jnp.asarray(alpha_ref)
+            )
+        else:
+            flux_cntm, _ = radiative_transfer(
+                alpha.T, source_function, spatial_coord, log_tau_ref,
+                alpha_ref=alpha_ref, spherical=spherical,
+                intensity_scheme="linear_flux_only", use_expint_flux=True
+            )
         # Convert from erg/s/cm^5 to erg/s/cm^4/Å (same as flux below)
         continuum_flux = flux_cntm * 1e-8
 
@@ -521,22 +546,31 @@ def synthesize_spectrum(
             print(f"Adding hydrogen line absorption...")
         if profile:
             t_h_lines_start = time.time()
+
+        # Batch-precompute occupation probabilities for all layers (much faster than per-layer)
+        if raw_arrays_list:
+            nH_I_arr = np.array([ra['neutral_dens'][0] for ra in raw_arrays_list])
+            nHe_I_arr = np.array([ra['neutral_dens'][1] for ra in raw_arrays_list])
+        else:
+            nH_I_arr = np.array([nd.get(Species("H_I"), 0.0) for nd in number_densities_list])
+            nHe_I_arr = np.array([nd.get(Species("He_I"), 0.0) for nd in number_densities_list])
+        ws_all = precompute_hummer_ws(T, nH_I_arr, nHe_I_arr, electron_densities)
+
+        pf_H_I = partition_funcs[Species("H_I")]
+        # Vectorized partition function evaluation (avoids 56 JAX scalar dispatches)
+        log_T_arr = np.log(T)
+        if hasattr(pf_H_I, 'numpy_eval'):
+            U_H_I_arr = pf_H_I.numpy_eval(log_T_arr)
+        else:
+            U_H_I_arr = np.array([float(pf_H_I(lt)) for lt in log_T_arr])
         for i in range(n_layers):
             T_i = T[i]
             ne_i = electron_densities[i]
-            n_dict = number_densities_list[i]
-
-            nH_I = n_dict.get(Species("H_I"), 0.0)
-            nHe_I = n_dict.get(Species("He_I"), 0.0)
-            U_H_I = partition_funcs[Species("H_I")](jnp.log(T_i))
-
-            # Get vmic for this layer (if array) or use scalar
             xi = vmic_cm_s
-
-            # Add hydrogen line absorption
             alpha_H = hydrogen_line_absorption(
-                wavelengths_cm, T_i, ne_i, nH_I, nHe_I, U_H_I, xi,
-                h_line_window_cm, use_MHD=True
+                wavelengths_cm, T_i, ne_i, nH_I_arr[i], nHe_I_arr[i],
+                float(U_H_I_arr[i]), xi,
+                h_line_window_cm, use_MHD=True, ws=ws_all[i]
             )
             alpha[i, :] += alpha_H
         if profile:
@@ -577,16 +611,18 @@ def synthesize_spectrum(
     if profile:
         t_rt_start = time.time()
 
-    flux_nu, _ = radiative_transfer(
-        alpha.T,  # Transpose to (n_wavelengths, n_layers)
-        source_function,
-        spatial_coord,
-        log_tau_ref,
-        alpha_ref=alpha_ref,
-        spherical=spherical,
-        intensity_scheme="linear_flux_only",
-        use_expint_flux=True
-    )
+    if using_defaults and not spherical:
+        flux_nu, _ = radiative_transfer_jit(
+            jnp.asarray(alpha.T), jnp.asarray(source_function),
+            jnp.asarray(spatial_coord), jnp.asarray(log_tau_ref),
+            jnp.asarray(alpha_ref)
+        )
+    else:
+        flux_nu, _ = radiative_transfer(
+            alpha.T, source_function, spatial_coord, log_tau_ref,
+            alpha_ref=alpha_ref, spherical=spherical,
+            intensity_scheme="linear_flux_only", use_expint_flux=True
+        )
 
     # Convert from erg/s/cm^5 (per cm wavelength) to erg/s/cm^4/Å (per Angstrom)
     # Since we use B_λ (wavelength-based Planck), we just multiply by 1e-8

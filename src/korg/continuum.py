@@ -1427,3 +1427,310 @@ def total_continuum_absorption(nu, T, ne, number_densities, partition_funcs):
     alpha += rayleigh(nu, nH_I, nHe_I, nH2)
 
     return alpha
+
+
+# Fixed species lists for fast batch continuum (order must match prepare_continuum_batch output)
+_PEACH_SPECIES = ['He_II', 'C_II', 'Si_II', 'Mg_II']
+
+
+@jax.jit
+def _total_continuum_fast(nu, T, ne, U_H_I, U_He_I,
+                           nH_I, nH_II, nHe_I, nH2,
+                           n_peach, n_Z1_ff, n_Z2_ff,
+                           metal_bf_dens, metal_bf_tables,
+                           nu_grid, logT_grid):
+    """
+    JIT-compiled continuum absorption with pre-extracted scalar inputs.
+
+    Avoids per-call Python dict iteration by receiving pre-summed densities.
+    n_peach: (4,) array [nHe_II, nC_II, nSi_II, nMg_II]
+    n_Z1_ff: sum of non-Peach singly-ionized densities
+    n_Z2_ff: sum of doubly-ionized densities
+    metal_bf_dens: (n_metal,) array of metal BF species densities (neutral then ionized)
+    metal_bf_tables: (n_metal, n_logT, n_nu) array of ln(sigma) tables
+    """
+    from . import peach1970 as _peach
+
+    nH_I_div_U = nH_I / jnp.clip(U_H_I, 1e-99, jnp.inf)
+    nHe_I_div_U = nHe_I / jnp.clip(U_He_I, 1e-99, jnp.inf)
+
+    alpha = jnp.zeros_like(nu)
+
+    # Hydrogen and helium continua
+    alpha += H_I_bf(nu, T, nH_I, nHe_I, ne, 1.0 / jnp.clip(U_H_I, 1e-99, jnp.inf))
+    alpha += Hminus_bf(nu, T, nH_I_div_U, ne)
+    alpha += Hminus_ff(nu, T, nH_I_div_U, ne)
+    alpha += H2plus_bf_and_ff(nu, T, nH_I, nH_II)
+    alpha += Heminus_ff(nu, T, nHe_I_div_U, ne)
+
+    # Positive ion free-free: Peach 1970 species
+    peach_funcs = [_peach.D_He_II, _peach.D_C_II, _peach.D_Si_II, _peach.D_Mg_II]
+    peach_charges = [1, 1, 1, 1]
+    for i, (D_func, charge) in enumerate(zip(peach_funcs, peach_charges)):
+        ndens = n_peach[i]
+        sigma = hplanck_eV * nu / (Rydberg_eV * charge**2)
+        D = D_func(T, sigma)
+        alpha += hydrogenic_ff_absorption(nu, T, charge, ndens, ne) * (1.0 + D)
+
+    # Positive ion free-free: hydrogenic (accumulated Z=1 and Z=2)
+    alpha += hydrogenic_ff_absorption(nu, T, 1, n_Z1_ff, ne)
+    alpha += hydrogenic_ff_absorption(nu, T, 2, n_Z2_ff, ne)
+
+    # Metal bound-free
+    logT = jnp.log10(T)
+    i_logT = jnp.clip(jnp.searchsorted(logT_grid, logT, side='right') - 1,
+                      0, logT_grid.shape[0] - 2)
+    i_nu = jnp.clip(jnp.searchsorted(nu_grid, nu, side='right') - 1,
+                    0, nu_grid.shape[0] - 2)
+    logT0 = logT_grid[i_logT]; logT1 = logT_grid[i_logT + 1]
+    nu0 = nu_grid[i_nu]; nu1 = nu_grid[i_nu + 1]
+    t_logT = jnp.where(logT1 != logT0, (logT - logT0) / (logT1 - logT0), 0.0)
+    t_nu = jnp.where(nu1 != nu0, (nu - nu0) / (nu1 - nu0), 0.0)
+
+    def add_one_metal(acc, args):
+        ndens, table = args
+        log_s00 = table[i_logT, i_nu]
+        log_s01 = table[i_logT, i_nu + 1]
+        log_s10 = table[i_logT + 1, i_nu]
+        log_s11 = table[i_logT + 1, i_nu + 1]
+        log_sigma = ((1 - t_logT) * (1 - t_nu) * log_s00
+                     + (1 - t_logT) * t_nu * log_s01
+                     + t_logT * (1 - t_nu) * log_s10
+                     + t_logT * t_nu * log_s11)
+        log_alpha = jnp.log(jnp.clip(ndens, 1e-99, jnp.inf)) + log_sigma - 18.0 * jnp.log(10.0)
+        return acc + jnp.where(jnp.isfinite(log_sigma), jnp.exp(log_alpha), 0.0), None
+
+    alpha, _ = jax.lax.scan(add_one_metal, alpha, (metal_bf_dens, metal_bf_tables))
+
+    # Scattering
+    alpha += electron_scattering(ne)
+    alpha += rayleigh(nu, nH_I, nHe_I, nH2)
+    return alpha
+
+
+def prepare_continuum_batch(number_densities_list, partition_funcs, T_arr):
+    """
+    Pre-extract per-layer continuum inputs from chemical equilibrium results.
+
+    Returns numpy arrays suitable for _total_continuum_fast via vmap.
+    Called once after all chemical equilibria are solved.
+    """
+    import numpy as np
+    from .peach1970 import DEPARTURE_COEFFICIENTS
+
+    n_layers = len(number_densities_list)
+
+    # Build ordered metal BF species list from cross-section data
+    bf_data = get_metal_bf_cross_sections()
+    metal_species_order = list(bf_data['species'].keys())
+    n_metal = len(metal_species_order)
+    nu_grid = bf_data['nu_grid']
+    logT_grid = bf_data['logT_grid']
+    metal_bf_tables = jnp.stack([bf_data['species'][s] for s in metal_species_order])
+
+    # Identify which species keys map to which continuum inputs
+    # Keys in number_densities use string format 'H_I', 'Fe_II', etc.
+    def sp_key(sp):
+        return str(sp).replace(' ', '_')
+
+    # Pre-evaluate partition functions at each T
+    pf_H_I = next((v for k, v in partition_funcs.items() if sp_key(k) == 'H_I'), None)
+    pf_He_I = next((v for k, v in partition_funcs.items() if sp_key(k) == 'He_I'), None)
+    U_H_I_arr = np.array([float(pf_H_I(np.log(T))) for T in T_arr]) if pf_H_I else np.ones(n_layers)
+    U_He_I_arr = np.array([float(pf_He_I(np.log(T))) for T in T_arr]) if pf_He_I else np.ones(n_layers)
+
+    # Per-layer density arrays
+    nH_I_arr = np.zeros(n_layers); nH_II_arr = np.zeros(n_layers)
+    nHe_I_arr = np.zeros(n_layers); nH2_arr = np.zeros(n_layers)
+    n_peach_arr = np.zeros((n_layers, 4))
+    n_Z1_ff_arr = np.zeros(n_layers); n_Z2_ff_arr = np.zeros(n_layers)
+    metal_bf_dens_arr = np.zeros((n_layers, n_metal))
+
+    peach_keys = _PEACH_SPECIES  # ['He_II', 'C_II', 'Si_II', 'Mg_II']
+
+    for i, nd in enumerate(number_densities_list):
+        nd_str = {sp_key(k): v for k, v in nd.items()}
+        nH_I_arr[i] = nd_str.get('H_I', 0.0)
+        nH_II_arr[i] = nd_str.get('H_II', 0.0)
+        nHe_I_arr[i] = nd_str.get('He_I', 0.0)
+        nH2_arr[i] = nd_str.get('H2', 0.0)
+        for j, pk in enumerate(peach_keys):
+            n_peach_arr[i, j] = nd_str.get(pk, 0.0)
+        for j, ms in enumerate(metal_species_order):
+            metal_bf_dens_arr[i, j] = nd_str.get(ms, 0.0)
+        # Z=1 FF (non-Peach) and Z=2 FF
+        for key, val in nd_str.items():
+            charge = _parse_species_charge(key)
+            if charge == 1 and key not in peach_keys and key != 'H_II':
+                n_Z1_ff_arr[i] += val
+            elif charge == 2:
+                n_Z2_ff_arr[i] += val
+        # Add H_II to Z=1 (it's the most important)
+        n_Z1_ff_arr[i] += nd_str.get('H_II', 0.0)
+
+    return dict(
+        U_H_I=jnp.array(U_H_I_arr),
+        U_He_I=jnp.array(U_He_I_arr),
+        nH_I=jnp.array(nH_I_arr),
+        nH_II=jnp.array(nH_II_arr),
+        nHe_I=jnp.array(nHe_I_arr),
+        nH2=jnp.array(nH2_arr),
+        n_peach=jnp.array(n_peach_arr),
+        n_Z1_ff=jnp.array(n_Z1_ff_arr),
+        n_Z2_ff=jnp.array(n_Z2_ff_arr),
+        metal_bf_dens=jnp.array(metal_bf_dens_arr),
+        metal_bf_tables=metal_bf_tables,
+        nu_grid=jnp.array(nu_grid),
+        logT_grid=jnp.array(logT_grid),
+    )
+
+
+# Vmapped version: compute continuum for all layers at once
+_batch_continuum_vmap = jax.vmap(
+    _total_continuum_fast,
+    in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None)
+)
+
+# Pre-computed index mappings for fast raw-array continuum batch
+# Metal BF species: ('Al I', 'C I', 'Ca I', 'Fe I', 'Mg I', 'Na I', 'S I', 'Si I')
+# Format: (Z-1, charge) tuples for indexing into (neutral_dens, ionized_dens, doubly_ionized_dens)
+_METAL_BF_SPECIES_NAMES = None  # populated lazily
+_METAL_BF_IDX = None            # (Z-1, charge) pairs
+_PEACH_IDX = [(1, 1), (5, 1), (13, 1), (11, 1)]  # He_II, C_II, Si_II, Mg_II → (Z-1, charge)
+_H2_MOL_IDX = 50  # index in default_mol_species
+
+def _get_metal_bf_idx():
+    global _METAL_BF_SPECIES_NAMES, _METAL_BF_IDX
+    if _METAL_BF_IDX is not None:
+        return _METAL_BF_SPECIES_NAMES, _METAL_BF_IDX
+    from .atomic_data import atomic_symbols
+    bf_data = get_metal_bf_cross_sections()
+    metal_species_order = list(bf_data['species'].keys())
+    sym_to_Z = {sym: Z for Z, sym in enumerate(atomic_symbols, 1)}
+    roman_to_charge = {'I': 0, 'II': 1, 'III': 2}
+    _METAL_BF_SPECIES_NAMES = metal_species_order
+    _METAL_BF_IDX = []
+    for s in metal_species_order:
+        parts = s.split()
+        Z = sym_to_Z[parts[0]]
+        charge = roman_to_charge[parts[1]]
+        _METAL_BF_IDX.append((Z - 1, charge))
+    return _METAL_BF_SPECIES_NAMES, _METAL_BF_IDX
+
+
+def prepare_continuum_batch_fast(raw_arrays_list, partition_funcs, T_arr):
+    """
+    Fast version of prepare_continuum_batch using pre-extracted raw density arrays.
+
+    raw_arrays_list: list of {'neutral_dens': (92,), 'ionized_dens': (92,),
+                               'doubly_ionized_dens': (92,), 'mol_dens': (n_mol,)} dicts
+    Returns dict of JAX arrays for batch_continuum_absorption.
+    """
+    import numpy as np
+
+    n_layers = len(raw_arrays_list)
+
+    # Build ordered metal BF species list from cross-section data (cached)
+    _, metal_bf_idx = _get_metal_bf_idx()
+    bf_data = get_metal_bf_cross_sections()
+    metal_species_names = list(bf_data['species'].keys())
+    n_metal = len(metal_species_names)
+    nu_grid = bf_data['nu_grid']
+    logT_grid = bf_data['logT_grid']
+    metal_bf_tables = jnp.stack([bf_data['species'][s] for s in metal_species_names])
+
+    # Partition functions for H I and He I (use numpy_eval for vectorized speed)
+    def sp_key(sp):
+        return str(sp).replace(' ', '_')
+    pf_H_I = next((v for k, v in partition_funcs.items() if sp_key(k) == 'H_I'), None)
+    pf_He_I = next((v for k, v in partition_funcs.items() if sp_key(k) == 'He_I'), None)
+    log_T_arr = np.log(T_arr)
+    if pf_H_I is not None:
+        U_H_I_arr = np.asarray(pf_H_I.numpy_eval(log_T_arr) if hasattr(pf_H_I, 'numpy_eval')
+                               else pf_H_I(log_T_arr))
+    else:
+        U_H_I_arr = np.ones(n_layers)
+    if pf_He_I is not None:
+        U_He_I_arr = np.asarray(pf_He_I.numpy_eval(log_T_arr) if hasattr(pf_He_I, 'numpy_eval')
+                                else pf_He_I(log_T_arr))
+    else:
+        U_He_I_arr = np.ones(n_layers)
+
+    # Build arrays from raw_arrays list without Species str() overhead
+    nH_I_arr = np.array([ra['neutral_dens'][0] for ra in raw_arrays_list])
+    nH_II_arr = np.array([ra['ionized_dens'][0] for ra in raw_arrays_list])
+    nHe_I_arr = np.array([ra['neutral_dens'][1] for ra in raw_arrays_list])
+    nH2_arr = np.array([ra['mol_dens'][_H2_MOL_IDX] if len(ra['mol_dens']) > _H2_MOL_IDX else 0.0
+                        for ra in raw_arrays_list])
+
+    # Peach FF species: He_II, C_II, Si_II, Mg_II
+    n_peach_arr = np.zeros((n_layers, 4))
+    for i, ra in enumerate(raw_arrays_list):
+        for j, (z_idx, charge) in enumerate(_PEACH_IDX):
+            arr = ra['ionized_dens'] if charge == 1 else ra['doubly_ionized_dens']
+            n_peach_arr[i, j] = arr[z_idx]
+
+    # Metal BF densities
+    metal_bf_dens_arr = np.zeros((n_layers, n_metal))
+    for i, ra in enumerate(raw_arrays_list):
+        for j, (z_idx, charge) in enumerate(metal_bf_idx):
+            if charge == 0:
+                metal_bf_dens_arr[i, j] = ra['neutral_dens'][z_idx]
+            elif charge == 1:
+                metal_bf_dens_arr[i, j] = ra['ionized_dens'][z_idx]
+            else:
+                metal_bf_dens_arr[i, j] = ra['doubly_ionized_dens'][z_idx]
+
+    # Z=1 FF (all singly ionized except Peach + H_II) and Z=2 FF
+    peach_z_idx = {z_idx for z_idx, _ in _PEACH_IDX}
+    n_Z1_ff_arr = np.array([ra['ionized_dens'].sum() - ra['ionized_dens'][1] for ra in raw_arrays_list])
+    n_Z2_ff_arr = np.array([ra['doubly_ionized_dens'].sum() for ra in raw_arrays_list])
+
+    return dict(
+        U_H_I=jnp.array(U_H_I_arr),
+        U_He_I=jnp.array(U_He_I_arr),
+        nH_I=jnp.array(nH_I_arr),
+        nH_II=jnp.array(nH_II_arr),
+        nHe_I=jnp.array(nHe_I_arr),
+        nH2=jnp.array(nH2_arr),
+        n_peach=jnp.array(n_peach_arr),
+        n_Z1_ff=jnp.array(n_Z1_ff_arr),
+        n_Z2_ff=jnp.array(n_Z2_ff_arr),
+        metal_bf_dens=jnp.array(metal_bf_dens_arr),
+        metal_bf_tables=metal_bf_tables,
+        nu_grid=jnp.array(nu_grid),
+        logT_grid=jnp.array(logT_grid),
+    )
+
+
+def batch_continuum_absorption(nu, T_arr, ne_arr, batch_inputs):
+    """
+    Compute continuum absorption for all atmosphere layers at once (vmapped).
+
+    Parameters
+    ----------
+    nu : array (n_wl,)
+        Frequency grid in Hz
+    T_arr : array (n_layers,)
+        Temperature per layer
+    ne_arr : array (n_layers,)
+        Electron density per layer
+    batch_inputs : dict
+        Output of prepare_continuum_batch()
+
+    Returns
+    -------
+    array (n_layers, n_wl)
+        Continuum absorption coefficient per layer
+    """
+    return _batch_continuum_vmap(
+        nu, T_arr, ne_arr,
+        batch_inputs['U_H_I'], batch_inputs['U_He_I'],
+        batch_inputs['nH_I'], batch_inputs['nH_II'],
+        batch_inputs['nHe_I'], batch_inputs['nH2'],
+        batch_inputs['n_peach'],
+        batch_inputs['n_Z1_ff'], batch_inputs['n_Z2_ff'],
+        batch_inputs['metal_bf_dens'],
+        batch_inputs['metal_bf_tables'],
+        batch_inputs['nu_grid'], batch_inputs['logT_grid'],
+    )

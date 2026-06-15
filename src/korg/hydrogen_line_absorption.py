@@ -222,7 +222,7 @@ def brackett_oscillator_strength(n: int, m: int) -> float:
 
 
 # Griem 1960 Knm constants for Brackett lines
-_GREIM_KMN_TABLE = jnp.array([
+_GREIM_KMN_TABLE = np.array([
     [0.0001716, 0.0090190, 0.1001000, 0.5820000],
     [0.0005235, 0.0177200, 0.1710000, 0.8660000],
     [0.0008912, 0.0250700, 0.2230000, 1.0200000]
@@ -246,17 +246,15 @@ def greim_1960_Knm(n: int, m: int) -> float:
     Returns:
         Knm constant
     """
-    # Table lookup value (for m-n <= 3 and n <= 4)
-    # Julia is 1-indexed, Python is 0-indexed
-    table_value = _GREIM_KMN_TABLE[jnp.minimum(m - n - 1, 2), jnp.minimum(n - 1, 3)]
-
     # Analytical formula (Griem 1960 equation 33)
     # 1 / (1 + 0.13/(m-n)) is probably a Kurucz addition.
     analytical_value = 5.5e-5 * n**4 * m**4 / (m**2 - n**2) / (1 + 0.13 / (m - n))
 
     # Use table if (m - n <= 3) and (n <= 4), otherwise use formula
-    use_table = (m - n <= 3) & (n <= 4)
-    return jnp.where(use_table, table_value, analytical_value)
+    if (m - n <= 3) and (n <= 4):
+        # Table lookup using plain Python indexing (n, m are ints here)
+        return float(_GREIM_KMN_TABLE[min(m - n - 1, 2), min(n - 1, 3)])
+    return analytical_value
 
 
 # Holtsmark profile constants
@@ -805,7 +803,8 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
                                nH_I: float, nHe_I: float, UH_I: float, xi: float,
                                window_size: float, use_MHD: bool = True,
                                stark_profiles: dict = None,
-                               use_jit: bool = True) -> np.ndarray:
+                               use_jit: bool = True,
+                               ws: jnp.ndarray = None) -> np.ndarray:
     """
     Calculate the opacity coefficient from hydrogen lines.
 
@@ -839,11 +838,13 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
     else:
         n_max = 20  # Default to including Brackett lines up to n=20
 
-    # Precalculate occupation probabilities if using MHD
-    if use_MHD:
-        ws = jnp.array([hummer_mihalas_w(T, n, nH_I, nHe_I, ne) for n in range(1, n_max + 1)])
-    else:
-        ws = jnp.ones(n_max)
+    # Precalculate occupation probabilities if using MHD (can be passed in for batch efficiency)
+    if ws is None:
+        if use_MHD:
+            ns = jnp.arange(1, n_max + 1, dtype=jnp.float64)
+            ws = jax.vmap(lambda n_eff: hummer_mihalas_w(T, n_eff, nH_I, nHe_I, ne))(ns)
+        else:
+            ws = jnp.ones(n_max)
 
     # Convert wavelengths to JAX array
     wavelengths_jax = jnp.array(wavelengths)
@@ -898,10 +899,18 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
     E_low = RydbergH_eV * (1 - 1 / n**2)
     beta = 1 / (kboltz_eV * T)
 
+    # Pre-compute Brackett line centers (Python scalars, no JAX)
+    brackett_lambda0s = [hplanck_eV * c_cgs / (RydbergH_eV * (1/n**2 - 1/m**2)) for m in range(5, n_max+1)]
+
     alphas_brackett = jnp.zeros_like(wavelengths_jax)
-    for m in range(5, n_max + 1):
+    for idx, m in enumerate(range(5, n_max + 1)):
+        λ0 = brackett_lambda0s[idx]
+
+        # Early-skip: line center is far from wavelength range (pure Python, no JAX)
+        if λ0 < wavelengths[0] or λ0 > wavelengths[-1]:
+            continue
+
         E = RydbergH_eV * (1 / n**2 - 1 / m**2)
-        λ0 = hplanck_eV * c_cgs / E  # cm
         levels_factor = ws[m - 1] * jnp.exp(-beta * E_low) * (1 - jnp.exp(-beta * E)) / UH_I
         gf = 2 * n**2 * brackett_oscillator_strength(n, m)
         amplitude = gf * nH_I * sigma_line(λ0) * levels_factor
@@ -910,6 +919,9 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
         stark_profile_itp, stark_window = bracket_line_interpolator(
             m, λ0, T, ne, xi, wavelengths[0], wavelengths[-1]
         )
+
+        if stark_window == 0.0:
+            continue
 
         # Evaluate interpolated profile for all wavelengths with masking
         in_window = jnp.abs(wavelengths_jax - λ0) < stark_window
@@ -920,3 +932,25 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
     alphas_total = alphas_stehle + alphas_brackett
 
     return np.array(alphas_total)
+
+
+_N_MAX_HUMMER = 20
+
+@jax.jit
+def _hummer_mihalas_w_all_n(T, nH_I, nHe_I, ne):
+    """Compute all occupation probabilities for n=1..N_MAX_HUMMER at once."""
+    ns = jnp.arange(1, _N_MAX_HUMMER + 1, dtype=jnp.float64)
+    return jax.vmap(lambda n_eff: hummer_mihalas_w(T, n_eff, nH_I, nHe_I, ne))(ns)
+
+
+_hummer_batch_all_layers = jax.vmap(_hummer_mihalas_w_all_n)
+
+
+def precompute_hummer_ws(T_arr, nH_I_arr, nHe_I_arr, ne_arr):
+    """Batch-compute occupation probabilities for all layers. Returns (n_layers, 20) array."""
+    return _hummer_batch_all_layers(
+        jnp.asarray(T_arr, dtype=jnp.float64),
+        jnp.asarray(nH_I_arr, dtype=jnp.float64),
+        jnp.asarray(nHe_I_arr, dtype=jnp.float64),
+        jnp.asarray(ne_arr, dtype=jnp.float64),
+    )

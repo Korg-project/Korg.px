@@ -44,10 +44,16 @@ class LazyPartitionFunction:
         Creates interpolator on first call.
         """
         if self._interpolator is None:
-            # Only create the spline when first needed
             self._interpolator = cubic_spline(self._log_temps, self._values,
                                              extrapolate=True)
         return self._interpolator(log_T)
+
+    def numpy_eval(self, log_T):
+        """Evaluate using numpy (no JAX, for fast precomputation)."""
+        if self._interpolator is None:
+            self._interpolator = cubic_spline(self._log_temps, self._values,
+                                             extrapolate=True)
+        return self._interpolator.numpy_eval(log_T)
 
 
 
@@ -785,6 +791,17 @@ def setup_partition_funcs_and_equilibrium_constants():
 
 # Load default partition functions and equilibrium constants at module import
 default_partition_funcs, default_log_equilibrium_constants = setup_partition_funcs_and_equilibrium_constants()
+
+# Pre-compute chemical equilibrium data grid (fast vectorized evaluation).
+# Building this once at import time avoids ~500s of scalar Python calls later.
+from .statmech import precompute_chemical_equilibrium_data as _precompute_chem_eq
+default_chem_eq_data = _precompute_chem_eq(
+    load_ionization_energies(),
+    default_partition_funcs,
+    default_log_equilibrium_constants,
+)
+# Ordered list of molecular species matching default_chem_eq_data.mol_* arrays
+default_mol_species = list(default_log_equilibrium_constants.keys())
 
 
 def load_default_linelist(reference_wavelength_cm: float = 5e-5):

@@ -6,6 +6,7 @@ DataInterpolations.jl (MIT license). See source for full license details.
 """
 
 import jax.numpy as jnp
+import numpy as np
 from jax.scipy.linalg import solve
 from dataclasses import dataclass
 from typing import Optional
@@ -75,6 +76,23 @@ class CubicSpline:
         D = ((self.u[i] / self.h[i+1] - self.z[i] * self.h[i+1] / 6) *
              (self.t[i+1] - t_eval))
 
+        return I + C + D
+
+    def numpy_eval(self, t_eval):
+        """Evaluate the spline using numpy (avoids JAX compilation overhead)."""
+        t = np.asarray(self.t)
+        u = np.asarray(self.u)
+        h = np.asarray(self.h)
+        z = np.asarray(self.z)
+        t_eval = np.asarray(t_eval)
+        if self.extrapolate:
+            t_eval = np.clip(t_eval, t[0], t[-1])
+        i = np.searchsorted(t, t_eval, side='right') - 1
+        i = np.clip(i, 0, len(t) - 2)
+        I = (z[i] * (t[i+1] - t_eval)**3 / (6 * h[i+1]) +
+             z[i+1] * (t_eval - t[i])**3 / (6 * h[i+1]))
+        C = ((u[i+1] / h[i+1] - z[i+1] * h[i+1] / 6) * (t_eval - t[i]))
+        D = ((u[i] / h[i+1] - z[i] * h[i+1] / 6) * (t[i+1] - t_eval))
         return I + C + D
 
     def cumulative_integral(self, t1, t2, num_points=None):
@@ -182,43 +200,32 @@ def cubic_spline(t, u, extrapolate=False):
     >>> spline = cubic_spline(t, u)
     >>> spline(1.5)  # Evaluate at x=1.5
     """
-    t = jnp.asarray(t)
-    u = jnp.asarray(u)
+    from scipy.linalg import solve_banded
 
-    n = len(t) - 1
+    t_np = np.asarray(t, dtype=np.float64)
+    u_np = np.asarray(u, dtype=np.float64)
 
-    # Compute differences h
-    h_inner = jnp.diff(t)
-    h = jnp.concatenate([jnp.array([0.0]), h_inner, jnp.array([0.0])])
+    n = len(t_np) - 1
 
-    # Build tridiagonal system
-    # Lower diagonal
+    # Compute differences h (numpy, no JAX overhead)
+    h_inner = np.diff(t_np)
+    h = np.concatenate([[0.0], h_inner, [0.0]])
+
+    # Right-hand side (vectorized, no Python loop)
+    d = np.zeros(n + 1)
+    d[1:n] = (6 * (u_np[2:n+1] - u_np[1:n]) / h[2:n+1]
+              - 6 * (u_np[1:n] - u_np[0:n-1]) / h[1:n])
+
+    # Solve banded tridiagonal system using scipy (O(n), avoids n×n JAX matrix)
+    # ab format: [upper_diag, main_diag, lower_diag], each padded appropriately
     dl = h[1:n+1]
-    # Main diagonal
     d_main = 2.0 * (h[0:n+1] + h[1:n+2])
-    # Upper diagonal
     du = h[1:n+1]
+    ab = np.zeros((3, n + 1))
+    ab[0, 1:] = du        # upper diagonal (offset right)
+    ab[1, :] = d_main     # main diagonal
+    ab[2, :-1] = dl       # lower diagonal (offset left)
+    z = solve_banded((1, 1), ab, d)
 
-    # Right-hand side
-    d = jnp.zeros(n + 1, dtype=u.dtype)
-    for i in range(1, n):
-        d = d.at[i].set(
-            6 * (u[i+1] - u[i]) / h[i+1] - 6 * (u[i] - u[i-1]) / h[i]
-        )
-    # Natural spline boundary conditions (d[0] = d[n] = 0)
-
-    # Solve tridiagonal system: tA @ z = d
-    # Construct the full tridiagonal matrix manually
-    size = n + 1
-    tA = jnp.zeros((size, size))
-
-    # Main diagonal
-    tA = tA.at[jnp.arange(size), jnp.arange(size)].set(d_main)
-    # Upper diagonal (du has length n, goes in positions [0,1], [1,2], ..., [n-1,n])
-    tA = tA.at[jnp.arange(size-1), jnp.arange(1, size)].set(du)
-    # Lower diagonal (dl has length n, goes in positions [1,0], [2,1], ..., [n,n-1])
-    tA = tA.at[jnp.arange(1, size), jnp.arange(size-1)].set(dl)
-
-    z = solve(tA, d)
-
-    return CubicSpline(t, u, h[0:n+1], z, extrapolate)
+    return CubicSpline(jnp.asarray(t_np), jnp.asarray(u_np),
+                       jnp.asarray(h[:n+1]), jnp.asarray(z), extrapolate)
