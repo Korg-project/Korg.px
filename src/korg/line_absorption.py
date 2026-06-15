@@ -715,7 +715,12 @@ def _line_absorption_fast(
     # array (no Python per-line overhead, XLA-fused). Scatter uses numpy slice-add.
     _voigt_jit = jax.jit(_voigt_profile_jax)
 
-    wl_spacing = (wl_np[-1] - wl_np[0]) / max(n_wl - 1, 1)
+    # For non-contiguous grids (concatenated wavelength windows), the global
+    # first-to-last spacing is far larger than the actual pixel spacing.
+    # Use the median adjacent spacing so line windows are correctly sized
+    # regardless of whether the grid has gaps.
+    diffs = np.diff(wl_np)
+    wl_spacing = float(np.median(diffs)) if len(diffs) > 0 else float(wl_np[-1] - wl_np[0])
     # Clip to n_wl so lines with huge windows (e.g., tiny continuum opacity) still
     # land in the last bucket rather than silently dropping.
     max_wins_px = np.clip(
