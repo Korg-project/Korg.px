@@ -37,6 +37,13 @@ from .artifacts import (
 try:
     from .synthesis import synthesize, load_synthesis_data, save_synthesis_data
     from .marcs_interpolation import interpolate_marcs
+    from .synthesis_preparation import (
+        prepare_wavelength_grid,
+        preprocess_linelist,
+        prepare_atmosphere,
+        PreparedLinelist,
+        AtmosphereArrays,
+    )
 except (ImportError, FileNotFoundError) as e:
     import warnings
     warnings.warn(f"Could not import synthesis functions: {e}")
