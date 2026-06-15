@@ -423,13 +423,15 @@ Notes:
 
 ## Test Results Summary
 
-Tests run against Julia reference data and JIT compatibility (`tests/test_julia_reference.py`, `tests/test_atmosphere.py`, `tests/test_radiative_transfer.py`, `tests/test_line_absorption_jit.py`, `tests/test_hydrogen_brackett_jit.py`, `tests/test_hydrogen_full_jit.py`, and `tests/test_synthesis_jit.py`):
-- **335 passed** (matching Julia to better than 1e-6 precision, or 1% for E2 approximation)
+Tests run against Julia reference data and JIT compatibility (`tests/test_julia_reference.py`, `tests/test_atmosphere.py`, `tests/test_radiative_transfer.py`, `tests/test_line_absorption_jit.py`, `tests/test_hydrogen_brackett_jit.py`, `tests/test_hydrogen_full_jit.py`, `tests/test_synthesis_jit.py`, `tests/test_rt_reference.py`, `tests/test_continuum_reference.py`, `tests/test_statmech_extended_reference.py`, and `tests/test_linelist_extended_reference.py`):
+- **496 passed** (matching Julia to better than 1e-6 precision, or 1% for E2 approximation)
+  - Includes Julia reference comparisons for: saha_ion_weights, get_log_nK, exponential_integral_2, expint_transfer_integral_core, H_I_bf, H2plus_bf_and_ff, line_class, approximate_radiative_gamma, approximate_gammas, line_explicit_broadening, chemical_equilibrium, total_continuum_absorption, hydrogen_line_absorption (brackett/hummer_mihalas/holtsmark), apply_LSF, apply_rotation, compute_LSF_matrix, generate_mu_grid, compute_I_linear_flux_only, compute_F_flux_only_expint, blackbody
+  - 109 new tests from 4 new test files added in this session
   - Includes 20 line_absorption tests with full JIT compatibility testing
   - Includes 5 hydrogen_line_absorption Brackett-only tests with full JIT compatibility
   - Full hydrogen_line_absorption (Stehlé + Brackett) is now fully JIT-compatible
   - Includes 5 synthesis_jit tests for JIT-compatible continuum-only synthesis
-- **22 skipped** (3 legacy tests using from_string API, 2 metal bf tests skipped due to missing data file, 1 VALD parser test requires pandas, 6 interpolate_marcs tests skipped due to missing MARCS data, 2 chemical equilibrium reference tests skipped due to solver issues in Julia, 5 full hydrogen tests skipped due to missing Stehlé profile data, 2 synthesis tests skipped due to line absorption bug, 1 synthesis comparison test skipped due to performance)
+- **16 skipped** (3 legacy from_string API, 1 pandas missing, 8 solar synthesis HDF5 missing, 2 synthesis JIT line absorption bug, 2 synthesis comparison timing)
 
 ### Level 0 Passed Tests (all at rtol=1e-6):
 1. **Physical Constants (7)**: c_cgs, hplanck_cgs, kboltz_cgs, electron_mass_cgs, Rydberg_eV, kboltz_eV, hplanck_eV
