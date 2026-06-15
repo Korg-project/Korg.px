@@ -662,10 +662,21 @@ def prepare_stark_profiles_for_jit(stark_profiles: dict, T: float, ne: float) ->
     all_profile_data = []
     all_lambda0_data = []
 
+    # T and ne select which transitions are in-bounds; this mirrors Julia's
+    # `for line in stark_profiles ... continue` and must be concrete control flow.
+    # Coerce both the query point and the grid bounds to Python floats so the
+    # comparison yields a plain Python bool (no JAX tracers), even if this function
+    # happens to run inside an enclosing jax.jit trace.
+    T_val = float(T)
+    ne_val = float(ne)
+
     for transition, line in stark_profiles.items():
-        # Check if within bounds
-        if (line.temps.min() < T < line.temps.max() and
-            line.electron_number_densities.min() < ne < line.electron_number_densities.max()):
+        # Check if within bounds (grid bounds are concrete Python floats on the line)
+        t_min = line.temp_min
+        t_max = line.temp_max
+        ne_min = line.ne_min
+        ne_max = line.ne_max
+        if (t_min < T_val < t_max and ne_min < ne_val < ne_max):
 
             valid_transitions.append(transition)
             lowers.append(line.lower)
@@ -676,10 +687,10 @@ def prepare_stark_profiles_for_jit(stark_profiles: dict, T: float, ne: float) ->
             lambda0_val = line.interpolate_lambda0_jax(T, ne)
             lambda0s.append(lambda0_val)
 
-            temps_mins.append(float(line.temps.min()))
-            temps_maxs.append(float(line.temps.max()))
-            ne_mins.append(float(line.electron_number_densities.min()))
-            ne_maxs.append(float(line.electron_number_densities.max()))
+            temps_mins.append(t_min)
+            temps_maxs.append(t_max)
+            ne_mins.append(ne_min)
+            ne_maxs.append(ne_max)
 
             # Store interpolation grids and data
             all_temps.append(line.temps)
@@ -692,8 +703,11 @@ def prepare_stark_profiles_for_jit(stark_profiles: dict, T: float, ne: float) ->
         return {}, []
 
     profile_data = {
-        'lowers': jnp.array(lowers, dtype=jnp.int32),
-        'uppers': jnp.array(uppers, dtype=jnp.int32),
+        # Quantum numbers stay as concrete numpy ints: the core indexes/uses them as
+        # static Python ints (level energies, ws[upper-1]), so they must never become
+        # JAX tracers even if this runs inside an enclosing jit trace.
+        'lowers': np.asarray(lowers, dtype=np.int64),
+        'uppers': np.asarray(uppers, dtype=np.int64),
         'log_gfs': jnp.array(log_gfs),
         'lambda0s': jnp.array(lambda0s),
         'temps_mins': jnp.array(temps_mins),
@@ -711,6 +725,71 @@ def prepare_stark_profiles_for_jit(stark_profiles: dict, T: float, ne: float) ->
 
 
 @jax.jit
+def _process_one_stehle_line(
+    wavelengths: jnp.ndarray,
+    T: float,
+    ne: float,
+    nH_I: float,
+    UH_I: float,
+    window_size: float,
+    ws: jnp.ndarray,
+    lower: int,
+    upper: int,
+    log_gf: float,
+    λ0: float,
+    temps_grid: jnp.ndarray,
+    nes_grid: jnp.ndarray,
+    log_delta_nu_grid: jnp.ndarray,
+    profile_3d_data: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    JIT-compiled processing of a single Stehlé profile line.
+
+    The per-line interpolation grids (``temps_grid``, ``nes_grid``,
+    ``log_delta_nu_grid``, ``profile_3d_data``) have line-dependent shapes, so this
+    function is called once per concrete line index from a Python-level loop rather
+    than from a traced ``fori_loop`` (which would index Python lists with a tracer).
+
+    Returns:
+        Per-wavelength absorption contribution of this single line [cm^-1].
+    """
+    nus = c_cgs / wavelengths
+    dnu_dlambda = c_cgs / wavelengths**2
+    beta = 1 / (kboltz_eV * T)
+    F0 = 1.25e-9 * ne**(2 / 3)
+
+    # Calculate energy levels and occupation factors
+    Elo = RydbergH_eV * (1 - 1 / lower**2)
+    Eup = RydbergH_eV * (1 - 1 / upper**2)
+
+    # Factor of w because transition can't happen if upper level doesn't exist
+    levels_factor = ws[upper - 1] * (jnp.exp(-beta * Elo) - jnp.exp(-beta * Eup)) / UH_I
+    amplitude = 10.0**log_gf * nH_I * sigma_line(λ0) * levels_factor
+
+    # Calculate Stark-broadened profile for all wavelengths
+    nu0 = c_cgs / λ0
+    scaled_delta_nu = jnp.abs(nus - nu0) / F0
+    # Avoid log(0) by using a small value
+    scaled_delta_nu = jnp.maximum(scaled_delta_nu, jnp.finfo(jnp.float64).tiny)
+    log_scaled_delta_nu = jnp.log(scaled_delta_nu)
+
+    # Vectorized 3D interpolation for all wavelengths
+    log_profile_vals = jax.vmap(
+        lambda log_sdn: _interp_linear_3d_jax(
+            T, ne, log_sdn,
+            temps_grid, nes_grid, log_delta_nu_grid, profile_3d_data
+        )
+    )(log_scaled_delta_nu)
+
+    dIdnu = jnp.exp(log_profile_vals)
+
+    # Apply window masking
+    in_window = jnp.abs(wavelengths - λ0) < window_size
+    contribution = jnp.where(in_window, dIdnu * dnu_dlambda * amplitude, 0.0)
+
+    return contribution
+
+
 def hydrogen_line_absorption_core(
     wavelengths: jnp.ndarray,
     T: float,
@@ -723,9 +802,13 @@ def hydrogen_line_absorption_core(
     n_stehle_lines: int
 ) -> jnp.ndarray:
     """
-    JIT-compiled core function for hydrogen line absorption.
+    Core driver for the Stehlé hydrogen line absorption contribution.
 
-    This function processes Stehlé profiles using JAX operations.
+    The valid transitions and their (line-dependent shape) interpolation grids are
+    concrete Python data known before any tracing happens, so the lines are summed
+    in a static Python loop over concrete indices. Each per-line evaluation is itself
+    JIT-compiled via :func:`_process_one_stehle_line`, keeping the heavy numerical
+    work compiled while avoiding tracer-indexed Python lists.
 
     Args:
         wavelengths: Wavelengths [cm]
@@ -736,65 +819,31 @@ def hydrogen_line_absorption_core(
         window_size: Line window size [cm]
         ws: Occupation probabilities array
         profile_data: Dictionary with line data
-        n_stehle_lines: Number of Stehlé lines to process
+        n_stehle_lines: Number of Stehlé lines to process (concrete int)
 
     Returns:
         Absorption coefficient array [cm^-1]
     """
     n_wl = len(wavelengths)
-    nus = c_cgs / wavelengths
-    dnu_dlambda = c_cgs / wavelengths**2
-    beta = 1 / (kboltz_eV * T)
-    F0 = 1.25e-9 * ne**(2 / 3)
+    alpha = jnp.zeros(n_wl)
 
-    def process_one_stehle_line(i_line, alpha_accum):
-        """Process a single Stehlé profile line."""
-        # Extract line properties
-        lower = profile_data['lowers'][i_line]
-        upper = profile_data['uppers'][i_line]
+    # n_stehle_lines is a concrete Python int, so this loop is statically unrolled.
+    for i_line in range(n_stehle_lines):
+        lower = int(profile_data['lowers'][i_line])
+        upper = int(profile_data['uppers'][i_line])
         log_gf = profile_data['log_gfs'][i_line]
         λ0 = profile_data['lambda0s'][i_line]
 
-        # Get interpolation grids and data for this line
         temps_grid = profile_data['all_temps'][i_line]
         nes_grid = profile_data['all_nes'][i_line]
         log_delta_nu_grid = profile_data['all_log_delta_nu_grids'][i_line]
         profile_3d_data = profile_data['all_profile_data'][i_line]
 
-        # Calculate energy levels and occupation factors
-        Elo = RydbergH_eV * (1 - 1 / lower**2)
-        Eup = RydbergH_eV * (1 - 1 / upper**2)
-
-        # Factor of w because transition can't happen if upper level doesn't exist
-        levels_factor = ws[upper - 1] * (jnp.exp(-beta * Elo) - jnp.exp(-beta * Eup)) / UH_I
-        amplitude = 10.0**log_gf * nH_I * sigma_line(λ0) * levels_factor
-
-        # Calculate Stark-broadened profile for all wavelengths
-        nu0 = c_cgs / λ0
-        scaled_delta_nu = jnp.abs(nus - nu0) / F0
-        # Avoid log(0) by using a small value
-        scaled_delta_nu = jnp.maximum(scaled_delta_nu, jnp.finfo(jnp.float64).tiny)
-        log_scaled_delta_nu = jnp.log(scaled_delta_nu)
-
-        # Vectorized 3D interpolation for all wavelengths
-        log_profile_vals = jax.vmap(
-            lambda log_sdn: _interp_linear_3d_jax(
-                T, ne, log_sdn,
-                temps_grid, nes_grid, log_delta_nu_grid, profile_3d_data
-            )
-        )(log_scaled_delta_nu)
-
-        dIdnu = jnp.exp(log_profile_vals)
-
-        # Apply window masking
-        in_window = jnp.abs(wavelengths - λ0) < window_size
-        contribution = jnp.where(in_window, dIdnu * dnu_dlambda * amplitude, 0.0)
-
-        return alpha_accum + contribution
-
-    # Process all Stehlé lines using fori_loop
-    alpha_init = jnp.zeros(n_wl)
-    alpha = jax.lax.fori_loop(0, n_stehle_lines, process_one_stehle_line, alpha_init)
+        alpha = alpha + _process_one_stehle_line(
+            wavelengths, T, ne, nH_I, UH_I, window_size, ws,
+            lower, upper, log_gf, λ0,
+            temps_grid, nes_grid, log_delta_nu_grid, profile_3d_data,
+        )
 
     return alpha
 
@@ -902,12 +951,28 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
     # Pre-compute Brackett line centers (Python scalars, no JAX)
     brackett_lambda0s = [hplanck_eV * c_cgs / (RydbergH_eV * (1/n**2 - 1/m**2)) for m in range(5, n_max+1)]
 
+    # The Brackett interpolator builds a concrete (numpy) wavelength grid and convolves,
+    # so it needs concrete wavelength bounds. When `wavelengths` is concrete (the normal
+    # synthesis path) we pass the true λmin/λmax to exactly reproduce Julia's trimming of
+    # the profile grid to the synthesis range. When `wavelengths` is a JAX tracer (e.g.
+    # the function is called inside an enclosing jax.jit over the wavelengths), we cannot
+    # read concrete endpoints, so we fall back to λmin=0, λmax=inf. That only widens the
+    # internal profile grid; the `in_window` mask below still restricts the contribution
+    # to [λ0 - stark_window, λ0 + stark_window], so values at the synthesis wavelengths
+    # are unaffected for the optical lines that matter.
+    wl_is_concrete = not isinstance(wavelengths_jax, jax.core.Tracer)
+    if wl_is_concrete:
+        wl_min_concrete = float(np.asarray(wavelengths).reshape(-1)[0])
+        wl_max_concrete = float(np.asarray(wavelengths).reshape(-1)[-1])
+    else:
+        wl_min_concrete, wl_max_concrete = 0.0, np.inf
+
     alphas_brackett = jnp.zeros_like(wavelengths_jax)
     for idx, m in enumerate(range(5, n_max + 1)):
         λ0 = brackett_lambda0s[idx]
 
-        # Early-skip: line center is far from wavelength range (pure Python, no JAX)
-        if λ0 < wavelengths[0] or λ0 > wavelengths[-1]:
+        # Early-skip when the line center is outside the synthesis range (concrete only).
+        if wl_is_concrete and (λ0 < wl_min_concrete or λ0 > wl_max_concrete):
             continue
 
         E = RydbergH_eV * (1 / n**2 - 1 / m**2)
@@ -915,12 +980,20 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
         gf = 2 * n**2 * brackett_oscillator_strength(n, m)
         amplitude = gf * nH_I * sigma_line(λ0) * levels_factor
 
-        # Get Stark profile interpolator (already JAX-compatible)
-        stark_profile_itp, stark_window = bracket_line_interpolator(
-            m, λ0, T, ne, xi, wavelengths[0], wavelengths[-1]
-        )
+        # Get Stark profile interpolator (uses concrete wavelength bounds; see note above).
+        # bracket_line_interpolator builds a numpy wavelength grid and uses Python control
+        # flow (max/min/if) on jnp-derived scalars. Inside an enclosing jax.jit trace those
+        # scalars would otherwise become tracers (even though their inputs are concrete),
+        # so we evaluate this construction eagerly at trace time. All inputs (m, λ0, T, ne,
+        # xi, bounds) are concrete Python values, so the resulting grids/profile are concrete.
+        with jax.ensure_compile_time_eval():
+            stark_profile_itp, stark_window = bracket_line_interpolator(
+                m, λ0, T, ne, xi, wl_min_concrete, wl_max_concrete
+            )
+            stark_window = float(stark_window)
 
         if stark_window == 0.0:
+            # stark_window depends only on concrete T, ne, λ0 -> safe Python branch.
             continue
 
         # Evaluate interpolated profile for all wavelengths with masking
@@ -931,6 +1004,10 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
     # Combine Stehlé and Brackett contributions
     alphas_total = alphas_stehle + alphas_brackett
 
+    # Return numpy for the normal eager API, but keep a JAX array when running inside an
+    # enclosing jax.jit trace (np.array() cannot materialise a tracer).
+    if isinstance(alphas_total, jax.core.Tracer):
+        return alphas_total
     return np.array(alphas_total)
 
 
