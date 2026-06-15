@@ -535,7 +535,7 @@ def _read_marcs_model_atmosphere(fname: str):
                 atm_layers.append(PlanarAtmosphereLayer(
                     tau_ref=10.0 ** log_tau5,
                     z=-depth,
-                    temp=temp,
+                    temperature=temp,
                     electron_number_density=ne,
                     number_density=n,
                 ))
