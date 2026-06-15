@@ -18,7 +18,7 @@ from .constants import (
     RydbergH_eV, bohr_radius_cgs, amu_cgs, electron_charge_cgs,
     eV_to_cgs
 )
-from .line_absorption import sigma_line, doppler_width, scaled_vdW
+from .line_absorption import sigma_line, doppler_width, scaled_vdW, line_profile
 from .atomic_data import atomic_masses
 from .hydrogen_stark_data import hline_stark_profiles
 
@@ -724,6 +724,17 @@ def prepare_stark_profiles_for_jit(stark_profiles: dict, T: float, ne: float) ->
     return profile_data, valid_transitions
 
 
+# ABO p-d resonant (self-)broadening parameters for the lower Balmer lines,
+# taken verbatim from Korg.jl's hydrogen_line_absorption! (Barklem, Piskunov &
+# O'Mara 2000). Keyed by upper level (lower==2). Values are
+# (λ0 [cm], σ_ABO [units of a0^2], α_ABO).
+_BALMER_ABO_PARAMS = {
+    3: (6.56460998e-5, 1180.0, 0.677),   # Hα
+    4: (4.8626810200000004e-5, 2320.0, 0.455),  # Hβ
+    5: (4.34168232e-5, 4208.0, 0.380),   # Hγ
+}
+
+
 @jax.jit
 def _process_one_stehle_line(
     wavelengths: jnp.ndarray,
@@ -732,11 +743,16 @@ def _process_one_stehle_line(
     nH_I: float,
     UH_I: float,
     window_size: float,
+    xi: float,
     ws: jnp.ndarray,
     lower: int,
     upper: int,
     log_gf: float,
     λ0: float,
+    λ0_stehle: float,
+    σ_ABO: float,
+    α_ABO: float,
+    abo_active: float,
     temps_grid: jnp.ndarray,
     nes_grid: jnp.ndarray,
     log_delta_nu_grid: jnp.ndarray,
@@ -749,6 +765,23 @@ def _process_one_stehle_line(
     ``log_delta_nu_grid``, ``profile_3d_data``) have line-dependent shapes, so this
     function is called once per concrete line index from a Python-level loop rather
     than from a traced ``fori_loop`` (which would index Python lists with a tracer).
+
+    For Hα/Hβ/Hγ (lower==2, upper in {3,4,5}) the Barklem, Piskunov & O'Mara (2000)
+    p-d approximated resonant-broadening Voigt profile is added to the absorption
+    coefficient, matching Korg.jl. This "convolution by summation" reuses the same
+    ``amplitude`` and window as the Stehlé Stark profile. For these lines the Stehlé
+    profile is centred on the ABO line centre ``λ0_stehle`` (Korg reassigns ``λ₀``
+    before evaluating the Stark profile), while ``amplitude`` and the window mask use
+    the interpolated centre ``λ0``.
+
+    Args:
+        λ0: interpolated Stehlé line centre [cm]; used for the amplitude (``sigma_line``)
+            and the window mask, exactly as in Korg.jl.
+        λ0_stehle: line centre [cm] used for the Stehlé Stark profile (== the ABO centre
+            for Balmer lines, otherwise == ``λ0``).
+        σ_ABO, α_ABO: Barklem+ 2000 ABO parameters (σ in cm², i.e. already multiplied by
+            ``bohr_radius_cgs**2``; α dimensionless). Ignored unless ``abo_active``.
+        abo_active: 1.0 to add the ABO Voigt profile, 0.0 otherwise.
 
     Returns:
         Per-wavelength absorption contribution of this single line [cm^-1].
@@ -766,8 +799,11 @@ def _process_one_stehle_line(
     levels_factor = ws[upper - 1] * (jnp.exp(-beta * Elo) - jnp.exp(-beta * Eup)) / UH_I
     amplitude = 10.0**log_gf * nH_I * sigma_line(λ0) * levels_factor
 
-    # Calculate Stark-broadened profile for all wavelengths
-    nu0 = c_cgs / λ0
+    # Apply window masking (uses the interpolated centre, as in Korg.jl)
+    in_window = jnp.abs(wavelengths - λ0) < window_size
+
+    # Calculate Stark-broadened profile for all wavelengths, centred on λ0_stehle
+    nu0 = c_cgs / λ0_stehle
     scaled_delta_nu = jnp.abs(nus - nu0) / F0
     # Avoid log(0) by using a small value
     scaled_delta_nu = jnp.maximum(scaled_delta_nu, jnp.finfo(jnp.float64).tiny)
@@ -782,12 +818,19 @@ def _process_one_stehle_line(
     )(log_scaled_delta_nu)
 
     dIdnu = jnp.exp(log_profile_vals)
+    stehle_contribution = jnp.where(in_window, dIdnu * dnu_dlambda * amplitude, 0.0)
 
-    # Apply window masking
-    in_window = jnp.abs(wavelengths - λ0) < window_size
-    contribution = jnp.where(in_window, dIdnu * dnu_dlambda * amplitude, 0.0)
+    # Barklem+ 2000 ABO p-d resonant broadening for the lower Balmer lines.
+    # Γ = scaled_vdW((σ_ABO, α_ABO), Hmass, T) * nH_I  (rad/s)
+    # γ = Γ * λ0_stehle^2 / (c * 4π)  -> HWHM in wavelength units (cm)
+    Hmass = atomic_masses[0]
+    Γ = scaled_vdW((σ_ABO, α_ABO), Hmass, T) * nH_I
+    γ_abo = Γ * λ0_stehle**2 / (c_cgs * 4 * jnp.pi)
+    σ_dop = doppler_width(λ0_stehle, T, Hmass, xi)
+    abo_profile = line_profile(λ0_stehle, σ_dop, γ_abo, amplitude, wavelengths)
+    abo_contribution = jnp.where(in_window, abo_profile * abo_active, 0.0)
 
-    return contribution
+    return stehle_contribution + abo_contribution
 
 
 def hydrogen_line_absorption_core(
@@ -797,6 +840,7 @@ def hydrogen_line_absorption_core(
     nH_I: float,
     UH_I: float,
     window_size: float,
+    xi: float,
     ws: jnp.ndarray,
     profile_data: Dict,
     n_stehle_lines: int
@@ -839,9 +883,24 @@ def hydrogen_line_absorption_core(
         log_delta_nu_grid = profile_data['all_log_delta_nu_grids'][i_line]
         profile_3d_data = profile_data['all_profile_data'][i_line]
 
+        # For Hα/Hβ/Hγ (lower==2, upper in {3,4,5}) Korg.jl reassigns the line
+        # centre to the Barklem+ 2000 ABO value before evaluating the Stehlé Stark
+        # profile, and adds the ABO p-d resonant-broadening Voigt profile. This
+        # branch is on concrete quantum numbers, so it is safe outside the trace.
+        if lower == 2 and upper in _BALMER_ABO_PARAMS:
+            λ0_abo, σ_abo_a0, α_abo = _BALMER_ABO_PARAMS[upper]
+            λ0_stehle = λ0_abo
+            σ_abo = σ_abo_a0 * bohr_radius_cgs**2  # cm²
+            abo_active = 1.0
+        else:
+            λ0_stehle = λ0
+            σ_abo = 0.0
+            α_abo = 0.0
+            abo_active = 0.0
+
         alpha = alpha + _process_one_stehle_line(
-            wavelengths, T, ne, nH_I, UH_I, window_size, ws,
-            lower, upper, log_gf, λ0,
+            wavelengths, T, ne, nH_I, UH_I, window_size, xi, ws,
+            lower, upper, log_gf, λ0, λ0_stehle, σ_abo, α_abo, abo_active,
             temps_grid, nes_grid, log_delta_nu_grid, profile_3d_data,
         )
 
@@ -905,7 +964,7 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
         if len(valid_transitions) > 0:
             # Process Stehlé profiles using JIT
             alphas_stehle = hydrogen_line_absorption_core(
-                wavelengths_jax, T, ne, nH_I, UH_I, window_size,
+                wavelengths_jax, T, ne, nH_I, UH_I, window_size, xi,
                 ws, profile_data, len(valid_transitions)
             )
         else:
@@ -934,7 +993,24 @@ def hydrogen_line_absorption(wavelengths: np.ndarray, T: float, ne: float,
             if lb >= ub:
                 continue
 
-            nu0 = c_cgs / λ0
+            # Barklem+ 2000 ABO p-d resonant broadening for Hα/Hβ/Hγ. Korg.jl
+            # reassigns λ0 to the ABO centre and adds a Voigt profile in [lb:ub].
+            λ0_stehle = λ0
+            if line.lower == 2 and line.upper in _BALMER_ABO_PARAMS:
+                λ0_abo, σ_abo_a0, α_abo = _BALMER_ABO_PARAMS[line.upper]
+                λ0_stehle = λ0_abo
+                Hmass = atomic_masses[0]
+                σ_abo = σ_abo_a0 * bohr_radius_cgs**2
+                Γ = float(scaled_vdW((σ_abo, α_abo), Hmass, T)) * nH_I
+                γ_abo = Γ * λ0_stehle**2 / (c_cgs * 4 * np.pi)
+                σ_dop = float(doppler_width(λ0_stehle, T, Hmass, xi))
+                abo_vals = np.array([
+                    float(line_profile(λ0_stehle, σ_dop, γ_abo, amplitude, wl))
+                    for wl in wavelengths[lb:ub]
+                ])
+                alphas_stehle[lb:ub] += abo_vals
+
+            nu0 = c_cgs / λ0_stehle
             scaled_delta_nu = np.abs(nus[lb:ub] - nu0) / F0
             scaled_delta_nu = np.maximum(scaled_delta_nu, np.finfo(float).tiny)
 
