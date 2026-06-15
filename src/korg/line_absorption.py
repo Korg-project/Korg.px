@@ -5,8 +5,11 @@ This module computes opacity from atomic spectral lines using Voigt profiles,
 including proper treatment of Doppler and pressure broadening.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
+from jax import lax
 import numpy as np
 from typing import List, Dict, Callable, Tuple, Optional, Union
 
@@ -500,6 +503,77 @@ def line_absorption(
     )
 
 
+# --------------------------------------------------------------------------
+# JAX Voigt profile via Harris series (Hunger 1965 / Hjerting), matching Julia
+# --------------------------------------------------------------------------
+
+def _harris_H1_jax(v, v2):
+    """Piecewise H1 component for Harris series (branchless via jnp.where)."""
+    H1_lo = (-1.12470432 + (-0.15516677 + (3.288675912 + (-2.34357915 + 0.42139162 * v) * v) * v) * v)
+    H1_mid = (-4.48480194 + (9.39456063 + (-6.61487486 + (1.98919585 - 0.22041650 * v) * v) * v) * v)
+    # v >= 2.4 for this branch, so v2 - 1.5 >= 4.26 > 0 (no singularity)
+    H1_hi = ((0.554153432 + (0.278711796 + (-0.1883256872 + (0.042991293 - 0.003278278 * v) * v) * v) * v) /
+             (v2 - 1.5))
+    return jnp.where(v < 1.3, H1_lo, jnp.where(v < 2.4, H1_mid, H1_hi))
+
+
+def _voigt_hjerting_jax(alpha, v):
+    """
+    Voigt-Hjerting function H(alpha, v) = Re[w(v+i*alpha)].
+
+    Matches Julia Korg.jl's voigt_hjerting exactly (Hunger 1965 Harris series).
+    Branchless: all cases evaluated, jnp.where selects. alpha >= 0, v >= 0.
+    """
+    v2 = v * v
+    sqrt_pi = jnp.sqrt(jnp.pi)
+
+    # Harris series components (shared between cases 2 and 3)
+    H0 = jnp.exp(-v2)
+    H1 = _harris_H1_jax(v, v2)
+    H2 = (1.0 - 2.0 * v2) * H0
+
+    # Case 1: alpha <= 0.2, v >= 5  →  asymptotic correction
+    safe_v2 = jnp.where(v2 > 0, v2, 1.0)
+    invv2 = 1.0 / safe_v2
+    r1 = (alpha / sqrt_pi * invv2) * (1.0 + 1.5 * invv2 + 3.75 * invv2 * invv2)
+
+    # Case 2: alpha <= 0.2, v < 5  →  Harris series
+    r2 = H0 + (H1 + H2 * alpha) * alpha
+
+    # Case 3: alpha <= 1.4, alpha+v < 3.2  →  modified Harris series (Hunger 1965)
+    inv_sqrt_pi = 1.0 / sqrt_pi
+    two_inv_sqrt_pi = 2.0 * inv_sqrt_pi
+    M0 = H0
+    M1 = H1 + two_inv_sqrt_pi * M0
+    M2 = H2 - M0 + two_inv_sqrt_pi * M1
+    M3 = (2.0 / (3.0 * sqrt_pi)) * (1.0 - H2) - (2.0 / 3.0) * v2 * M1 + two_inv_sqrt_pi * M2
+    M4 = (2.0 / 3.0) * v2 * v2 * M0 - (two_inv_sqrt_pi / 3.0) * M1 + two_inv_sqrt_pi * M3
+    psi = 0.979895023 + (-0.962846325 + (0.532770573 - 0.122727278 * alpha) * alpha) * alpha
+    r3 = psi * (M0 + (M1 + (M2 + (M3 + M4 * alpha) * alpha) * alpha) * alpha)
+
+    # Case 4: else (large alpha or large alpha+v)  →  Lorentz-like
+    safe_alpha = jnp.where(alpha > 0, alpha, 1.0)
+    r2_lorentz = v2 / (safe_alpha * safe_alpha)
+    alpha_invu = 1.0 / (jnp.sqrt(2.0) * (r2_lorentz + 1.0) * safe_alpha)
+    a2_inv_u2 = alpha_invu * alpha_invu
+    r4 = (jnp.sqrt(2.0 / jnp.pi) * alpha_invu *
+          (1.0 + (3.0 * r2_lorentz - 1.0 + ((r2_lorentz - 2.0) * 15.0 * r2_lorentz + 2.0) * a2_inv_u2) * a2_inv_u2))
+
+    cond1 = (alpha <= 0.2) & (v >= 5.0)
+    cond2 = (alpha <= 0.2) & (v < 5.0)
+    cond3 = (alpha <= 1.4) & (alpha + v < 3.2)
+    return jnp.where(cond1, r1,
+           jnp.where(cond2, r2,
+           jnp.where(cond3, r3,
+                            r4)))
+
+
+def _voigt_profile_jax(delta, sigma, gamma):
+    """Voigt profile (area-normalized). Matches scipy.special.voigt_profile."""
+    s2 = sigma * jnp.sqrt(2.0)
+    return _voigt_hjerting_jax(gamma / s2, jnp.abs(delta) / s2) / (sigma * jnp.sqrt(2.0 * jnp.pi))
+
+
 # Module-level cache: (tuple of line ids) → (unique_species, per-line numpy arrays)
 _LINELIST_PREP_CACHE = {}
 
@@ -508,14 +582,12 @@ def _line_absorption_fast(
     number_densities, partition_functions, xi, continuum_opacity, cutoff_threshold
 ):
     """
-    Fast numpy+scipy implementation of line absorption.
+    Fast line absorption using bucketed JAX Voigt computation.
 
-    Processes each line individually in a Python loop but only evaluates the
-    Voigt profile within each line's wavelength window (like Julia does).
-    Uses scipy.special.voigt_profile (Faddeeva-based, fast C code).
+    Lines are grouped by window size. Each bucket evaluates Voigt profiles
+    for all lines simultaneously (vectorized via XLA) then scatters into alpha.
+    Uses _voigt_profile_jax (Harris series, matches Julia Korg.jl exactly).
     """
-    from scipy.special import voigt_profile as scipy_voigt
-
     n_layers = len(temperatures)
     n_wl = len(wavelengths)
     wl_np = np.asarray(wavelengths)
@@ -637,19 +709,56 @@ def _line_absorption_fast(
     # Max window per line: (n_lines,)
     max_wins = np.max(np.sqrt(win_G_all**2 + win_L_all**2), axis=1)
 
-    # --- Voigt computation ---
-    n_lines = len(linelist)
+    # --- Bucketed JAX Voigt accumulation ---
+    # Lines are grouped by window size so each bucket fits a fixed W_MAX-pixel window.
+    # Within each bucket, _voigt_profile_jax runs on a vectorized (n_b, n_layers, W_MAX)
+    # array (no Python per-line overhead, XLA-fused). Scatter uses numpy slice-add.
+    _voigt_jit = jax.jit(_voigt_profile_jax)
+
+    wl_spacing = (wl_np[-1] - wl_np[0]) / max(n_wl - 1, 1)
+    # Clip to n_wl so lines with huge windows (e.g., tiny continuum opacity) still
+    # land in the last bucket rather than silently dropping.
+    max_wins_px = np.clip(
+        (np.ceil(2.0 * max_wins / wl_spacing) + 2).astype(int), 0, n_wl
+    )
+
     alpha = np.zeros((n_layers, n_wl))
 
-    for i_line in range(n_lines):
-        max_win = max_wins[i_line]
-        wl0 = wls[i_line]
-        wl_mask = np.abs(wl_np - wl0) <= max_win
-        if not np.any(wl_mask):
+    BUCKET_WIDTHS = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, n_wl]
+    prev_W = 0
+    for W_MAX_raw in BUCKET_WIDTHS:
+        W_MAX = min(W_MAX_raw, n_wl)
+        in_bucket = (max_wins_px > prev_W) & (max_wins_px <= W_MAX_raw)
+        n_b = int(in_bucket.sum())
+        if n_b == 0:
+            prev_W = W_MAX_raw
             continue
-        delta = wl_np[wl_mask][None, :] - wl0
-        profiles = scipy_voigt(delta, sigma_all[i_line, :, None], gamma_wl_all[i_line, :, None])
-        alpha[:, wl_mask] += amplitude_all[i_line, :, None] * profiles
+
+        idx_b = np.where(in_bucket)[0]
+
+        i_lo_b = np.searchsorted(wl_np, wls[idx_b] - max_wins[idx_b]).astype(int)
+        i_lo_b = np.clip(i_lo_b, 0, n_wl - W_MAX)
+
+        # Wavelength windows: (n_b, W_MAX)
+        pix_idx = i_lo_b[:, None] + np.arange(W_MAX, dtype=int)[None, :]
+        wl_win  = wl_np[pix_idx]
+
+        # Window mask: (n_b, W_MAX)
+        mask_b = np.abs(wl_win - wls[idx_b, None]) <= max_wins[idx_b, None]
+
+        # JAX Voigt profiles: broadcast to (n_b, n_layers, W_MAX) then compute
+        delta = jnp.asarray((wl_win - wls[idx_b, None])[:, None, :])  # (n_b, 1, W_MAX)
+        sigma = jnp.asarray(sigma_all[idx_b, :, None])                  # (n_b, n_layers, 1)
+        gamma = jnp.asarray(gamma_wl_all[idx_b, :, None])               # (n_b, n_layers, 1)
+
+        profiles = np.asarray(_voigt_jit(delta, sigma, gamma))  # (n_b, n_layers, W_MAX)
+
+        contrib = mask_b[:, None, :] * amplitude_all[idx_b, :, None] * profiles
+
+        for il, i_lo in enumerate(i_lo_b):
+            alpha[:, i_lo:i_lo + W_MAX] += contrib[il]
+
+        prev_W = W_MAX_raw
 
     return alpha
 
