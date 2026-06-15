@@ -28,6 +28,7 @@ mkpath(dirname(outfile))
 # centers (ABO line centers, cm)
 Hbeta_λ0 = 4.8626810200000004e-5
 Halpha_λ0 = 6.56460998e-5
+Hgamma_λ0 = 4.34168232e-5
 halfwidth = 30e-8  # 30 Å each side
 npts = 401
 
@@ -38,6 +39,10 @@ cases = [
     ("Halpha_T10000",Halpha_λ0, 10000.0, 1e14),
     ("Hbeta_T6000_ne1e13", Hbeta_λ0, 6000.0, 1e13),
     ("Hbeta_T6000_ne1e15", Hbeta_λ0, 6000.0, 1e15),
+    ("Hgamma_T6000",  Hgamma_λ0, 6000.0,  1e14),
+    ("Hgamma_T10000", Hgamma_λ0, 10000.0, 1e14),
+    ("Hgamma_T6000_ne1e13", Hgamma_λ0, 6000.0, 1e13),
+    ("Hgamma_T6000_ne1e15", Hgamma_λ0, 6000.0, 1e15),
 ]
 
 nH_I = 1e16
