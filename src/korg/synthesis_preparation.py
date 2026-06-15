@@ -89,6 +89,8 @@ class PreparedLinelist:
     is_molecule: np.ndarray
     species_id: np.ndarray
     species_list: tuple
+    species_Z: np.ndarray       # shape (n_lines,), int32 — atomic number of absorber
+    species_charge: np.ndarray  # shape (n_lines,), int32 — ionisation state (0=neutral)
 
     @property
     def n_lines(self) -> int:
@@ -108,6 +110,25 @@ class PreparedLinelist:
             is_molecule=jnp.asarray(self.is_molecule),
             species_id=jnp.asarray(self.species_id),
             species_list=self.species_list,
+            species_Z=jnp.asarray(self.species_Z),
+            species_charge=jnp.asarray(self.species_charge),
+        )
+
+    def to_linelist_data(self):
+        """Convert to ``LinelistData`` for use with :func:`synthesize_jit`."""
+        from .synthesis import LinelistData
+        return LinelistData(
+            n_lines=self.n_lines,
+            wl=jnp.asarray(self.wl),
+            log_gf=jnp.asarray(self.log_gf),
+            species_Z=jnp.asarray(self.species_Z),
+            species_charge=jnp.asarray(self.species_charge),
+            E_lower=jnp.asarray(self.E_lower),
+            gamma_rad=jnp.asarray(self.gamma_rad),
+            gamma_stark=jnp.asarray(self.gamma_stark),
+            vdW_sigma=jnp.asarray(self.vdW_sigma),
+            vdW_alpha=jnp.asarray(self.vdW_alpha),
+            mass=jnp.asarray(self.mass),
         )
 
 
@@ -237,22 +258,24 @@ def prepare_wavelength_grid(
 
 def _vdW_to_sigma_alpha(vdW) -> Tuple[float, float]:
     """
-    Unpack a line's ``vdW`` field into (sigma, alpha) floats.
+    Unpack a line's ``vdW`` field into (sigma, alpha) matching ``_vdW_to_tuple``.
 
-    The vdW field can be:
-    - ``(sigma, alpha)`` tuple  — ABO theory parameters
-    - scalar < 0               — log|C₆| packed as ``(log|C₆|, -1.0)``
-    - ``(0.0, -1.0)``          — no broadening sentinel
-    - ``None`` / ``float('nan')`` — no broadening
+    The returned (sigma, alpha) pair uses the same convention as
+    ``line_absorption._vdW_to_tuple``:
+    - tuple (s, α): ABO if α != -1, or simple γ at 10 000 K if α == -1
+    - negative scalar: log₁₀(γ at 10 000 K) → converted to linear (10**v)
+    - None / NaN / 0: no broadening → (0.0, -1.0)
     """
     if vdW is None:
         return 0.0, -1.0
     if isinstance(vdW, (tuple, list)):
         return float(vdW[0]), float(vdW[1])
     v = float(vdW)
-    if np.isnan(v):
+    if np.isnan(v) or v == 0.0:
         return 0.0, -1.0
-    # Negative scalar: log|C₆| encoding
+    if v < 0:
+        return 10.0 ** v, -1.0   # log10(gamma_vdW) → linear
+    # Small positive scalar: fudge factor (direct coefficient)
     return v, -1.0
 
 
@@ -329,29 +352,34 @@ def preprocess_linelist(
     species_to_id = seen
 
     n = len(filtered)
-    wl       = np.empty(n, dtype=np.float64)
-    log_gf   = np.empty(n, dtype=np.float64)
-    E_lower  = np.empty(n, dtype=np.float64)
-    g_rad    = np.empty(n, dtype=np.float64)
-    g_stark  = np.empty(n, dtype=np.float64)
-    vdW_s    = np.empty(n, dtype=np.float64)
-    vdW_a    = np.empty(n, dtype=np.float64)
-    mass     = np.empty(n, dtype=np.float64)
-    is_mol   = np.empty(n, dtype=bool)
-    sp_id    = np.empty(n, dtype=np.int32)
+    wl        = np.empty(n, dtype=np.float64)
+    log_gf    = np.empty(n, dtype=np.float64)
+    E_lower   = np.empty(n, dtype=np.float64)
+    g_rad     = np.empty(n, dtype=np.float64)
+    g_stark   = np.empty(n, dtype=np.float64)
+    vdW_s     = np.empty(n, dtype=np.float64)
+    vdW_a     = np.empty(n, dtype=np.float64)
+    mass      = np.empty(n, dtype=np.float64)
+    is_mol    = np.empty(n, dtype=bool)
+    sp_id     = np.empty(n, dtype=np.int32)
+    sp_Z      = np.empty(n, dtype=np.int32)
+    sp_charge = np.empty(n, dtype=np.int32)
 
     for i, line in enumerate(filtered):
-        wl[i]      = line.wl
-        log_gf[i]  = line.log_gf
-        E_lower[i] = line.E_lower
-        g_rad[i]   = line.gamma_rad if line.gamma_rad is not None else 0.0
-        g_stark[i] = (line.gamma_stark if line.gamma_stark is not None else 0.0)
-        s, a       = _vdW_to_sigma_alpha(line.vdW)
-        vdW_s[i]   = s
-        vdW_a[i]   = a
-        mass[i]    = line.species.get_mass()
-        is_mol[i]  = line.species.formula.is_molecule()
-        sp_id[i]   = species_to_id[line.species]
+        wl[i]        = line.wl
+        log_gf[i]    = line.log_gf
+        E_lower[i]   = line.E_lower
+        g_rad[i]     = line.gamma_rad if line.gamma_rad is not None else 0.0
+        g_stark[i]   = line.gamma_stark if line.gamma_stark is not None else 0.0
+        s, a         = _vdW_to_sigma_alpha(line.vdW)
+        vdW_s[i]     = s
+        vdW_a[i]     = a
+        mass[i]      = line.species.get_mass()
+        is_mol[i]    = line.species.formula.is_molecule()
+        sp_id[i]     = species_to_id[line.species]
+        atoms        = line.species.formula.get_atoms()
+        sp_Z[i]      = int(atoms[0]) if len(atoms) > 0 else 1
+        sp_charge[i] = int(line.species.charge)
 
     return PreparedLinelist(
         wl=wl, log_gf=log_gf, E_lower=E_lower,
@@ -359,6 +387,7 @@ def preprocess_linelist(
         vdW_sigma=vdW_s, vdW_alpha=vdW_a,
         mass=mass, is_molecule=is_mol,
         species_id=sp_id, species_list=species_list,
+        species_Z=sp_Z, species_charge=sp_charge,
     )
 
 
@@ -373,6 +402,7 @@ def _empty_prepared_linelist() -> PreparedLinelist:
         vdW_sigma=empty_f, vdW_alpha=empty_f,
         mass=empty_f, is_molecule=empty_b,
         species_id=empty_i, species_list=(),
+        species_Z=empty_i.copy(), species_charge=empty_i.copy(),
     )
 
 

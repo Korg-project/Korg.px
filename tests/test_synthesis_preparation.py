@@ -284,8 +284,9 @@ class TestVdWToSigmaAlpha:
         assert alpha == pytest.approx(0.227)
 
     def test_negative_scalar_log_c6(self):
+        # Negative scalar is log10(gamma_vdW); converted to linear like _vdW_to_tuple
         sigma, alpha = _vdW_to_sigma_alpha(-7.5)
-        assert sigma == pytest.approx(-7.5)
+        assert sigma == pytest.approx(10**-7.5)
         assert alpha == pytest.approx(-1.0)
 
     def test_none_returns_no_broadening(self):

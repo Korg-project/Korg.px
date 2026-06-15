@@ -21,11 +21,12 @@ from .data_loader import (ionization_energies, default_partition_funcs,
                           default_log_equilibrium_constants,
                           default_chem_eq_data, default_mol_species)
 from .continuum import prepare_continuum_batch, prepare_continuum_batch_fast, batch_continuum_absorption
-from .constants import electron_mass_cgs, c_cgs, kboltz_eV, hplanck_eV, hplanck_cgs, kboltz_cgs
+from .constants import (electron_mass_cgs, electron_charge_cgs, c_cgs,
+                        kboltz_eV, hplanck_eV, hplanck_cgs, kboltz_cgs)
 from .radiative_transfer import radiative_transfer, radiative_transfer_jit
 from .linelist import Line
 from .species import Species
-from .line_absorption import line_absorption
+from .line_absorption import line_absorption, _vdW_to_tuple, _voigt_profile_jax
 from .hydrogen_line_absorption import (hydrogen_line_absorption, precompute_hummer_ws,
                                        hline_stark_profiles,
                                        hydrogen_line_absorption_stark_batched)
@@ -1113,9 +1114,11 @@ def preprocess_linelist(linelist: List[Line]) -> LinelistData:
     gamma_rad = jnp.array([line.gamma_rad for line in linelist])
     gamma_stark = jnp.array([line.gamma_stark for line in linelist])
 
-    # van der Waals parameters
-    vdW_sigma = jnp.array([line.vdW[0] for line in linelist])
-    vdW_alpha = jnp.array([line.vdW[1] for line in linelist])
+    # van der Waals parameters (use _vdW_to_tuple for robust handling of
+    # scalar log-gamma, tuple ABO, and None inputs)
+    vdW_params = [_vdW_to_tuple(line.vdW) for line in linelist]
+    vdW_sigma = jnp.array([p[0] for p in vdW_params])
+    vdW_alpha = jnp.array([p[1] for p in vdW_params])
 
     return LinelistData(
         n_lines=n_lines,
@@ -1592,80 +1595,64 @@ def synthesize_jit(
 
     def add_line_absorption(alpha):
         """Add line absorption to continuum opacity."""
-        # Handle empty linelist case
         if n_lines == 0:
             return alpha
 
-        # For each line, add its contribution to all layers and wavelengths
-        def process_line(alpha, line_idx):
-            wl_center = linelist_data.wl[line_idx]
-            log_gf = linelist_data.log_gf[line_idx]
-            Z = linelist_data.species_Z[line_idx]
-            charge = linelist_data.species_charge[line_idx]
-            E_lower = linelist_data.E_lower[line_idx]
-            gamma_rad = linelist_data.gamma_rad[line_idx]
-            gamma_stark = linelist_data.gamma_stark[line_idx]
-            vdW_sigma = linelist_data.vdW_sigma[line_idx]
-            vdW_alpha = linelist_data.vdW_alpha[line_idx]
-            mass = linelist_data.mass[line_idx]
+        # Integrated cross-section prefactor: (π e²/mc) × λ²/c  [cm³]
+        # The λ²/c converts from frequency-integrated to wavelength-integrated units.
+        pi_e2_mc = jnp.pi * electron_charge_cgs**2 / (electron_mass_cgs * c_cgs)
 
-            def add_to_layer(alpha_layer, layer_idx):
-                T_i = T_layers[layer_idx]
-                ne_i = ne_calc[layer_idx]
-                nH_I = nH_I_all[layer_idx]
+        def process_line(alpha_carry, line_idx):
+            wl_center     = linelist_data.wl[line_idx]
+            log_gf_val    = linelist_data.log_gf[line_idx]
+            Z             = linelist_data.species_Z[line_idx]
+            charge        = linelist_data.species_charge[line_idx]
+            E_lower       = linelist_data.E_lower[line_idx]
+            gamma_rad_l   = linelist_data.gamma_rad[line_idx]
+            gamma_stark_l = linelist_data.gamma_stark[line_idx]
+            vdW_sigma_l   = linelist_data.vdW_sigma[line_idx]
+            vdW_alpha_l   = linelist_data.vdW_alpha[line_idx]
+            mass          = linelist_data.mass[line_idx]
 
-                # Get species number density
-                n_species = jnp.where(
-                    charge == 0,
-                    n_neutral_all[layer_idx, Z - 1],
-                    n_ion_all[layer_idx, Z - 1]
-                )
+            nu = c_cgs / wl_center
+            sigma_ln = pi_e2_mc * wl_center**2 / c_cgs  # wavelength-integrated cross-section
 
-                # Get partition function
+            def per_layer(T_i, ne_i, nH_I_i, n_neutral_i, n_ion_i):
+                n_species = jnp.where(charge == 0, n_neutral_i[Z - 1], n_ion_i[Z - 1])
+
                 log_T = jnp.log(T_i)
                 U = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
-                              data.chem_eq_data.partition_func_values[Z - 1, charge])
+                               data.chem_eq_data.partition_func_values[Z - 1, charge])
 
-                # Doppler width
-                sigma_D = wl_center * jnp.sqrt(kboltz_cgs * T_i / mass + vmic_cm_s**2 / 2) / c_cgs
+                sigma_D = wl_center * jnp.sqrt(kboltz_cgs * T_i / mass + vmic_cm_s**2 / 2.0) / c_cgs
 
-                # Lorentz width (damping)
-                # Radiative + Stark + van der Waals
-                gamma_stark_scaled = gamma_stark * (T_i / 10000)**0.166667
-                gamma_vdW = jnp.where(
-                    vdW_alpha == -1,
-                    vdW_sigma * (T_i / 10000)**0.3,
-                    vdW_sigma * 1e6 * (T_i / 10000)**0.4  # Simplified ABO
+                # Damping (rad/s): radiative + Stark + van der Waals
+                g_stark = gamma_stark_l * (T_i / 1e4) ** (1.0 / 6.0) * ne_i
+                # Simple vdW: sigma is the gamma at 10000 K (linear, not log)
+                # ABO: simplified temperature scaling
+                g_vdW = jnp.where(
+                    vdW_alpha_l < 0.0,
+                    vdW_sigma_l * (T_i / 1e4) ** 0.3 * nH_I_i,
+                    2.0 * vdW_sigma_l * 1e6 * (T_i / 1e4) ** (0.5 * (1.0 - vdW_alpha_l)) * nH_I_i
                 )
-                gamma_total = gamma_rad + gamma_stark_scaled * ne_i + gamma_vdW * nH_I
+                gamma_total = gamma_rad_l + g_stark + g_vdW
+                # Convert rad/s → wavelength HWHM [cm]: γ_λ = γ_ω × λ²/(4πc)
+                gamma_L = gamma_total * wl_center**2 / (4.0 * jnp.pi * c_cgs)
 
-                # Convert to wavelength units
-                gamma_L = gamma_total * wl_center**2 / (4 * jnp.pi * c_cgs)
+                stim = 1.0 - jnp.exp(-hplanck_eV * nu / (kboltz_eV * T_i))
+                boltz = jnp.exp(-E_lower / (kboltz_eV * T_i))
+                amplitude = (n_species / jnp.clip(U, 1e-10) *
+                             10.0 ** log_gf_val * sigma_ln * boltz * stim)
 
-                # Line strength
-                # n * sigma = n/U * g * f * (πe²/mc) * exp(-E_lower/kT) * (1 - exp(-hν/kT))
-                from .constants import electron_charge_cgs, electron_mass_cgs, hplanck_eV
-                sigma_e = jnp.pi * electron_charge_cgs**2 / (electron_mass_cgs * c_cgs)
-                nu = c_cgs / wl_center
-                stim_correction = 1 - jnp.exp(-hplanck_eV * nu / (kboltz_eV * T_i))
-                boltzmann = jnp.exp(-E_lower / (kboltz_eV * T_i))
+                # Harris-series Voigt profile at all wavelengths (broadcasting over n_wl)
+                return amplitude * _voigt_profile_jax(wavelengths_cm - wl_center, sigma_D, gamma_L)
 
-                amplitude = (n_species / jnp.clip(U, 1e-10, jnp.inf) *
-                            10**log_gf * sigma_e * boltzmann * stim_correction)
+            # Compute contribution for every layer simultaneously: (n_layers, n_wl)
+            line_contrib = jax.vmap(per_layer)(
+                T_layers, ne_calc, nH_I_all, n_neutral_all, n_ion_all
+            )
+            return alpha_carry + line_contrib, None
 
-                # Compute profile at all wavelengths
-                def profile_at_wl(wl):
-                    return _line_profile_jit(wl_center, sigma_D, gamma_L, amplitude, wl)
-
-                alpha_line = jax.vmap(profile_at_wl)(wavelengths_cm)
-
-                return alpha_layer + alpha_line, None
-
-            # Add line to all layers
-            alpha_new, _ = jax.lax.scan(add_to_layer, alpha, jnp.arange(n_layers))
-            return alpha_new, None
-
-        # Process all lines
         alpha_final, _ = jax.lax.scan(process_line, alpha, jnp.arange(n_lines))
         return alpha_final
 
