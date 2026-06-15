@@ -1143,7 +1143,7 @@ def chemical_equilibrium_all_layers(T_arr, n_total_arr, ne_model_arr,
         T_jax, n_total_jax, ne_model_jax, abs_abund_jax, data
     )
 
-    # Batch molecular densities
+    # Batch molecular densities (first pass — uses Picard neutral fracs which ignore mol. depletion)
     mol_dens_all = _compute_mol_densities_batch_jit(
         T_jax, n_total_jax, ne_sol_all, abs_abund_jax, neutral_fracs_all, data
     )
@@ -1160,7 +1160,37 @@ def chemical_equilibrium_all_layers(T_arr, n_total_arr, ne_model_arr,
 
     n_layers = len(ne_np)
     atom_dens = (n_total_arr[:, None] - ne_np[:, None]) * absolute_abundances[None, :]
-    neutral_dens_all = atom_dens * nf_np          # (n_layers, 92)
+    neutral_dens_picard = atom_dens * nf_np       # (n_layers, 92) — before molecular correction
+
+    # Iterative molecular depletion correction:
+    # The Picard iteration for ne doesn't account for atoms bound in molecules,
+    # so neutral_dens_picard overestimates free atomic densities (e.g. n_CI includes CO/C2/CN).
+    # We correct by subtracting molecular atom consumption and recomputing mol_dens (3 passes).
+    if data.n_molecules > 0:
+        mol_atoms_np = np.asarray(data.mol_atoms_array)  # (n_mols, 6), Z-1 indexed, -1 = pad
+        mol_n_atoms_np = np.asarray(data.mol_n_atoms)    # (n_mols,)
+        # M_consume[i, Z-1] = number of Z-atoms in molecule i
+        M_consume = np.zeros((data.n_molecules, 92), dtype=np.float64)
+        for i in range(data.n_molecules):
+            for k in range(int(mol_n_atoms_np[i])):
+                Z_idx = int(mol_atoms_np[i, k])
+                if 0 <= Z_idx < 92:
+                    M_consume[i, Z_idx] += 1.0
+
+        for _ in range(5):
+            # mol_atom_correction[layer, Z-1] = total atoms of element Z in all molecules
+            mol_atom_correction = mol_np @ M_consume   # (n_layers, 92)
+            neutral_dens_corrected = np.maximum(neutral_dens_picard - mol_atom_correction, 1e-99)
+            nf_corrected = neutral_dens_corrected / np.maximum(atom_dens, 1e-99)
+            mol_dens_all = _compute_mol_densities_batch_jit(
+                T_jax, n_total_jax, ne_sol_all, abs_abund_jax,
+                jnp.asarray(nf_corrected), data
+            )
+            mol_np = np.asarray(mol_dens_all)
+    else:
+        neutral_dens_corrected = neutral_dens_picard
+
+    neutral_dens_all = neutral_dens_corrected     # (n_layers, 92)
     ionized_dens_all = wII_np * neutral_dens_all
     doubly_dens_all = wIII_np * neutral_dens_all
 
