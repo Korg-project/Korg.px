@@ -538,6 +538,7 @@ def _line_absorption_fast(
     # Partition functions: (n_species, n_layers)
     log_T_np = np.log(T_np)
     pf_arr = np.zeros((n_species, n_layers))
+    pf_available = np.zeros(n_species, dtype=bool)
     for sp, idx in ld['species_to_id'].items():
         if sp in partition_functions:
             pf = partition_functions[sp]
@@ -546,6 +547,7 @@ def _line_absorption_fast(
             else:
                 for j, lt in enumerate(log_T_np):
                     pf_arr[idx, j] = float(pf(lt))
+            pf_available[idx] = True
 
     # H I densities for vdW broadening
     H_I_species = Species("H_I")
@@ -616,8 +618,11 @@ def _line_absorption_fast(
                   np.exp(-beta[None, :] * E_upper_all[:, None]))  # (n_lines, n_layers)
     n_sp_all = nd_arr[ld['species_ids']]   # (n_lines, n_layers)
     U_sp_all = pf_arr[ld['species_ids']]   # (n_lines, n_layers)
+    line_has_pf = pf_available[ld['species_ids']]  # (n_lines,) — False for species without pf
     amplitude_all = (10.0**ld['log_gfs'][:, None] * sigma_ln_all[:, None] *
                      levels_all * n_sp_all / np.maximum(U_sp_all, 1e-300))  # (n_lines, n_layers)
+    # Zero out lines with no partition function (avoids division-by-~0 amplitudes)
+    amplitude_all = np.where(line_has_pf[:, None], amplitude_all, 0.0)
 
     # Window sizes: (n_lines, n_layers)
     rho_crit_all = (cntm_opac * cutoff_threshold /
