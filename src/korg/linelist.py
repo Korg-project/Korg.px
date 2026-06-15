@@ -189,7 +189,7 @@ def create_line(
     # Note: Julia treats both 0 and 1 as flags to approximate (missing/placeholder values)
     need_stark = (gamma_stark is None or np.isnan(gamma_stark) or
                   gamma_stark == 0.0 or gamma_stark == 1.0)
-    need_vdW = (vdW is None or (not isinstance(vdW, tuple) and np.isnan(vdW)))
+    need_vdW = (vdW is None or (not isinstance(vdW, tuple) and (np.isnan(vdW) or vdW == 0.0)))
 
     if need_stark or need_vdW:
         gamma_stark_approx, vdW_approx = approximate_gammas(
@@ -210,9 +210,6 @@ def create_line(
         if vdW < 0:
             # Negative: it's log(γ_vdW)
             vdW = (10**vdW, -1.0)
-        elif vdW == 0:
-            # Exactly zero: no vdW broadening
-            vdW = (0.0, -1.0)
         elif 0 < vdW < 20:
             # Fudge factor for Unsöld approximation
             _, log_gamma_vdW_base = approximate_gammas(
