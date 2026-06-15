@@ -96,8 +96,11 @@ class TestHydrogenLineAbsorptionFull:
             use_jit=True
         )
 
-        # Profiles should differ with temperature
-        assert not np.allclose(alphas_low, alphas_high)
+        # Profiles should differ with temperature. These far-wing H-alpha opacities
+        # are ~1e-66 cm^-1, so the default np.allclose atol (1e-8) would treat every
+        # value as "close to zero"; use a purely relative comparison (atol=0) so the
+        # check actually tests temperature dependence.
+        assert not np.allclose(alphas_low, alphas_high, rtol=1e-3, atol=0.0)
 
     def test_brackett_only(self):
         """Test Brackett series contribution (no Stehlé profiles)."""
