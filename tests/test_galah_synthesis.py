@@ -20,6 +20,7 @@ Output:
     - galah_synthesis_comparison.png: Comparison plot
     - julia_galah_synthesis.h5: Julia synthesis results
 """
+import time
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
@@ -266,15 +267,31 @@ def test_galah_solar_synthesis():
     print("Python Korg Synthesis")
     print("="*70)
 
-    result_py = synthesize(
-        atmosphere=atm,
-        linelist=linelist,
-        wavelengths_angstrom=wavelengths,
-        abundances=abundances,
-        vmic=1.0,  # km/s
-        hydrogen_lines=True,
-        verbose=True,
-    )
+    def _run_py_synth(verbose):
+        return synthesize(
+            atmosphere=atm,
+            linelist=linelist,
+            wavelengths_angstrom=wavelengths,
+            abundances=abundances,
+            vmic=1.0,  # km/s
+            hydrogen_lines=True,
+            verbose=verbose,
+        )
+
+    # Cold call: includes JAX tracing/compilation. synthesize() returns flux as a
+    # materialized numpy array (np.array(...)), which forces the device
+    # computation to finish, so the wall time captures the full synthesis.
+    _t0 = time.perf_counter()
+    result_py = _run_py_synth(verbose=True)
+    py_cold_seconds = time.perf_counter() - _t0
+
+    # Warm call: identical shapes, so JAX reuses the compiled executable.
+    _t0 = time.perf_counter()
+    result_py = _run_py_synth(verbose=False)
+    py_warm_seconds = time.perf_counter() - _t0
+
+    print(f"\n  Python synthesis wall time: cold={py_cold_seconds:.3f} s, "
+          f"warm={py_warm_seconds:.3f} s")
 
     flux_py = np.array(result_py.flux)
     continuum_py = np.array(result_py.continuum)
@@ -290,10 +307,12 @@ def test_galah_solar_synthesis():
     print("Julia Korg.jl Synthesis")
     print("="*70)
 
-    # Create Julia script
+    # Create Julia script. Activate the Julia project at the repo root, which
+    # provides Korg, HDF5 and JSON.
+    repo_root = Path(__file__).resolve().parent.parent
     julia_script = f"""
 using Pkg
-Pkg.activate("/tmp/Korg.jl")
+Pkg.activate("{repo_root}")
 using Korg
 using HDF5
 
@@ -312,9 +331,16 @@ println("\\nSynthesizing spectrum...")
 wavelengths = collect(range({wl_min}, {wl_max}, length={len(wavelengths)}))
 A_X = Korg.grevesse_2007_solar_abundances
 
-sol = Korg.synthesize(atm, linelist, A_X, wavelengths,
+# Cold call: includes Julia method compilation.
+jl_cold_seconds = @elapsed sol = Korg.synthesize(atm, linelist, A_X, wavelengths,
                       vmic=1.0,  # km/s
                       hydrogen_lines=true)
+# Warm call: everything already compiled.
+jl_warm_seconds = @elapsed sol = Korg.synthesize(atm, linelist, A_X, wavelengths,
+                      vmic=1.0,  # km/s
+                      hydrogen_lines=true)
+println("\\nJULIA_COLD_SECONDS=", jl_cold_seconds)
+println("JULIA_WARM_SECONDS=", jl_warm_seconds)
 
 println("\\n✓ Julia synthesis complete")
 println("  Flux range: ", minimum(sol.flux), " - ", maximum(sol.flux))
@@ -348,8 +374,11 @@ println("\\n✓ Saved to julia_galah_synthesis.h5")
             print("Julia stderr:", result.stderr)
 
         if result.returncode != 0:
-            print(f"Julia synthesis failed with return code {result.returncode}")
-            return
+            raise AssertionError(
+                f"Julia synthesis failed with return code {result.returncode}.\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
 
         # Load Julia results
         with h5py.File("julia_galah_synthesis.h5", "r") as f:
