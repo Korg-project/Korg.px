@@ -54,6 +54,11 @@ class Formula:
         padded = [0] * (MAX_ATOMS_PER_MOLECULE - len(atoms_list)) + atoms_list
         object.__setattr__(self, 'atoms', tuple(np.uint8(padded)))
 
+    @classmethod
+    def from_string(cls, code: str) -> 'Formula':
+        """Construct a Formula from a string code (e.g. 'Fe', 'OH', 'FeH', '0801')."""
+        return cls(code)
+
     def _parse_string(self, code: str) -> List[int]:
         """Parse a string code into a list of atomic numbers."""
         # Quick parse for single elements
@@ -237,6 +242,11 @@ class Species:
                 raise ValueError(f"Can't construct a species with charge < -1: {formula_input} with charge {charge}")
             object.__setattr__(self, 'formula', formula_input)
             object.__setattr__(self, 'charge', int(charge))
+
+    @classmethod
+    def from_string(cls, code: str) -> 'Species':
+        """Construct a Species from a string code (e.g. 'Fe I', 'H2O', 'OH+')."""
+        return cls(code)
 
     def _parse_species_code(self, code: str) -> tuple:
         """Parse a species code string into (Formula, charge)."""

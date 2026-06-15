@@ -220,12 +220,9 @@ class TestSpeciesReference:
 
         ref = reference_data["species"]
         for code, julia_result in ref["outputs"].items():
-            try:
-                py_species = Species.from_string(code)
-                assert py_species.charge == julia_result["charge"], \
-                    f"Charge mismatch for {code}: Python={py_species.charge}, Julia={julia_result['charge']}"
-            except Exception as e:
-                pytest.skip(f"Species.from_string not fully implemented for '{code}': {e}")
+            py_species = Species.from_string(code)
+            assert py_species.charge == julia_result["charge"], \
+                f"Charge mismatch for {code}: Python={py_species.charge}, Julia={julia_result['charge']}"
 
     def test_species_is_molecule(self, reference_data):
         """Species molecule detection should match."""
@@ -233,14 +230,11 @@ class TestSpeciesReference:
 
         ref = reference_data["species"]
         for code, julia_result in ref["outputs"].items():
-            try:
-                py_species = Species.from_string(code)
-                py_is_mol = py_species.is_molecule
-                julia_is_mol = julia_result["is_molecule"]
-                assert py_is_mol == julia_is_mol, \
-                    f"is_molecule mismatch for {code}: Python={py_is_mol}, Julia={julia_is_mol}"
-            except Exception as e:
-                pytest.skip(f"Species.from_string not fully implemented for '{code}': {e}")
+            py_species = Species.from_string(code)
+            py_is_mol = py_species.is_molecule()
+            julia_is_mol = julia_result["is_molecule"]
+            assert py_is_mol == julia_is_mol, \
+                f"is_molecule mismatch for {code}: Python={py_is_mol}, Julia={julia_is_mol}"
 
 
 class TestFormulaReference:
@@ -252,13 +246,10 @@ class TestFormulaReference:
 
         ref = reference_data["formula"]
         for code, julia_result in ref["outputs"].items():
-            try:
-                py_formula = Formula.from_string(code)
-                julia_atoms = tuple(julia_result["atoms"])
-                assert py_formula.atoms == julia_atoms, \
-                    f"Atoms mismatch for {code}: Python={py_formula.atoms}, Julia={julia_atoms}"
-            except Exception as e:
-                pytest.skip(f"Formula.from_string not fully implemented for '{code}': {e}")
+            py_formula = Formula.from_string(code)
+            julia_atoms = tuple(julia_result["atoms"])
+            assert py_formula.atoms == julia_atoms, \
+                f"Atoms mismatch for {code}: Python={py_formula.atoms}, Julia={julia_atoms}"
 
 
 class TestAtomicDataReference:
