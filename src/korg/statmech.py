@@ -41,6 +41,7 @@ class ChemicalEquilibriumData(NamedTuple):
     mol_n_atoms: jnp.ndarray  # shape (n_molecules,)
     mol_log_K_values: jnp.ndarray  # shape (n_molecules, n_temps) - log K on T grid
     mol_partition_func_values: jnp.ndarray  # shape (n_molecules, n_temps) - U(T) for each molecule
+    mol_atom_consume: jnp.ndarray  # shape (n_molecules, 92) - atoms of each element per molecule
 
 
 def hummer_mihalas_w(T, n_eff, nH, nHe, ne, use_hubeny_generalization=False):
@@ -747,12 +748,19 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
         mol_n_atoms = jnp.array(mol_n_atoms_list, dtype=jnp.int32)
         mol_log_K_values = jnp.array(mol_log_K_list)
         mol_partition_func_values = jnp.array(mol_pf_list)
+        # mol_atom_consume[i, Z-1] = # atoms of element Z in molecule i
+        M_consume = np.zeros((n_molecules, MAX_ATOMIC_NUMBER), dtype=np.float64)
+        for i, mol in enumerate(molecules_all):
+            for Z in mol.get_atoms():
+                M_consume[i, int(Z) - 1] += 1.0
+        mol_atom_consume = jnp.array(M_consume)
     else:
         mol_atoms_array = jnp.zeros((0, 6), dtype=jnp.int32)
         mol_charges = jnp.array([], dtype=jnp.int32)
         mol_n_atoms = jnp.array([], dtype=jnp.int32)
         mol_log_K_values = jnp.zeros((0, n_temps))
         mol_partition_func_values = jnp.zeros((0, n_temps))
+        mol_atom_consume = jnp.zeros((0, MAX_ATOMIC_NUMBER))
 
     return ChemicalEquilibriumData(
         log_T_grid=log_T_grid,
@@ -763,7 +771,8 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
         mol_charges=mol_charges,
         mol_n_atoms=mol_n_atoms,
         mol_log_K_values=mol_log_K_values,
-        mol_partition_func_values=mol_partition_func_values
+        mol_partition_func_values=mol_partition_func_values,
+        mol_atom_consume=mol_atom_consume
     )
 
 
