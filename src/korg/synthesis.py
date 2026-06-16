@@ -1680,4 +1680,5 @@ def synthesize_jit(
         alpha_ref_all
     )
 
-    return flux, flux_cntm
+    # Convert cm⁻¹ → Å⁻¹ (1 cm = 1e8 Å)
+    return flux * 1e-8, flux_cntm * 1e-8

@@ -217,13 +217,11 @@ class TestSynthesisJIT:
             linelist_data=linelist_data
         )
 
-        # Convert JIT output to same units as normal (erg/s/cm^2/Å)
-        flux_jit_angstrom = np.array(flux_jit * 1e-8)  # cm⁻¹ to Å⁻¹
-
+        # Both synthesize and synthesize_jit now return erg/s/cm^2/Å — no conversion needed
         # Should be similar (within ~5% due to different approximations)
         # JIT uses simplified chemical equilibrium, so some difference expected
         np.testing.assert_allclose(
-            flux_jit_angstrom,
+            np.array(flux_jit),
             result_normal.flux,
             rtol=0.05,
             err_msg="JIT and normal synthesis should produce similar continuum"
@@ -291,16 +289,11 @@ class TestSynthesisJIT:
             linelist_data=linelist_data
         )
 
-        # Convert to erg/s/cm^2/Å
-        flux_angstrom = flux * 1e-8
-
-        # Physical checks
-        # Solar flux at 5000 Å in erg/s/cm^2/Å should be ~1e7 order of magnitude
-        # (flux_angstrom is flux * 1e-8 for conversion from per-cm to per-Angstrom)
-        assert 1e6 < flux_angstrom.mean() < 1e9, f"Unexpected flux magnitude: {flux_angstrom.mean():.2e}"
+        # Physical checks — synthesize_jit now returns erg/s/cm^2/Å (same as synthesize)
+        assert 1e6 < flux.mean() < 1e9, f"Unexpected flux magnitude: {float(flux.mean()):.2e}"
 
         # Spectrum should be relatively smooth (no huge jumps)
-        flux_changes = jnp.abs(jnp.diff(flux_angstrom) / flux_angstrom[:-1])
+        flux_changes = jnp.abs(jnp.diff(flux) / flux[:-1])
         assert jnp.max(flux_changes) < 0.1, "Spectrum has unexpectedly large discontinuities"
 
     def test_preprocess_linelist_empty(self):
