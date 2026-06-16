@@ -623,21 +623,21 @@ def newton_solve_jax(residuals_func, x0, ftol=1e-8, max_iter=1000):
 
         # Compute residuals
         F = residuals_func(x)
-        residual_norm = jnp.linalg.norm(F)
+        residual_norm = jnp.max(jnp.abs(F))
 
-        # Check convergence
+        # Check convergence (infinity norm, matching NLsolve's f_converged)
         converged = residual_norm < ftol
 
         # Compute Jacobian using forward-mode autodiff
         J = jax.jacfwd(residuals_func)(x)
 
-        # Tikhonov regularization to handle rank-deficient Jacobians
-        # (elements with zero abundance give zero rows in J)
+        # Tiny regularization only to handle exact singularity from zero-abundance
+        # elements; 1e-12 is far below ftol=1e-8 so it does not bias the solution.
         n = J.shape[0]
-        J_reg = J + 1e-8 * jnp.eye(n)
+        J_reg = J + 1e-12 * jnp.eye(n)
 
-        # Solve J * dx = -F for the Newton step
-        dx = jnp.linalg.lstsq(J_reg, -F, rcond=None)[0]
+        # Solve J * dx = -F for the Newton step (LU, matching Julia's A \ b)
+        dx = jnp.linalg.solve(J_reg, -F)
 
         # Replace NaN/Inf steps with zero
         dx = jnp.where(jnp.isfinite(dx), dx, 0.0)
@@ -649,7 +649,7 @@ def newton_solve_jax(residuals_func, x0, ftol=1e-8, max_iter=1000):
 
     # Initial state
     F0 = residuals_func(x0)
-    residual_norm0 = jnp.linalg.norm(F0)
+    residual_norm0 = jnp.max(jnp.abs(F0))
     converged0 = residual_norm0 < ftol
     init_state = (x0, 0, converged0, residual_norm0)
 
@@ -1378,22 +1378,19 @@ def chemical_equilibrium(T, n_total, ne_model, absolute_abundances,
     )
 
 
-    # Solve using JAX-based Newton's method (like Julia's NLsolve)
-    # Residuals in _compute_residuals_core are normalized (element residuals divided
-    # by atom_number_densities, electron residual divided by ne*1e-5), so ftol is
-    # dimensionless. 1e-4 is safely above float32 precision (~1e-7) while tight
-    # enough that the solver must actually converge, not just accept the initial guess.
-    ftol = 1e-4
+    # Solve using JAX-based Newton's method (like Julia's NLsolve with
+    # method=:newton, ftol=1e-8, iterations=1000; convergence is via ∞-norm).
+    ftol = 1e-8
     try:
         x_solution, converged, residual_norm, iterations = newton_solve_jax(
-            residuals_func, x0, ftol=ftol, max_iter=100
+            residuals_func, x0, ftol=ftol, max_iter=1000
         )
 
         if not converged:
             # Try again with very small ne guess (like Julia does)
             x0_retry = x0.at[-1].set(1e-5)
             x_solution, converged, residual_norm, iterations = newton_solve_jax(
-                residuals_func, x0_retry, ftol=ftol, max_iter=100
+                residuals_func, x0_retry, ftol=ftol, max_iter=1000
             )
 
         if not converged:
