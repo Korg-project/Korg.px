@@ -31,7 +31,7 @@ from .line_absorption import line_absorption, _vdW_to_tuple, _voigt_profile_jax
 from .hydrogen_line_absorption import (hydrogen_line_absorption, precompute_hummer_ws,
                                        hline_stark_profiles,
                                        hydrogen_line_absorption_stark_batched)
-from .atomic_data import atomic_masses
+from .atomic_data import atomic_masses, atomic_symbols
 from .abundances import A_X_to_absolute
 
 
@@ -245,12 +245,20 @@ def get_reference_wavelength_linelist(linelist: List[Line],
     ref_linelist : list of Line
         Lines to use when computing opacity at the reference wavelength
     """
-    # Filter to ±21 Å window around the reference wavelength (matches Julia)
+    # Julia: when use_internal_reference_linelist=true and ref wl is 5000 Å,
+    # always use the built-in list unconditionally (user linelist is ignored).
+    if use_internal_reference_linelist and reference_wavelength_cm == 5e-5:
+        from .data_loader import load_default_linelist
+        try:
+            return load_default_linelist(reference_wavelength_cm)
+        except Exception:
+            pass
+
+    # For non-5000 Å references (or when built-in is disabled), use the user's linelist.
     window_cm = np.array([reference_wavelength_cm, reference_wavelength_cm])
     buffer_cm = 21e-8  # 21 Å in cm
     filtered = filter_linelist(linelist, window_cm, buffer_cm, warn_empty=False)
 
-    # If using a non-5000 Å reference and no lines found, error
     if reference_wavelength_cm != 5e-5 and len(filtered) == 0:
         raise ValueError(
             f"The provided linelist contains no lines near the reference wavelength "
@@ -258,30 +266,14 @@ def get_reference_wavelength_linelist(linelist: List[Line],
             f"only for 5000 Å (the MARCS default)."
         )
 
-    # If enough lines span the reference wavelength, use them
     if len(filtered) > 0 and filtered[0].wl <= reference_wavelength_cm <= filtered[-1].wl:
         return filtered
 
-    # Fall back to or supplement with the built-in 5000 Å linelist
-    if use_internal_reference_linelist and reference_wavelength_cm == 5e-5:
-        from .data_loader import load_default_linelist
-        try:
-            builtin = load_default_linelist(reference_wavelength_cm)
-        except Exception:
-            builtin = []
-
-        if len(filtered) == 0:
-            return builtin
-
-        # Supplement: prepend built-in lines below the user's coverage
-        if len(filtered) > 0 and filtered[0].wl > reference_wavelength_cm:
-            prefix = [l for l in builtin if l.wl < filtered[0].wl]
-            return prefix + filtered
-
-        # Supplement: append built-in lines above the user's coverage
-        if len(filtered) > 0 and filtered[-1].wl < reference_wavelength_cm:
-            suffix = [l for l in builtin if l.wl > filtered[-1].wl]
-            return filtered + suffix
+    # Filter lines below the reference wavelength that aren't already covered
+    if len(filtered) > 0 and filtered[0].wl > reference_wavelength_cm:
+        return filtered
+    if len(filtered) > 0 and filtered[-1].wl < reference_wavelength_cm:
+        return filtered
 
     return filtered
 
@@ -526,6 +518,23 @@ def synthesize_spectrum(
         timings['continuum_absorption'] = t_cntm_abs
         timings['source_function'] = t_source_fn
         t0 = time.time()
+
+    # Add line absorption at reference wavelength to alpha_ref (matching Julia).
+    # Julia's alpha_ref = continuum + line opacity at 5000 Å, which correctly accounts
+    # for the total opacity that determines the MARCS depth scale.
+    ref_ll_for_ref = get_reference_wavelength_linelist(linelist, lambda_ref_cm)
+    if ref_ll_for_ref:
+        def _cntm_at_ref_wl(wl_cm):
+            wl_arr = np.atleast_1d(wl_cm)
+            result = np.stack([alpha_cntm_interps[i](wl_arr) for i in range(n_layers)], axis=-1)
+            return result if np.ndim(wl_cm) > 0 else result[0]
+        line_at_ref = line_absorption(
+            ref_ll_for_ref, np.array([lambda_ref_cm]),
+            T, electron_densities, number_densities,
+            partition_funcs, vmic_cm_s, _cntm_at_ref_wl,
+            cutoff_threshold=line_cutoff_threshold,
+        )  # (n_layers, 1)
+        alpha_ref += np.asarray(line_at_ref[:, 0])
 
     # Compute continuum flux if requested
     continuum_flux = None
@@ -1902,6 +1911,33 @@ def synthesize_jit(
     alpha_ref_all = jax.vmap(
         lambda row: jnp.interp(jnp.array([lambda_ref_cm]), cntm_wl_jnp, row)[0]
     )(alpha_cntm_coarse)  # (n_layers,)
+
+    # Add line absorption at reference wavelength to alpha_ref_all (matching Julia).
+    # Julia's alpha_ref = continuum + lines at 5000 Å.
+    from .data_loader import load_default_linelist as _load_ref_ll
+    _ref_ll = _load_ref_ll(lambda_ref_cm)
+    if _ref_ll:
+        _T_np = np.asarray(T_layers)
+        _ne_np = np.asarray(ne_all)
+        _neutral_np = np.asarray(neutral_dens_final)   # (n_layers, 92)
+        _ionized_np = np.asarray(ionized_dens_final)   # (n_layers, 92)
+        _nd_ref = {}
+        for _Z in range(1, 93):
+            _sym = atomic_symbols[_Z - 1]
+            _nd_ref[Species(f'{_sym}_I')]  = _neutral_np[:, _Z - 1]
+            _nd_ref[Species(f'{_sym}_II')] = _ionized_np[:, _Z - 1]
+        _cntm_coarse_np = np.asarray(alpha_cntm_coarse)
+        def _cntm_at_ref_jit_fn(wl_cm):
+            wl_arr = np.atleast_1d(wl_cm)
+            result = np.stack([np.interp(wl_arr, cntm_wl_np, _cntm_coarse_np[i]) for i in range(n_layers)], axis=-1)
+            return result if np.ndim(wl_cm) > 0 else result[0]
+        _line_at_ref = line_absorption(
+            _ref_ll, np.array([lambda_ref_cm]),
+            _T_np, _ne_np, _nd_ref,
+            default_partition_funcs, float(vmic_cm_s), _cntm_at_ref_jit_fn,
+            cutoff_threshold=3e-4,
+        )  # (n_layers, 1)
+        alpha_ref_all = alpha_ref_all + jnp.array(_line_at_ref[:, 0])
 
     # Source function: Planck function per layer at all wavelengths
     S_all = jax.vmap(lambda T_i: blackbody(T_i, wavelengths_cm))(T_layers)  # (n_layers, n_wl)
