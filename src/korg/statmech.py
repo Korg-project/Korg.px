@@ -33,6 +33,14 @@ class ChemicalEquilibriumData(NamedTuple):
     # Partition function values on T grid: shape (92, 3, n_temps)
     # For each element Z, ionization states 0,1,2
     partition_func_values: jnp.ndarray
+    # Original CubicSpline knots for atomic partition functions (padded to 201 with inf/zeros)
+    pf_orig_t: jnp.ndarray   # shape (92, 3, 201) — knot positions (log T)
+    pf_orig_u: jnp.ndarray   # shape (92, 3, 201) — knot values
+    pf_orig_h: jnp.ndarray   # shape (92, 3, 201) — h[i] = t[i] - t[i-1]
+    pf_orig_z: jnp.ndarray   # shape (92, 3, 201) — second derivatives
+    pf_orig_n: jnp.ndarray   # shape (92, 3) int32 — number of valid knots
+    # h array for uniform-grid cubic spline (used for molecular partition funcs)
+    log_T_h: jnp.ndarray     # shape (n_temps,): [0, Δlog_T, ...]
 
     # Molecular data
     n_molecules: int
@@ -41,6 +49,7 @@ class ChemicalEquilibriumData(NamedTuple):
     mol_n_atoms: jnp.ndarray  # shape (n_molecules,)
     mol_log_K_values: jnp.ndarray  # shape (n_molecules, n_temps) - log K on T grid
     mol_partition_func_values: jnp.ndarray  # shape (n_molecules, n_temps) - U(T) for each molecule
+    mol_partition_func_z: jnp.ndarray  # cubic spline z for mol partition funcs: (n_molecules, n_temps)
     mol_atom_consume: jnp.ndarray  # shape (n_molecules, 92) - atoms of each element per molecule
 
 
@@ -693,7 +702,15 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
 
     # Build partition function values on T grid using numpy (no JAX compilation).
     # Shape: (92, 3, n_temps) for elements 1-92, charge states 0,1,2
+    from .cubic_splines import cubic_spline as _make_cubic_spline
+    MAX_ATOM_KNOTS = 201
     pf_values = np.zeros((MAX_ATOMIC_NUMBER, 3, n_temps))
+    # Original CubicSpline knot arrays, padded to MAX_ATOM_KNOTS
+    pf_orig_t = np.full((MAX_ATOMIC_NUMBER, 3, MAX_ATOM_KNOTS), np.inf)
+    pf_orig_u = np.zeros((MAX_ATOMIC_NUMBER, 3, MAX_ATOM_KNOTS))
+    pf_orig_h = np.zeros((MAX_ATOMIC_NUMBER, 3, MAX_ATOM_KNOTS))
+    pf_orig_z = np.zeros((MAX_ATOMIC_NUMBER, 3, MAX_ATOM_KNOTS))
+    pf_orig_n = np.ones((MAX_ATOMIC_NUMBER, 3), dtype=np.int32)  # default 1 (safe dummy)
     log_T_np = np.asarray(log_T_grid)
     for Z in range(1, MAX_ATOMIC_NUMBER + 1):
         formula = Formula(Z)
@@ -701,11 +718,28 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
             species = Species(formula, charge)
             if species in partition_funcs:
                 pf_func = partition_funcs[species]
-                # Use numpy_eval if available (avoids JAX compilation for each unique knot shape)
+                interp = getattr(pf_func, '_interpolator', pf_func)
+                # Use numpy_eval for the tabulated values (Picard iteration / jnp.interp)
                 if hasattr(pf_func, 'numpy_eval'):
                     pf_values[Z-1, charge, :] = pf_func.numpy_eval(log_T_np)
                 else:
                     pf_values[Z-1, charge, :] = np.asarray(pf_func(log_T_np))
+                # Store original CubicSpline knots for exact evaluation in line absorption
+                if hasattr(interp, 't'):
+                    n = len(interp.t)
+                    pf_orig_t[Z-1, charge, :n] = np.asarray(interp.t)
+                    pf_orig_u[Z-1, charge, :n] = np.asarray(interp.u)
+                    pf_orig_h[Z-1, charge, :n] = np.asarray(interp.h)
+                    pf_orig_z[Z-1, charge, :n] = np.asarray(interp.z)
+                    pf_orig_n[Z-1, charge]      = n
+                else:
+                    # Fallback: fit spline through tabulated values
+                    cs = _make_cubic_spline(log_T_np, pf_values[Z-1, charge, :], extrapolate=True)
+                    pf_orig_t[Z-1, charge, :n_temps] = log_T_np
+                    pf_orig_u[Z-1, charge, :n_temps] = np.asarray(cs.u)
+                    pf_orig_h[Z-1, charge, :n_temps] = np.asarray(cs.h)
+                    pf_orig_z[Z-1, charge, :n_temps] = np.asarray(cs.z)
+                    pf_orig_n[Z-1, charge]            = n_temps
 
     # Process molecules
     molecules_all = list(log_equilibrium_constants.keys())
@@ -742,12 +776,22 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
             mol_pf_list.append(np.ones(n_temps))  # fallback: U=1
 
     n_molecules = len(molecules_all)
+
+    # Precompute h array for cubic spline eval: [0, Δlog_T, ...]
+    log_T_h = np.concatenate([[0.0], np.diff(log_T_np)])
+
     if n_molecules > 0:
         mol_atoms_array = jnp.array(mol_atoms_list, dtype=jnp.int32)
         mol_charges = jnp.array(mol_charges_list, dtype=jnp.int32)
         mol_n_atoms = jnp.array(mol_n_atoms_list, dtype=jnp.int32)
         mol_log_K_values = jnp.array(mol_log_K_list)
-        mol_partition_func_values = jnp.array(mol_pf_list)
+        mol_pf_np = np.array(mol_pf_list)
+        mol_partition_func_values = jnp.array(mol_pf_np)
+        mol_pf_z_np = np.zeros_like(mol_pf_np)
+        for i in range(n_molecules):
+            cs = _make_cubic_spline(log_T_np, mol_pf_np[i], extrapolate=True)
+            mol_pf_z_np[i] = np.asarray(cs.z)
+        mol_partition_func_z = jnp.array(mol_pf_z_np)
         # mol_atom_consume[i, Z-1] = # atoms of element Z in molecule i
         M_consume = np.zeros((n_molecules, MAX_ATOMIC_NUMBER), dtype=np.float64)
         for i, mol in enumerate(molecules_all):
@@ -760,18 +804,26 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
         mol_n_atoms = jnp.array([], dtype=jnp.int32)
         mol_log_K_values = jnp.zeros((0, n_temps))
         mol_partition_func_values = jnp.zeros((0, n_temps))
+        mol_partition_func_z = jnp.zeros((0, n_temps))
         mol_atom_consume = jnp.zeros((0, MAX_ATOMIC_NUMBER))
 
     return ChemicalEquilibriumData(
         log_T_grid=log_T_grid,
         ionization_energies=jnp.array(ion_energies),
         partition_func_values=jnp.array(pf_values),
+        pf_orig_t=jnp.array(pf_orig_t),
+        pf_orig_u=jnp.array(pf_orig_u),
+        pf_orig_h=jnp.array(pf_orig_h),
+        pf_orig_z=jnp.array(pf_orig_z),
+        pf_orig_n=jnp.array(pf_orig_n, dtype=jnp.int32),
+        log_T_h=jnp.array(log_T_h),
         n_molecules=n_molecules,
         mol_atoms_array=mol_atoms_array,
         mol_charges=mol_charges,
         mol_n_atoms=mol_n_atoms,
         mol_log_K_values=mol_log_K_values,
         mol_partition_func_values=mol_partition_func_values,
+        mol_partition_func_z=mol_partition_func_z,
         mol_atom_consume=mol_atom_consume
     )
 

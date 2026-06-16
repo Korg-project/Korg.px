@@ -1048,11 +1048,20 @@ def save_synthesis_data(data: SynthesisData, path: str) -> None:
         log_T_grid=np.asarray(data.chem_eq_data.log_T_grid),
         ionization_energies=np.asarray(data.chem_eq_data.ionization_energies),
         partition_func_values=np.asarray(data.chem_eq_data.partition_func_values),
+        pf_orig_t=np.asarray(data.chem_eq_data.pf_orig_t),
+        pf_orig_u=np.asarray(data.chem_eq_data.pf_orig_u),
+        pf_orig_h=np.asarray(data.chem_eq_data.pf_orig_h),
+        pf_orig_z=np.asarray(data.chem_eq_data.pf_orig_z),
+        pf_orig_n=np.asarray(data.chem_eq_data.pf_orig_n),
+        log_T_h=np.asarray(data.chem_eq_data.log_T_h),
         n_molecules=data.chem_eq_data.n_molecules,
         mol_atoms_array=np.asarray(data.chem_eq_data.mol_atoms_array),
         mol_charges=np.asarray(data.chem_eq_data.mol_charges),
         mol_n_atoms=np.asarray(data.chem_eq_data.mol_n_atoms),
         mol_log_K_values=np.asarray(data.chem_eq_data.mol_log_K_values),
+        mol_partition_func_values=np.asarray(data.chem_eq_data.mol_partition_func_values),
+        mol_partition_func_z=np.asarray(data.chem_eq_data.mol_partition_func_z),
+        mol_atom_consume=np.asarray(data.chem_eq_data.mol_atom_consume),
         # Gaunt factor tables
         gaunt_log_u_grid=np.asarray(data.gaunt_log_u_grid),
         gaunt_log_gamma2_grid=np.asarray(data.gaunt_log_gamma2_grid),
@@ -1092,11 +1101,20 @@ def load_synthesis_data(path: Optional[str] = None) -> SynthesisData:
             log_T_grid=jnp.array(f['log_T_grid']),
             ionization_energies=jnp.array(f['ionization_energies']),
             partition_func_values=jnp.array(f['partition_func_values']),
+            pf_orig_t=jnp.array(f['pf_orig_t']),
+            pf_orig_u=jnp.array(f['pf_orig_u']),
+            pf_orig_h=jnp.array(f['pf_orig_h']),
+            pf_orig_z=jnp.array(f['pf_orig_z']),
+            pf_orig_n=jnp.array(f['pf_orig_n'], dtype=jnp.int32),
+            log_T_h=jnp.array(f['log_T_h']),
             n_molecules=int(f['n_molecules']),
             mol_atoms_array=jnp.array(f['mol_atoms_array']),
             mol_charges=jnp.array(f['mol_charges']),
             mol_n_atoms=jnp.array(f['mol_n_atoms']),
             mol_log_K_values=jnp.array(f['mol_log_K_values']),
+            mol_partition_func_values=jnp.array(f['mol_partition_func_values']),
+            mol_partition_func_z=jnp.array(f['mol_partition_func_z']),
+            mol_atom_consume=jnp.array(f['mol_atom_consume']),
         )
         return SynthesisData(
             chem_eq_data=chem_eq_data,
@@ -1597,12 +1615,48 @@ def _compute_number_densities_jit(T, n_total, ne, abundances, data):
     # H2 (very approximate - assume negligible for now)
     nH2 = 0.0
 
-    # Partition function for H I
+    # Partition function for H I (uses original CubicSpline knots — exact match to synthesize)
     log_T = jnp.log(T)
-    U_H_I = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
-                       data.chem_eq_data.partition_func_values[0, 0])
+    U_H_I = _pf_orig_eval(
+        log_T, data.chem_eq_data.pf_orig_t[0, 0], data.chem_eq_data.pf_orig_u[0, 0],
+        data.chem_eq_data.pf_orig_h[0, 0], data.chem_eq_data.pf_orig_z[0, 0],
+        data.chem_eq_data.pf_orig_n[0, 0],
+    )
 
     return nH_I, nH_II, nHe_I, nH2, U_H_I, n_neutral, n_ion, neutral_fracs, ne_sol
+
+
+def _pf_spline_eval(log_T, t_grid, h_grid, u_vals, z_vals):
+    """Evaluate uniform-grid cubic spline at log_T. Used for molecular partition funcs."""
+    log_T_c = jnp.clip(log_T, t_grid[0], t_grid[-1])
+    i = jnp.clip(jnp.searchsorted(t_grid, log_T_c, side='right') - 1, 0, t_grid.shape[0] - 2)
+    ti  = t_grid[i];   ti1 = t_grid[i + 1]
+    ui  = u_vals[i];   ui1 = u_vals[i + 1]
+    zi  = z_vals[i];   zi1 = z_vals[i + 1]
+    hi1 = h_grid[i + 1]
+    return (zi  * (ti1 - log_T_c)**3 / (6.0 * hi1)
+            + zi1 * (log_T_c - ti )**3 / (6.0 * hi1)
+            + (ui1 / hi1 - zi1 * hi1 / 6.0) * (log_T_c - ti )
+            + (ui  / hi1 - zi  * hi1 / 6.0) * (ti1 - log_T_c))
+
+
+def _pf_orig_eval(log_T, t_arr, u_arr, h_arr, z_arr, n_knots):
+    """Evaluate original CubicSpline knots at log_T. Exactly matches CubicSpline.__call__.
+
+    t_arr/u_arr/h_arr/z_arr are padded to 201 entries (inf in tail of t_arr).
+    n_knots is the number of valid (unpadded) knots — may be a traced JAX integer.
+    """
+    t_max = t_arr[n_knots - 1]
+    log_T_c = jnp.clip(log_T, t_arr[0], t_max)
+    i = jnp.clip(jnp.searchsorted(t_arr, log_T_c, side='right') - 1, 0, n_knots - 2)
+    ti  = t_arr[i];   ti1 = t_arr[i + 1]
+    ui  = u_arr[i];   ui1 = u_arr[i + 1]
+    zi  = z_arr[i];   zi1 = z_arr[i + 1]
+    hi1 = h_arr[i + 1]
+    return (zi  * (ti1 - log_T_c)**3 / (6.0 * hi1)
+            + zi1 * (log_T_c - ti )**3 / (6.0 * hi1)
+            + (ui1 / hi1 - zi1 * hi1 / 6.0) * (log_T_c - ti )
+            + (ui  / hi1 - zi  * hi1 / 6.0) * (ti1 - log_T_c))
 
 
 @jax.jit
@@ -1643,10 +1697,18 @@ def _compute_line_params_jit(
             n_mol     = mol_densities_i[safe_mol_idx]
             n_species = jnp.where(mol_idx >= 0, n_mol, n_atomic)
             log_T = jnp.log(T_i)
-            U_atomic = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
-                                  data.chem_eq_data.partition_func_values[Z - 1, charge])
-            U_mol = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
-                               data.chem_eq_data.mol_partition_func_values[safe_pf_mol_idx])
+            U_atomic = _pf_orig_eval(
+                log_T, data.chem_eq_data.pf_orig_t[Z - 1, charge],
+                data.chem_eq_data.pf_orig_u[Z - 1, charge],
+                data.chem_eq_data.pf_orig_h[Z - 1, charge],
+                data.chem_eq_data.pf_orig_z[Z - 1, charge],
+                data.chem_eq_data.pf_orig_n[Z - 1, charge],
+            )
+            U_mol = _pf_spline_eval(
+                log_T, data.chem_eq_data.log_T_grid, data.chem_eq_data.log_T_h,
+                data.chem_eq_data.mol_partition_func_values[safe_pf_mol_idx],
+                data.chem_eq_data.mol_partition_func_z[safe_pf_mol_idx],
+            )
             U = jnp.where(mol_idx >= 0, U_mol, U_atomic)
             sigma_D = wl_center * jnp.sqrt(kboltz_cgs * T_i / mass + vmic_cm_s**2 / 2.0) / c_cgs
             g_stark = gamma_stark_l * (T_i / 1e4)**(1.0 / 6.0) * ne_i
@@ -1769,15 +1831,21 @@ def synthesize_jit(
     nH_II_all = ionized_dens_final[:, 0]
     nHe_I_all = neutral_dens_final[:, 1]
 
-    # Partition functions for H I and He I at each layer
+    # Partition functions for H I and He I at each layer (original knots — exact match to synthesize)
     log_T_all = jnp.log(T_layers)
     U_H_I_all = jax.vmap(
-        lambda lt: jnp.interp(lt, data.chem_eq_data.log_T_grid,
-                              data.chem_eq_data.partition_func_values[0, 0])
+        lambda lt: _pf_orig_eval(
+            lt, data.chem_eq_data.pf_orig_t[0, 0], data.chem_eq_data.pf_orig_u[0, 0],
+            data.chem_eq_data.pf_orig_h[0, 0], data.chem_eq_data.pf_orig_z[0, 0],
+            data.chem_eq_data.pf_orig_n[0, 0],
+        )
     )(log_T_all)  # (n_layers,)
     U_He_I_all = jax.vmap(
-        lambda lt: jnp.interp(lt, data.chem_eq_data.log_T_grid,
-                              data.chem_eq_data.partition_func_values[1, 0])
+        lambda lt: _pf_orig_eval(
+            lt, data.chem_eq_data.pf_orig_t[1, 0], data.chem_eq_data.pf_orig_u[1, 0],
+            data.chem_eq_data.pf_orig_h[1, 0], data.chem_eq_data.pf_orig_z[1, 0],
+            data.chem_eq_data.pf_orig_n[1, 0],
+        )
     )(log_T_all)  # (n_layers,)
 
     # Pad mol_dens with a zero column so mol_species_idx == -1 can safely index it
@@ -1808,23 +1876,32 @@ def synthesize_jit(
     )  # (n_layers, n_metal)
 
     # ── Phase 3: Continuum opacity + source function (batched over all layers) ─
-    # Uses the full continuum function matching synthesize's batch_continuum_absorption.
-    # Evaluates at all output wavelengths directly (no coarse-grid interpolation).
-    nu_all = c_cgs / wavelengths_cm                                     # (n_wl,) frequencies
-    alpha_cntm_all = _batch_continuum_vmap(
-        nu_all, T_layers, ne_all, U_H_I_all, U_He_I_all,
-        nH_I_all, nH_II_all, nHe_I_all, nH2_all,
-        n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
-        data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
-    )  # (n_layers, n_wl)
+    # Uses synthesize's coarse 1 Å grid + linear interpolation to match exactly.
+    # synthesize computes continuum at cntm_step=1.0 Å grid, then interp1d(kind='linear').
+    c_cgs_float = float(c_cgs)
+    wl_min_cm = float(wavelengths_cm[0])
+    wl_max_cm = float(wavelengths_cm[-1])
+    cntm_step_cm = 1e-8  # 1.0 Å, matching synthesize default cntm_step
+    cntm_wl_np = np.arange(wl_min_cm - cntm_step_cm, wl_max_cm + 2 * cntm_step_cm, cntm_step_cm)
+    cntm_nu_np = c_cgs_float / cntm_wl_np  # (n_cntm,) decreasing frequencies
 
-    nu_ref = c_cgs / lambda_ref_cm
-    alpha_ref_all = _batch_continuum_vmap(
-        jnp.array([nu_ref]), T_layers, ne_all, U_H_I_all, U_He_I_all,
+    alpha_cntm_coarse = _batch_continuum_vmap(
+        jnp.array(cntm_nu_np), T_layers, ne_all, U_H_I_all, U_He_I_all,
         nH_I_all, nH_II_all, nHe_I_all, nH2_all,
         n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
         data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
-    )[:, 0]  # (n_layers,)
+    )  # (n_layers, n_cntm)
+
+    # Interpolate to fine output grid (matches synthesize's interp1d linear)
+    cntm_wl_jnp = jnp.array(cntm_wl_np)
+    alpha_cntm_all = jax.vmap(
+        lambda row: jnp.interp(wavelengths_cm, cntm_wl_jnp, row)
+    )(alpha_cntm_coarse)  # (n_layers, n_wl)
+
+    # Reference opacity at lambda_ref from coarse grid (matches synthesize's alpha_cntm_interp(lambda_ref))
+    alpha_ref_all = jax.vmap(
+        lambda row: jnp.interp(jnp.array([lambda_ref_cm]), cntm_wl_jnp, row)[0]
+    )(alpha_cntm_coarse)  # (n_layers,)
 
     # Source function: Planck function per layer at all wavelengths
     S_all = jax.vmap(lambda T_i: blackbody(T_i, wavelengths_cm))(T_layers)  # (n_layers, n_wl)
@@ -1851,12 +1928,15 @@ def synthesize_jit(
         gamma_np   = np.asarray(gamma_L_jax)
         wl_np      = np.asarray(wavelengths_cm)
         wls_np     = np.asarray(linelist_data.wl)
-        cntm_np    = np.asarray(alpha_cntm_all)  # (n_layers, n_wl)
 
         wl_spacing = float(np.median(np.diff(wl_np))) if n_wl > 1 else 5e-9
 
-        i_ctr_np = np.clip(np.searchsorted(wl_np, wls_np), 0, n_wl - 1)
-        cntm_at_center = cntm_np[:, i_ctr_np].T  # (n_lines, n_layers)
+        # Interpolate continuum at line centers from the coarse grid (one interp step,
+        # matching synthesize's alpha_cntm_interp(wl_centers) exactly)
+        cntm_coarse_np = np.asarray(alpha_cntm_coarse)
+        cntm_at_center = np.array(
+            [np.interp(wls_np, cntm_wl_np, cntm_coarse_np[i]) for i in range(n_layers)]
+        ).T  # (n_lines, n_layers)
 
         _CUTOFF = 3e-4
         rho_crit = _CUTOFF * cntm_at_center / np.maximum(np.abs(amp_np), 1e-300)
