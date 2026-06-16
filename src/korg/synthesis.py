@@ -20,7 +20,8 @@ from .statmech import (chemical_equilibrium, chemical_equilibrium_fast,
 from .data_loader import (ionization_energies, default_partition_funcs,
                           default_log_equilibrium_constants,
                           default_chem_eq_data, default_mol_species)
-from .continuum import prepare_continuum_batch, prepare_continuum_batch_fast, batch_continuum_absorption
+from .continuum import (prepare_continuum_batch, prepare_continuum_batch_fast, batch_continuum_absorption,
+                        Hminus_bf, Hminus_ff)
 from .constants import (electron_mass_cgs, electron_charge_cgs, c_cgs,
                         kboltz_eV, hplanck_eV, hplanck_cgs, kboltz_cgs)
 from .radiative_transfer import radiative_transfer, radiative_transfer_jit
@@ -1401,9 +1402,9 @@ def _continuum_absorption_jit(wavelength_cm, T, ne, nH_I, nH_II, nHe_I, nH2, U_H
     # H I free-free
     alpha_H_ff = _hydrogenic_ff_jit(nu, T, 1, nH_II, ne, data)
 
-    # H⁻ bound-free and free-free
-    alpha_Hminus_bf = _hminus_bf_jit(nu, T, nH_I_div_U, ne)
-    alpha_Hminus_ff = _hminus_ff_jit(nu, T, nH_I_div_U, ne)
+    # H⁻ bound-free and free-free — use accurate tabulated functions from continuum.py
+    alpha_Hminus_bf = Hminus_bf(nu, T, nH_I_div_U, ne)
+    alpha_Hminus_ff = Hminus_ff(nu, T, nH_I_div_U, ne)
 
     return alpha_rayleigh + alpha_electron + alpha_H_ff + alpha_Hminus_bf + alpha_Hminus_ff
 
@@ -1654,11 +1655,12 @@ def synthesize_jit(
 
             return jax.vmap(per_layer)(T_layers, ne_calc, nH_I_all, n_neutral_all, n_ion_all)
 
-        # ── Phase 1: Compute all windowed contributions in parallel ──────────
-        # Shape: (n_lines, n_layers, W_MAX)  ← much smaller than (n_lines, n_layers, n_wl)
+        # Compute all windowed contributions in parallel.
+        # Shape: (n_lines, n_layers, W_MAX)  — manageable when linelist is pre-filtered
+        # to the synthesis range (callers should filter before calling synthesize_jit).
         all_contribs = jax.vmap(per_line)(jnp.arange(n_lines))
 
-        # ── Phase 2: Scatter-add windows into the full α array ───────────────
+        # Scatter-add windows into the full α array.
         # scatter_idx[l, w] = i_lo[l] + w  → destination pixel for (line l, offset w)
         scatter_idx = i_lo[:, None] + jnp.arange(W_MAX)[None, :]        # (n_lines, W_MAX)
         flat_idx    = scatter_idx.reshape(-1)                             # (n_lines * W_MAX,)
