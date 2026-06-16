@@ -907,7 +907,8 @@ import jax
 from typing import NamedTuple
 from .statmech import (ChemicalEquilibriumData, precompute_chemical_equilibrium_data,
                        chemical_equilibrium_jit, MAX_ATOMIC_NUMBER,
-                       _compute_saha_weights_jit, translational_U)
+                       _compute_saha_weights_jit, translational_U,
+                       _compute_mol_densities_jit)
 
 
 class LinelistData(NamedTuple):
@@ -927,6 +928,7 @@ class LinelistData(NamedTuple):
     vdW_sigma: jnp.ndarray    # van der Waals sigma
     vdW_alpha: jnp.ndarray    # van der Waals alpha (-1 for simple scaling)
     mass: jnp.ndarray         # Species mass [g]
+    mol_species_idx: jnp.ndarray  # Index into mol_densities array; -1 for atomic species
 
 
 class SynthesisData(NamedTuple):
@@ -1067,7 +1069,7 @@ def load_synthesis_data(path: Optional[str] = None) -> SynthesisData:
         )
 
 
-def preprocess_linelist(linelist: List[Line]) -> LinelistData:
+def preprocess_linelist(linelist: List[Line], chem_eq_data=None) -> LinelistData:
     """
     Convert a list of Line objects to JAX-compatible arrays.
 
@@ -1075,6 +1077,10 @@ def preprocess_linelist(linelist: List[Line]) -> LinelistData:
     ----------
     linelist : list of Line
         Standard linelist with Line objects
+    chem_eq_data : ChemicalEquilibriumData, optional
+        Pre-computed chemical equilibrium data. When provided, molecular species
+        are matched against mol_atoms_array and mol_species_idx is set to the
+        molecule's index; otherwise mol_species_idx is -1 for all lines.
 
     Returns
     -------
@@ -1093,8 +1099,17 @@ def preprocess_linelist(linelist: List[Line]) -> LinelistData:
             gamma_stark=jnp.array([]),
             vdW_sigma=jnp.array([]),
             vdW_alpha=jnp.array([]),
-            mass=jnp.array([])
+            mass=jnp.array([]),
+            mol_species_idx=jnp.array([], dtype=jnp.int32)
         )
+
+    # Build molecule lookup table if chem_eq_data is provided
+    mol_atoms_np = None
+    mol_charges_np = None
+    if chem_eq_data is not None and chem_eq_data.n_molecules > 0:
+        import numpy as _np
+        mol_atoms_np = _np.array(chem_eq_data.mol_atoms_array)   # (n_mols, 6)
+        mol_charges_np = _np.array(chem_eq_data.mol_charges)     # (n_mols,)
 
     n_lines = len(linelist)
     wl = jnp.array([line.wl for line in linelist])
@@ -1104,12 +1119,26 @@ def preprocess_linelist(linelist: List[Line]) -> LinelistData:
     species_Z = []
     species_charge = []
     masses = []
+    mol_species_idx_list = []
     for line in linelist:
         atoms = line.species.get_atoms()
         Z = int(atoms[0]) if len(atoms) > 0 else 1
         species_Z.append(Z)
         species_charge.append(line.species.charge)
         masses.append(line.species.get_mass())
+
+        # Determine mol_species_idx: match molecular lines against chem_eq_data
+        mol_idx = -1
+        if len(atoms) > 1 and mol_atoms_np is not None:
+            atoms_z1 = sorted([int(a) - 1 for a in atoms])
+            padded = atoms_z1 + [-1] * (6 - len(atoms_z1))
+            line_charge = line.species.charge
+            for i in range(mol_atoms_np.shape[0]):
+                if (list(mol_atoms_np[i]) == padded and
+                        int(mol_charges_np[i]) == line_charge):
+                    mol_idx = i
+                    break
+        mol_species_idx_list.append(mol_idx)
 
     E_lower = jnp.array([line.E_lower for line in linelist])
     gamma_rad = jnp.array([line.gamma_rad for line in linelist])
@@ -1132,7 +1161,8 @@ def preprocess_linelist(linelist: List[Line]) -> LinelistData:
         gamma_stark=gamma_stark,
         vdW_sigma=vdW_sigma,
         vdW_alpha=vdW_alpha,
-        mass=jnp.array(masses)
+        mass=jnp.array(masses),
+        mol_species_idx=jnp.array(mol_species_idx_list, dtype=jnp.int32)
     )
 
 
@@ -1473,17 +1503,19 @@ def _line_profile_jit(wl_center, sigma_D, gamma_L, amplitude, wl):
 
 def _compute_number_densities_jit(T, n_total, ne, abundances, data):
     """
-    Compute species number densities from Saha equation (JIT-compatible).
+    Compute species number densities using Picard-iterated chemical equilibrium (JIT-compatible).
 
-    Returns arrays indexed by (Z-1) for H I, H II, He I, H2.
+    Returns arrays indexed by (Z-1) for H I, H II, He I, H2, plus the self-consistent ne.
     """
-    # Get neutral fractions from Saha equation
-    wII, wIII = _compute_saha_weights_jit(T, ne, data.chem_eq_data)
+    # Picard iteration for self-consistent electron density and neutral fractions
+    ne_sol, neutral_fracs = chemical_equilibrium_jit(T, n_total, ne, abundances, data.chem_eq_data)
 
-    neutral_fracs = 1.0 / (1.0 + wII + wIII)
+    # First-ionization weights at the self-consistent ne
+    wII_ne1, _ = _compute_saha_weights_jit(T, 1.0, data.chem_eq_data)
+    wII = wII_ne1 / jnp.clip(ne_sol, 1e-12, jnp.inf)
 
     # Atom number densities
-    atom_n = abundances * (n_total - ne)
+    atom_n = abundances * (n_total - ne_sol)
 
     # Neutral densities
     n_neutral = atom_n * neutral_fracs
@@ -1504,7 +1536,7 @@ def _compute_number_densities_jit(T, n_total, ne, abundances, data):
     U_H_I = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
                        data.chem_eq_data.partition_func_values[0, 0])
 
-    return nH_I, nH_II, nHe_I, nH2, U_H_I, n_neutral, n_ion
+    return nH_I, nH_II, nHe_I, nH2, U_H_I, n_neutral, n_ion, neutral_fracs, ne_sol
 
 
 @jax.jit
@@ -1564,27 +1596,33 @@ def synthesize_jit(
         n_i = n_total_layers[i]
         ne_i = ne_layers[i]
 
-        # Get number densities
-        nH_I, nH_II, nHe_I, nH2, U_H_I, n_neutral, n_ion = _compute_number_densities_jit(
+        # Get number densities (Picard-iterated, self-consistent ne)
+        nH_I, nH_II, nHe_I, nH2, U_H_I, n_neutral, n_ion, neutral_fracs, ne_sol = _compute_number_densities_jit(
             T_i, n_i, ne_i, abundances, data
         )
 
-        # Compute continuum absorption at all wavelengths
+        # Molecular number densities (post-process from atomic neutral fractions)
+        mol_densities = _compute_mol_densities_jit(T_i, n_i, ne_sol, abundances, neutral_fracs,
+                                                    data.chem_eq_data)
+        # Pad by one zero so index -1 (atomic lines) never causes an out-of-bounds read
+        mol_densities = jnp.concatenate([mol_densities, jnp.zeros(1)])
+
+        # Compute continuum absorption at all wavelengths using self-consistent ne
         def compute_cntm_wl(wl):
-            return _continuum_absorption_jit(wl, T_i, ne_i, nH_I, nH_II, nHe_I, nH2, U_H_I, data)
+            return _continuum_absorption_jit(wl, T_i, ne_sol, nH_I, nH_II, nHe_I, nH2, U_H_I, data)
 
         alpha_cntm = jax.vmap(compute_cntm_wl)(wavelengths_cm)
 
         # Continuum at reference wavelength
-        alpha_ref = _continuum_absorption_jit(lambda_ref_cm, T_i, ne_i, nH_I, nH_II, nHe_I, nH2, U_H_I, data)
+        alpha_ref = _continuum_absorption_jit(lambda_ref_cm, T_i, ne_sol, nH_I, nH_II, nHe_I, nH2, U_H_I, data)
 
         # Source function (Planck)
         S = blackbody(T_i, wavelengths_cm)
 
-        return carry, (alpha_cntm, alpha_ref, S, ne_i, n_neutral, n_ion, nH_I, U_H_I)
+        return carry, (alpha_cntm, alpha_ref, S, ne_sol, n_neutral, n_ion, nH_I, U_H_I, mol_densities)
 
     # Process all layers
-    _, (alpha_cntm_all, alpha_ref_all, S_all, ne_calc, n_neutral_all, n_ion_all, nH_I_all, U_H_I_all) = jax.lax.scan(
+    _, (alpha_cntm_all, alpha_ref_all, S_all, ne_calc, n_neutral_all, n_ion_all, nH_I_all, U_H_I_all, mol_densities_all) = jax.lax.scan(
         compute_layer, None, jnp.arange(n_layers)
     )
 
@@ -1633,11 +1671,23 @@ def synthesize_jit(
             wl_win   = jax.lax.dynamic_slice(wavelengths_cm, (i_lo_l,), (W_MAX,))
             delta_wl = wl_win - wl_center  # (W_MAX,)
 
-            def per_layer(T_i, ne_i, nH_I_i, n_neutral_i, n_ion_i):
-                n_species = jnp.where(charge == 0, n_neutral_i[Z - 1], n_ion_i[Z - 1])
+            mol_idx = linelist_data.mol_species_idx[line_idx]
+            n_mol_slots = mol_densities_all.shape[1]  # n_mols + 1 (padded)
+            safe_mol_idx = jnp.clip(mol_idx, 0, n_mol_slots - 1)
+            # safe index into mol_partition_func_values (n_mols rows, never the padding slot)
+            n_mols_real = data.chem_eq_data.mol_partition_func_values.shape[0]
+            safe_pf_mol_idx = jnp.clip(mol_idx, 0, jnp.maximum(n_mols_real - 1, 0))
+
+            def per_layer(T_i, ne_i, nH_I_i, n_neutral_i, n_ion_i, mol_densities_i):
+                n_atomic = jnp.where(charge == 0, n_neutral_i[Z - 1], n_ion_i[Z - 1])
+                n_mol = mol_densities_i[safe_mol_idx]
+                n_species = jnp.where(mol_idx >= 0, n_mol, n_atomic)
                 log_T = jnp.log(T_i)
-                U = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
-                               data.chem_eq_data.partition_func_values[Z - 1, charge])
+                U_atomic = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
+                                      data.chem_eq_data.partition_func_values[Z - 1, charge])
+                U_mol = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
+                                   data.chem_eq_data.mol_partition_func_values[safe_pf_mol_idx])
+                U = jnp.where(mol_idx >= 0, U_mol, U_atomic)
                 sigma_D = wl_center * jnp.sqrt(kboltz_cgs * T_i / mass + vmic_cm_s**2 / 2.0) / c_cgs
                 g_stark = gamma_stark_l * (T_i / 1e4) ** (1.0 / 6.0) * ne_i
                 g_vdW = jnp.where(
@@ -1653,7 +1703,8 @@ def synthesize_jit(
                              10.0 ** log_gf_val * sigma_ln * boltz * stim)
                 return amplitude * _voigt_profile_jax(delta_wl, sigma_D, gamma_L)  # (W_MAX,)
 
-            return jax.vmap(per_layer)(T_layers, ne_calc, nH_I_all, n_neutral_all, n_ion_all)
+            return jax.vmap(per_layer)(T_layers, ne_calc, nH_I_all, n_neutral_all, n_ion_all,
+                                       mol_densities_all)
 
         # Compute all windowed contributions in parallel.
         # Shape: (n_lines, n_layers, W_MAX)  — manageable when linelist is pre-filtered

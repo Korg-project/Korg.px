@@ -129,6 +129,7 @@ class PreparedLinelist:
             vdW_sigma=jnp.asarray(self.vdW_sigma),
             vdW_alpha=jnp.asarray(self.vdW_alpha),
             mass=jnp.asarray(self.mass),
+            mol_species_idx=jnp.full(self.n_lines, -1, dtype=jnp.int32),
         )
 
 
