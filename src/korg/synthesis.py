@@ -1914,7 +1914,50 @@ def synthesize_jit(
 
         line_alpha = jnp.asarray(alpha_lines)
 
-    alpha_total = alpha_cntm_all + line_alpha
+    # ── Phase 4.5: Hydrogen line absorption (matches synthesize hydrogen_lines=True) ──
+    _RYDBERG_CM = 1.0973731568539e5
+    _H_LINE_WINDOW_CM = 150.0 * 1e-8   # synthesize's hydrogen_line_window_size default
+    wl_min_cm = float(wavelengths_cm[0])
+    wl_max_cm = float(wavelengths_cm[-1])
+    nearby_stark = {
+        k: v for k, v in hline_stark_profiles.items()
+        if (wl_min_cm - _H_LINE_WINDOW_CM
+            <= 1.0 / (_RYDBERG_CM * (1.0 / v.lower**2 - 1.0 / v.upper**2))
+            <= wl_max_cm + _H_LINE_WINDOW_CM)
+    }
+
+    T_np     = np.asarray(T_layers)
+    ne_np    = np.asarray(ne_all)
+    nH_I_np  = np.asarray(nH_I_all)
+    nHe_I_np = np.asarray(nHe_I_all)
+    U_H_I_np = np.asarray(U_H_I_all)
+    wl_cm_np = np.asarray(wavelengths_cm)
+
+    ws_all_h = precompute_hummer_ws(T_np, nH_I_np, nHe_I_np, ne_np)
+
+    h_alpha = np.zeros((n_layers, n_wl))
+    if nearby_stark:
+        h_alpha += hydrogen_line_absorption_stark_batched(
+            wl_cm_np, T_np, ne_np, nH_I_np, U_H_I_np,
+            _H_LINE_WINDOW_CM, float(vmic_cm_s), ws_all_h, nearby_stark
+        )
+
+    brackett_in_range = any(
+        wl_min_cm - _H_LINE_WINDOW_CM
+        <= 1.0 / (_RYDBERG_CM * (1.0 / 16.0 - 1.0 / m**2))
+        <= wl_max_cm + _H_LINE_WINDOW_CM
+        for m in range(5, 31)
+    )
+    if brackett_in_range:
+        for i in range(n_layers):
+            h_alpha[i] += hydrogen_line_absorption(
+                wl_cm_np, T_np[i], ne_np[i], nH_I_np[i], nHe_I_np[i],
+                float(U_H_I_np[i]), float(vmic_cm_s),
+                _H_LINE_WINDOW_CM, use_MHD=True, ws=ws_all_h[i],
+                stark_profiles={}
+            )
+
+    alpha_total = alpha_cntm_all + line_alpha + jnp.asarray(h_alpha)
 
     # ── Phase 5: Radiative transfer ───────────────────────────────────────────
     from .radiative_transfer import radiative_transfer_jit
