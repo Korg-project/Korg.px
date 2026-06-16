@@ -908,7 +908,12 @@ from typing import NamedTuple
 from .statmech import (ChemicalEquilibriumData, precompute_chemical_equilibrium_data,
                        chemical_equilibrium_jit, MAX_ATOMIC_NUMBER,
                        _compute_saha_weights_jit, translational_U,
-                       _compute_mol_densities_jit)
+                       _compute_mol_densities_jit,
+                       _chemical_equilibrium_batch_jit,
+                       _compute_mol_densities_batch_jit,
+                       _compute_saha_weights_batch_jit)
+from .continuum import (_batch_continuum_vmap, _get_metal_bf_idx,
+                        get_metal_bf_cross_sections, _PEACH_IDX, _H2_MOL_IDX)
 
 
 class LinelistData(NamedTuple):
@@ -944,6 +949,13 @@ class SynthesisData(NamedTuple):
     gaunt_log_u_grid: jnp.ndarray      # shape (n_u,)
     gaunt_log_gamma2_grid: jnp.ndarray  # shape (n_gamma2,)
     gaunt_table: jnp.ndarray           # shape (n_u, n_gamma2)
+
+    # Metal bound-free cross-section tables (for _total_continuum_fast / _batch_continuum_vmap)
+    metal_bf_tables: jnp.ndarray     # shape (n_metal, n_logT, n_nu)
+    metal_bf_nu_grid: jnp.ndarray    # shape (n_nu,)
+    metal_bf_logT_grid: jnp.ndarray  # shape (n_logT,)
+    metal_bf_z_arr: jnp.ndarray      # shape (n_metal,) int32 — Z-1 index per species
+    metal_bf_charge_arr: jnp.ndarray # shape (n_metal,) int32 — ionization charge per species
 
 
 def precompute_synthesis_data(
@@ -996,11 +1008,26 @@ def precompute_synthesis_data(
         gaunt_log_gamma2_grid = jnp.array([-4.0, 4.0])
         gaunt_table = jnp.ones((2, 2))
 
+    # Pre-build metal BF tables and species index mapping for _batch_continuum_vmap
+    _, metal_bf_idx = _get_metal_bf_idx()
+    bf_data = get_metal_bf_cross_sections()
+    metal_species_names = list(bf_data['species'].keys())
+    metal_bf_tables = jnp.stack([jnp.array(bf_data['species'][s]) for s in metal_species_names])
+    metal_bf_nu_grid = jnp.array(bf_data['nu_grid'])
+    metal_bf_logT_grid = jnp.array(bf_data['logT_grid'])
+    metal_bf_z_arr = jnp.array([z for z, _ in metal_bf_idx], dtype=jnp.int32)
+    metal_bf_charge_arr = jnp.array([c for _, c in metal_bf_idx], dtype=jnp.int32)
+
     return SynthesisData(
         chem_eq_data=chem_eq_data,
         gaunt_log_u_grid=gaunt_log_u_grid,
         gaunt_log_gamma2_grid=gaunt_log_gamma2_grid,
-        gaunt_table=gaunt_table
+        gaunt_table=gaunt_table,
+        metal_bf_tables=metal_bf_tables,
+        metal_bf_nu_grid=metal_bf_nu_grid,
+        metal_bf_logT_grid=metal_bf_logT_grid,
+        metal_bf_z_arr=metal_bf_z_arr,
+        metal_bf_charge_arr=metal_bf_charge_arr,
     )
 
 
@@ -1030,6 +1057,12 @@ def save_synthesis_data(data: SynthesisData, path: str) -> None:
         gaunt_log_u_grid=np.asarray(data.gaunt_log_u_grid),
         gaunt_log_gamma2_grid=np.asarray(data.gaunt_log_gamma2_grid),
         gaunt_table=np.asarray(data.gaunt_table),
+        # Metal bound-free tables
+        metal_bf_tables=np.asarray(data.metal_bf_tables),
+        metal_bf_nu_grid=np.asarray(data.metal_bf_nu_grid),
+        metal_bf_logT_grid=np.asarray(data.metal_bf_logT_grid),
+        metal_bf_z_arr=np.asarray(data.metal_bf_z_arr),
+        metal_bf_charge_arr=np.asarray(data.metal_bf_charge_arr),
     )
 
 
@@ -1050,6 +1083,10 @@ def load_synthesis_data(path: Optional[str] = None) -> SynthesisData:
     if path is None:
         path = Path(__file__).parent / "data" / "synthesis_data.npz"
 
+    _, metal_bf_idx = _get_metal_bf_idx()
+    bf_data = get_metal_bf_cross_sections()
+    metal_species_names = list(bf_data['species'].keys())
+
     with np.load(path) as f:
         chem_eq_data = ChemicalEquilibriumData(
             log_T_grid=jnp.array(f['log_T_grid']),
@@ -1066,6 +1103,11 @@ def load_synthesis_data(path: Optional[str] = None) -> SynthesisData:
             gaunt_log_u_grid=jnp.array(f['gaunt_log_u_grid']),
             gaunt_log_gamma2_grid=jnp.array(f['gaunt_log_gamma2_grid']),
             gaunt_table=jnp.array(f['gaunt_table']),
+            metal_bf_tables=jnp.stack([jnp.array(bf_data['species'][s]) for s in metal_species_names]),
+            metal_bf_nu_grid=jnp.array(bf_data['nu_grid']),
+            metal_bf_logT_grid=jnp.array(bf_data['logT_grid']),
+            metal_bf_z_arr=jnp.array([z for z, _ in metal_bf_idx], dtype=jnp.int32),
+            metal_bf_charge_arr=jnp.array([c for _, c in metal_bf_idx], dtype=jnp.int32),
         )
 
 
@@ -1146,9 +1188,33 @@ def preprocess_linelist(linelist: List[Line], chem_eq_data=None) -> LinelistData
 
     # van der Waals parameters (use _vdW_to_tuple for robust handling of
     # scalar log-gamma, tuple ABO, and None inputs)
+    # For ABO lines (alpha >= 0), precompute the full Barklem-O'Mara pre-factor at
+    # T_ref=10000 K so that per_layer only needs: 2 * vdW_sigma * 1e6 * (T/1e4)^(0.5*(1-alpha))
+    from scipy.special import gamma as _gamma_fn
+    import numpy as _np_vdw
+    from .constants import amu_cgs as _amu_cgs, kboltz_cgs as _kboltz_cgs
+    _v0 = 1e6   # reference velocity in cm/s
+    _T_ref = 1e4
+    _M_H = 1.008 * _amu_cgs
+
     vdW_params = [_vdW_to_tuple(line.vdW) for line in linelist]
-    vdW_sigma = jnp.array([p[0] for p in vdW_params])
-    vdW_alpha = jnp.array([p[1] for p in vdW_params])
+    raw_sigma  = [p[0] for p in vdW_params]
+    raw_alpha  = [p[1] for p in vdW_params]
+
+    corrected_sigma = []
+    for sigma, alpha, mass in zip(raw_sigma, raw_alpha, masses):
+        if alpha >= 0.0 and sigma > 0.0:
+            inv_mu = 1.0 / _M_H + 1.0 / mass
+            vbar_ref = _np_vdw.sqrt(8.0 * _kboltz_cgs * _T_ref / _np_vdw.pi * inv_mu)
+            C = ((4.0 / _np_vdw.pi) ** (alpha / 2.0)
+                 * _gamma_fn((4.0 - alpha) / 2.0)
+                 * (vbar_ref / _v0) ** (1.0 - alpha))
+            corrected_sigma.append(sigma * C)
+        else:
+            corrected_sigma.append(sigma)
+
+    vdW_sigma = jnp.array(corrected_sigma)
+    vdW_alpha = jnp.array(raw_alpha)
 
     return LinelistData(
         n_lines=n_lines,
@@ -1540,6 +1606,74 @@ def _compute_number_densities_jit(T, n_total, ne, abundances, data):
 
 
 @jax.jit
+def _compute_line_params_jit(
+    T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
+    mol_densities_all, linelist_data, data, vmic_cm_s
+):
+    """Compute (amplitude, sigma_D, gamma_L) per (line, layer) without Voigt profiles.
+
+    Used by synthesize_jit to compute max_win per line for exact bucketed line absorption.
+    Returns three arrays each of shape (n_lines, n_layers).
+    """
+    pi_e2_mc = jnp.pi * electron_charge_cgs**2 / (electron_mass_cgs * c_cgs)
+
+    def per_line_params(line_idx):
+        wl_center     = linelist_data.wl[line_idx]
+        log_gf_val    = linelist_data.log_gf[line_idx]
+        Z             = linelist_data.species_Z[line_idx]
+        charge        = linelist_data.species_charge[line_idx]
+        E_lower       = linelist_data.E_lower[line_idx]
+        gamma_rad_l   = linelist_data.gamma_rad[line_idx]
+        gamma_stark_l = linelist_data.gamma_stark[line_idx]
+        vdW_sigma_l   = linelist_data.vdW_sigma[line_idx]
+        vdW_alpha_l   = linelist_data.vdW_alpha[line_idx]
+        mass          = linelist_data.mass[line_idx]
+        mol_idx       = linelist_data.mol_species_idx[line_idx]
+
+        nu       = c_cgs / wl_center
+        sigma_ln = pi_e2_mc * wl_center**2 / c_cgs
+
+        n_mol_slots     = mol_densities_all.shape[1]
+        safe_mol_idx    = jnp.clip(mol_idx, 0, n_mol_slots - 1)
+        n_mols_real     = data.chem_eq_data.mol_partition_func_values.shape[0]
+        safe_pf_mol_idx = jnp.clip(mol_idx, 0, jnp.maximum(n_mols_real - 1, 0))
+
+        def per_layer_params(T_i, ne_i, nH_I_i, n_neutral_i, n_ion_i, mol_densities_i):
+            n_atomic  = jnp.where(charge == 0, n_neutral_i[Z - 1], n_ion_i[Z - 1])
+            n_mol     = mol_densities_i[safe_mol_idx]
+            n_species = jnp.where(mol_idx >= 0, n_mol, n_atomic)
+            log_T = jnp.log(T_i)
+            U_atomic = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
+                                  data.chem_eq_data.partition_func_values[Z - 1, charge])
+            U_mol = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
+                               data.chem_eq_data.mol_partition_func_values[safe_pf_mol_idx])
+            U = jnp.where(mol_idx >= 0, U_mol, U_atomic)
+            sigma_D = wl_center * jnp.sqrt(kboltz_cgs * T_i / mass + vmic_cm_s**2 / 2.0) / c_cgs
+            g_stark = gamma_stark_l * (T_i / 1e4)**(1.0 / 6.0) * ne_i
+            g_vdW = jnp.where(
+                vdW_alpha_l < 0.0,
+                vdW_sigma_l * (T_i / 1e4)**0.3 * nH_I_i,
+                2.0 * vdW_sigma_l * 1e6 * (T_i / 1e4)**(0.5 * (1.0 - vdW_alpha_l)) * nH_I_i
+            )
+            gamma_total = gamma_rad_l + g_stark + g_vdW
+            gamma_L = gamma_total * wl_center**2 / (4.0 * jnp.pi * c_cgs)
+            stim  = 1.0 - jnp.exp(-hplanck_eV * nu / (kboltz_eV * T_i))
+            boltz = jnp.exp(-E_lower / (kboltz_eV * T_i))
+            amplitude = (n_species / jnp.clip(U, 1e-10) *
+                         10.0**log_gf_val * sigma_ln * boltz * stim)
+            return amplitude, sigma_D, gamma_L
+
+        return jax.vmap(per_layer_params)(
+            T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
+            mol_densities_all
+        )
+
+    return jax.vmap(per_line_params)(jnp.arange(linelist_data.wl.shape[0]))
+
+
+_voigt_profile_jax_jit = jax.jit(_voigt_profile_jax)
+
+
 def synthesize_jit(
     wavelengths_cm: jnp.ndarray,
     T_layers: jnp.ndarray,
@@ -1589,149 +1723,202 @@ def synthesize_jit(
     n_wl = wavelengths_cm.shape[0]
     lambda_ref_cm = 5e-5  # 5000 Å reference wavelength
 
-    # Compute number densities and continuum opacity for each layer
-    def compute_layer(carry, layer_idx):
-        i = layer_idx
-        T_i = T_layers[i]
-        n_i = n_total_layers[i]
-        ne_i = ne_layers[i]
-
-        # Get number densities (Picard-iterated, self-consistent ne)
-        nH_I, nH_II, nHe_I, nH2, U_H_I, n_neutral, n_ion, neutral_fracs, ne_sol = _compute_number_densities_jit(
-            T_i, n_i, ne_i, abundances, data
-        )
-
-        # Molecular number densities (post-process from atomic neutral fractions)
-        mol_densities = _compute_mol_densities_jit(T_i, n_i, ne_sol, abundances, neutral_fracs,
-                                                    data.chem_eq_data)
-        # Pad by one zero so index -1 (atomic lines) never causes an out-of-bounds read
-        mol_densities = jnp.concatenate([mol_densities, jnp.zeros(1)])
-
-        # Compute continuum absorption at all wavelengths using self-consistent ne
-        def compute_cntm_wl(wl):
-            return _continuum_absorption_jit(wl, T_i, ne_sol, nH_I, nH_II, nHe_I, nH2, U_H_I, data)
-
-        alpha_cntm = jax.vmap(compute_cntm_wl)(wavelengths_cm)
-
-        # Continuum at reference wavelength
-        alpha_ref = _continuum_absorption_jit(lambda_ref_cm, T_i, ne_sol, nH_I, nH_II, nHe_I, nH2, U_H_I, data)
-
-        # Source function (Planck)
-        S = blackbody(T_i, wavelengths_cm)
-
-        return carry, (alpha_cntm, alpha_ref, S, ne_sol, n_neutral, n_ion, nH_I, U_H_I, mol_densities)
-
-    # Process all layers
-    _, (alpha_cntm_all, alpha_ref_all, S_all, ne_calc, n_neutral_all, n_ion_all, nH_I_all, U_H_I_all, mol_densities_all) = jax.lax.scan(
-        compute_layer, None, jnp.arange(n_layers)
+    # ── Phase 1: Batch Picard iteration for ne and neutral fractions ─────────
+    # Processes all layers at once; returns (n_layers,) and (n_layers, 92).
+    ne_all, nf_picard = _chemical_equilibrium_batch_jit(
+        T_layers, n_total_layers, ne_layers, abundances, data.chem_eq_data
     )
 
-    # alpha_cntm_all: shape (n_layers, n_wl)
-    # S_all: shape (n_layers, n_wl)
+    # ── Phase 2: Molecular depletion correction (5 passes) ───────────────────
+    # The Picard iteration doesn't account for atoms locked in molecules (e.g.
+    # CO depletes 22% of C at 4500 K), causing n(C I) and hence n(C2) to be
+    # overestimated.  We iterate: subtract molecular consumption from neutral
+    # atom densities, recompute molecular densities, repeat until convergence.
+    atom_dens = abundances[None, :] * (n_total_layers - ne_all)[:, None]   # (n_layers, 92)
+    neutral_dens_picard = atom_dens * nf_picard                             # (n_layers, 92)
+    M_consume = data.chem_eq_data.mol_atom_consume                          # (n_mols, 92)
 
-    # Add line absorption if there are lines
+    # Initial molecular densities (will be refined by correction loop)
+    mol_dens = _compute_mol_densities_batch_jit(
+        T_layers, n_total_layers, ne_all, abundances, nf_picard, data.chem_eq_data
+    )  # (n_layers, n_mols)
+
+    # 5 correction passes (unrolled at trace-time — XLA can fuse across passes).
+    # Each pass: subtract molecular atom consumption from picard neutral densities →
+    # recompute neutral fractions → recompute molecular densities.
+    # neutral_dens_corr after the loop is picard - mol_{n-1} @ M (matching
+    # chemical_equilibrium_all_layers which sets neutral_dens_all = neutral_dens_corrected
+    # from the last loop body, while mol_dens is mol_n from the same body).
+    neutral_dens_corr = neutral_dens_picard
+    for _ in range(5):
+        mol_atom_corr = mol_dens @ M_consume                                # (n_layers, 92)
+        neutral_dens_corr = jnp.maximum(neutral_dens_picard - mol_atom_corr, 1e-99)
+        nf_corr = neutral_dens_corr / jnp.maximum(atom_dens, 1e-99)
+        mol_dens = _compute_mol_densities_batch_jit(
+            T_layers, n_total_layers, ne_all, abundances, nf_corr, data.chem_eq_data
+        )
+
+    # neutral_dens_corr = picard - mol_{n-1} @ M  (matches chemical_equilibrium_all_layers)
+    # mol_dens          = mol_n  (final molecular densities)
+    neutral_dens_final = neutral_dens_corr
+    wII_all, wIII_all = _compute_saha_weights_batch_jit(T_layers, ne_all, data.chem_eq_data)
+    ionized_dens_final = wII_all * neutral_dens_final                       # (n_layers, 92)
+    doubly_dens_final  = wIII_all * neutral_dens_final                      # (n_layers, 92)
+
+    nH_I_all  = neutral_dens_final[:, 0]   # (n_layers,)
+    nH_II_all = ionized_dens_final[:, 0]
+    nHe_I_all = neutral_dens_final[:, 1]
+
+    # Partition functions for H I and He I at each layer
+    log_T_all = jnp.log(T_layers)
+    U_H_I_all = jax.vmap(
+        lambda lt: jnp.interp(lt, data.chem_eq_data.log_T_grid,
+                              data.chem_eq_data.partition_func_values[0, 0])
+    )(log_T_all)  # (n_layers,)
+    U_He_I_all = jax.vmap(
+        lambda lt: jnp.interp(lt, data.chem_eq_data.log_T_grid,
+                              data.chem_eq_data.partition_func_values[1, 0])
+    )(log_T_all)  # (n_layers,)
+
+    # Pad mol_dens with a zero column so mol_species_idx == -1 can safely index it
+    mol_densities_all = jnp.concatenate(
+        [mol_dens, jnp.zeros((n_layers, 1))], axis=1
+    )  # (n_layers, n_mols+1)
+
+    # H2 density from molecular densities (index 50 in default mol list)
+    nH2_all = mol_dens[:, _H2_MOL_IDX]  # (n_layers,)
+
+    # Peach FF species: He_II (z=1), C_II (z=5), Si_II (z=13), Mg_II (z=11)
+    _peach_z = jnp.array([z for z, _ in _PEACH_IDX])    # [1, 5, 13, 11]
+    n_peach = ionized_dens_final[:, _peach_z]            # (n_layers, 4)
+
+    # Z=1 FF: sum of all singly-ionized minus He II (index 1) — matches prepare_continuum_batch_fast
+    n_Z1_ff = ionized_dens_final.sum(axis=1) - ionized_dens_final[:, 1]    # (n_layers,)
+
+    # Z=2 FF: sum of all doubly-ionized
+    n_Z2_ff = doubly_dens_final.sum(axis=1)                                 # (n_layers,)
+
+    # Metal bound-free densities: select neutral/ionized/doubly column per species
+    n_neutral_metal = neutral_dens_final[:, data.metal_bf_z_arr]   # (n_layers, n_metal)
+    n_ionized_metal = ionized_dens_final[:, data.metal_bf_z_arr]   # (n_layers, n_metal)
+    n_doubly_metal  = doubly_dens_final[:, data.metal_bf_z_arr]    # (n_layers, n_metal)
+    metal_bf_dens = jnp.where(
+        data.metal_bf_charge_arr[None, :] == 0, n_neutral_metal,
+        jnp.where(data.metal_bf_charge_arr[None, :] == 1, n_ionized_metal, n_doubly_metal)
+    )  # (n_layers, n_metal)
+
+    # ── Phase 3: Continuum opacity + source function (batched over all layers) ─
+    # Uses the full continuum function matching synthesize's batch_continuum_absorption.
+    # Evaluates at all output wavelengths directly (no coarse-grid interpolation).
+    nu_all = c_cgs / wavelengths_cm                                     # (n_wl,) frequencies
+    alpha_cntm_all = _batch_continuum_vmap(
+        nu_all, T_layers, ne_all, U_H_I_all, U_He_I_all,
+        nH_I_all, nH_II_all, nHe_I_all, nH2_all,
+        n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
+        data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
+    )  # (n_layers, n_wl)
+
+    nu_ref = c_cgs / lambda_ref_cm
+    alpha_ref_all = _batch_continuum_vmap(
+        jnp.array([nu_ref]), T_layers, ne_all, U_H_I_all, U_He_I_all,
+        nH_I_all, nH_II_all, nHe_I_all, nH2_all,
+        n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
+        data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
+    )[:, 0]  # (n_layers,)
+
+    # Source function: Planck function per layer at all wavelengths
+    S_all = jax.vmap(lambda T_i: blackbody(T_i, wavelengths_cm))(T_layers)  # (n_layers, n_wl)
+
+    # ── Phase 4: Line absorption with exact bucketing (matches _line_absorption_fast) ──
+    # Strategy: compute amplitude/sigma_D/gamma_L per (line, layer) via JIT, then
+    # compute max_wins at Python level, bucket by window size, call the Voigt JIT
+    # once per bucket.  This avoids allocating a single (n_lines, n_layers, W_MAX=512)
+    # tensor for ALL lines and instead uses the actual required window per line.
     n_lines = linelist_data.wl.shape[0]
 
-    def add_line_absorption(alpha):
-        """Add line absorption to continuum opacity."""
-        if n_lines == 0:
-            return alpha
+    if n_lines == 0:
+        line_alpha = jnp.zeros((n_layers, n_wl))
+    else:
+        # Step 4a: params pass (no Voigt) — JIT-compiled, fast
+        amp_jax, sigma_D_jax, gamma_L_jax = _compute_line_params_jit(
+            T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
+            mol_densities_all, linelist_data, data, vmic_cm_s
+        )  # each (n_lines, n_layers)
 
-        n_wl = wavelengths_cm.shape[0]
-        # Window width: compute Voigt over at most W_MAX pixels per line instead
-        # of the full n_wl grid.  Evaluated at trace time so XLA sees a static shape.
-        # 128 pixels covers ±3.2 Å at 0.05 Å/px — wider than the significant wings of
-        # any line commonly encountered in optical stellar synthesis.
-        W_MAX = min(n_wl, 128)
+        # Step 4b: sync to numpy, compute max_wins per line
+        amp_np     = np.asarray(amp_jax)      # (n_lines, n_layers) — sync point
+        sigma_np   = np.asarray(sigma_D_jax)
+        gamma_np   = np.asarray(gamma_L_jax)
+        wl_np      = np.asarray(wavelengths_cm)
+        wls_np     = np.asarray(linelist_data.wl)
+        cntm_np    = np.asarray(alpha_cntm_all)  # (n_layers, n_wl)
 
-        pi_e2_mc = jnp.pi * electron_charge_cgs**2 / (electron_mass_cgs * c_cgs)
+        wl_spacing = float(np.median(np.diff(wl_np))) if n_wl > 1 else 5e-9
 
-        # Starting pixel for each line's window, centred on the line (static shape).
-        i_center = jnp.searchsorted(wavelengths_cm, linelist_data.wl)      # (n_lines,)
-        i_lo = jnp.clip(i_center - W_MAX // 2, 0, n_wl - W_MAX)            # (n_lines,)
+        i_ctr_np = np.clip(np.searchsorted(wl_np, wls_np), 0, n_wl - 1)
+        cntm_at_center = cntm_np[:, i_ctr_np].T  # (n_lines, n_layers)
 
-        def per_line(line_idx):
-            """Return (n_layers, W_MAX) windowed opacity contribution for one line."""
-            wl_center     = linelist_data.wl[line_idx]
-            log_gf_val    = linelist_data.log_gf[line_idx]
-            Z             = linelist_data.species_Z[line_idx]
-            charge        = linelist_data.species_charge[line_idx]
-            E_lower       = linelist_data.E_lower[line_idx]
-            gamma_rad_l   = linelist_data.gamma_rad[line_idx]
-            gamma_stark_l = linelist_data.gamma_stark[line_idx]
-            vdW_sigma_l   = linelist_data.vdW_sigma[line_idx]
-            vdW_alpha_l   = linelist_data.vdW_alpha[line_idx]
-            mass          = linelist_data.mass[line_idx]
+        _CUTOFF = 3e-4
+        rho_crit = _CUTOFF * cntm_at_center / np.maximum(np.abs(amp_np), 1e-300)
+        sqrt2pi = np.sqrt(2.0 * np.pi)
+        log_arg = sqrt2pi * sigma_np * rho_crit
+        with np.errstate(invalid='ignore', divide='ignore'):
+            win_G = np.where(log_arg >= 1.0, 0.0,
+                             sigma_np * np.sqrt(-2.0 * np.log(np.maximum(log_arg, 1e-300))))
+            win_L_arg = gamma_np / (np.pi * rho_crit)
+            win_L = np.where(win_L_arg <= gamma_np**2, 0.0,
+                             np.sqrt(np.maximum(win_L_arg - gamma_np**2, 0.0)))
+        max_wins = np.max(np.sqrt(win_G**2 + win_L**2), axis=1)   # (n_lines,)
+        max_wins_px = np.clip(
+            np.ceil(2.0 * max_wins / wl_spacing + 2).astype(int), 0, n_wl
+        )
 
-            nu       = c_cgs / wl_center
-            sigma_ln = pi_e2_mc * wl_center**2 / c_cgs
+        # Step 4c: bucketed Voigt — exactly as in _line_absorption_fast
+        alpha_lines = np.zeros((n_layers, n_wl))
+        BUCKET_WIDTHS = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, n_wl]
+        prev_W = 0
+        for W_MAX in BUCKET_WIDTHS:
+            W = min(W_MAX, n_wl)
+            in_bucket = (max_wins_px > prev_W) & (max_wins_px <= W_MAX)
+            n_b = int(in_bucket.sum())
+            if n_b == 0:
+                prev_W = W_MAX
+                continue
 
-            # Extract W_MAX-pixel window centred on the line  (static shape → XLA-friendly)
-            i_lo_l   = i_lo[line_idx]
-            wl_win   = jax.lax.dynamic_slice(wavelengths_cm, (i_lo_l,), (W_MAX,))
-            delta_wl = wl_win - wl_center  # (W_MAX,)
+            idx_b = np.where(in_bucket)[0]
+            wls_b = wls_np[idx_b]
 
-            mol_idx = linelist_data.mol_species_idx[line_idx]
-            n_mol_slots = mol_densities_all.shape[1]  # n_mols + 1 (padded)
-            safe_mol_idx = jnp.clip(mol_idx, 0, n_mol_slots - 1)
-            # safe index into mol_partition_func_values (n_mols rows, never the padding slot)
-            n_mols_real = data.chem_eq_data.mol_partition_func_values.shape[0]
-            safe_pf_mol_idx = jnp.clip(mol_idx, 0, jnp.maximum(n_mols_real - 1, 0))
+            # Window start: left edge placed at line_center - max_win (matches _line_absorption_fast)
+            i_lo_b = np.searchsorted(wl_np, wls_b - max_wins[idx_b]).astype(int)
+            i_lo_b = np.clip(i_lo_b, 0, n_wl - W)
 
-            def per_layer(T_i, ne_i, nH_I_i, n_neutral_i, n_ion_i, mol_densities_i):
-                n_atomic = jnp.where(charge == 0, n_neutral_i[Z - 1], n_ion_i[Z - 1])
-                n_mol = mol_densities_i[safe_mol_idx]
-                n_species = jnp.where(mol_idx >= 0, n_mol, n_atomic)
-                log_T = jnp.log(T_i)
-                U_atomic = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
-                                      data.chem_eq_data.partition_func_values[Z - 1, charge])
-                U_mol = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
-                                   data.chem_eq_data.mol_partition_func_values[safe_pf_mol_idx])
-                U = jnp.where(mol_idx >= 0, U_mol, U_atomic)
-                sigma_D = wl_center * jnp.sqrt(kboltz_cgs * T_i / mass + vmic_cm_s**2 / 2.0) / c_cgs
-                g_stark = gamma_stark_l * (T_i / 1e4) ** (1.0 / 6.0) * ne_i
-                g_vdW = jnp.where(
-                    vdW_alpha_l < 0.0,
-                    vdW_sigma_l * (T_i / 1e4) ** 0.3 * nH_I_i,
-                    2.0 * vdW_sigma_l * 1e6 * (T_i / 1e4) ** (0.5 * (1.0 - vdW_alpha_l)) * nH_I_i
-                )
-                gamma_total = gamma_rad_l + g_stark + g_vdW
-                gamma_L = gamma_total * wl_center**2 / (4.0 * jnp.pi * c_cgs)
-                stim = 1.0 - jnp.exp(-hplanck_eV * nu / (kboltz_eV * T_i))
-                boltz = jnp.exp(-E_lower / (kboltz_eV * T_i))
-                amplitude = (n_species / jnp.clip(U, 1e-10) *
-                             10.0 ** log_gf_val * sigma_ln * boltz * stim)
-                return amplitude * _voigt_profile_jax(delta_wl, sigma_D, gamma_L)  # (W_MAX,)
+            pix_idx = i_lo_b[:, None] + np.arange(W, dtype=int)[None, :]  # (n_b, W)
+            wl_win  = wl_np[pix_idx]                                        # (n_b, W)
+            delta_b = wl_win - wls_b[:, None]                               # (n_b, W)
+            mask_b  = np.abs(delta_b) <= max_wins[idx_b, None]              # (n_b, W)
 
-            return jax.vmap(per_layer)(T_layers, ne_calc, nH_I_all, n_neutral_all, n_ion_all,
-                                       mol_densities_all)
+            # JAX Voigt — compiled once per unique (n_b, n_layers, W) shape
+            delta_j = jnp.asarray(delta_b[:, None, :])             # (n_b, 1, W)
+            sigma_j = jnp.asarray(sigma_np[idx_b, :, None])        # (n_b, n_layers, 1)
+            gamma_j = jnp.asarray(gamma_np[idx_b, :, None])        # (n_b, n_layers, 1)
+            profiles = np.asarray(
+                _voigt_profile_jax_jit(delta_j, sigma_j, gamma_j)
+            )  # (n_b, n_layers, W)
 
-        # Compute all windowed contributions in parallel.
-        # Shape: (n_lines, n_layers, W_MAX)  — manageable when linelist is pre-filtered
-        # to the synthesis range (callers should filter before calling synthesize_jit).
-        all_contribs = jax.vmap(per_line)(jnp.arange(n_lines))
+            contrib = mask_b[:, None, :] * amp_np[idx_b, :, None] * profiles  # (n_b, n_layers, W)
 
-        # Scatter-add windows into the full α array.
-        # scatter_idx[l, w] = i_lo[l] + w  → destination pixel for (line l, offset w)
-        scatter_idx = i_lo[:, None] + jnp.arange(W_MAX)[None, :]        # (n_lines, W_MAX)
-        flat_idx    = scatter_idx.reshape(-1)                             # (n_lines * W_MAX,)
+            for il, i_lo in enumerate(i_lo_b):
+                alpha_lines[:, i_lo:i_lo + W] += contrib[il]
 
-        # Reorder to (n_layers, n_lines * W_MAX) for per-layer scatter
-        flat_contribs = all_contribs.transpose(1, 0, 2).reshape(n_layers, -1)
+            prev_W = W_MAX
 
-        def scatter_layer(alpha_layer, flat_contrib):
-            return alpha_layer.at[flat_idx].add(flat_contrib)
+        line_alpha = jnp.asarray(alpha_lines)
 
-        line_alpha = jax.vmap(scatter_layer)(jnp.zeros((n_layers, n_wl)), flat_contribs)
-        return alpha + line_alpha
+    alpha_total = alpha_cntm_all + line_alpha
 
-    # Add lines if present (function handles empty linelist internally)
-    alpha_total = add_line_absorption(alpha_cntm_all)
-
-    # Solve radiative transfer
+    # ── Phase 5: Radiative transfer ───────────────────────────────────────────
     from .radiative_transfer import radiative_transfer_jit
 
-    # Transpose to (n_wl, n_layers) for RT
     flux, _ = radiative_transfer_jit(
         alpha_total.T,
         S_all.T,
@@ -1740,7 +1927,6 @@ def synthesize_jit(
         alpha_ref_all
     )
 
-    # Also compute continuum flux
     flux_cntm, _ = radiative_transfer_jit(
         alpha_cntm_all.T,
         S_all.T,
