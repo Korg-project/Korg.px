@@ -36,8 +36,8 @@ def run_python_synthesis():
     A_X = korg.format_A_X()
     wavelengths = np.linspace(WL_MIN, WL_MAX, N_WL)
 
-    # Warmup call to trigger JIT compilation
-    print("  Warming up JIT...")
+    # Warmup call to trigger JAX compilation
+    print("  Warming up...")
     korg.synthesize(atm, linelist, wavelengths, A_X, vmic=1.0, verbose=False)
 
     t0 = time.perf_counter()
@@ -131,51 +131,44 @@ def make_plot(wl_py, cnorm_py, py_ms,
               wl_jl, cnorm_jl, julia_ms):
     diff = cnorm_py - np.interp(wl_py, wl_jl, cnorm_jl)
     abs_diff = np.abs(diff)
+    rms = np.sqrt(np.mean(diff**2))
     speedup = julia_ms / (py_ms * 1000)
 
-    fig, axes = plt.subplots(2, 1, figsize=(13, 7),
-                             gridspec_kw={'height_ratios': [3, 1]},
+    fig, axes = plt.subplots(2, 1, figsize=(18, 4),
+                             gridspec_kw={'height_ratios': [1, 3]},
                              sharex=True)
-    fig.subplots_adjust(hspace=0.06)
+    fig.subplots_adjust(hspace=0.04)
 
-    # --- Top: spectra ---
-    ax = axes[0]
-    ax.plot(wl_jl, cnorm_jl, '-', color='#888888', lw=0.7)
-    ax.plot(wl_py, cnorm_py, '-', color='#111111', lw=0.55)
-
-    # Direct labels inside the plot at top-left where continuum is clear
-    ax.text(WL_MIN + 0.3, 1.04, f'Julia Korg.jl  ({julia_ms:.0f} ms)',
-            ha='left', va='center', fontsize=8.5, color='#888888')
-    ax.text(WL_MIN + 32, 1.04, f'Python Korg  ({py_ms*1000:.0f} ms, {speedup:.1f}× faster)',
-            ha='left', va='center', fontsize=8.5, color='#111111')
-
+    # Spectrum panel (bottom)
+    ax = axes[1]
+    ax.plot(wl_jl, cnorm_jl, '-', color='#333333', lw=0.6)
+    ax.plot(wl_py, cnorm_py, '-', color='#999999', lw=0.5)
+    # Direct labels — no legend box
+    ax.text(WL_MAX - 0.4, 1.058, f'Korg.jl  {julia_ms:.0f} ms',
+            ha='right', va='center', fontsize=8, color='#333333')
+    ax.text(WL_MAX - 0.4, 1.038, f'Korg.py  {py_ms*1000:.0f} ms  ·  {speedup:.1f}× faster',
+            ha='right', va='center', fontsize=8, color='#999999')
     ax.set_ylabel('Normalized flux')
     ax.set_ylim(-0.02, 1.09)
     ax.set_xlim(WL_MIN, WL_MAX)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['bottom'].set_visible(False)
-    ax.tick_params(bottom=False)
-    ax.set_title(
-        f'Solar spectrum  ·  VALD linelist  ·  {WL_MIN:.0f}–{WL_MAX:.0f} Å  ·  {N_WL} points',
-        fontsize=10, loc='left', pad=6, color='#333333')
-
-    # --- Bottom: residuals ---
-    ax = axes[1]
-    ax.plot(wl_py, diff, '-', color='#333333', lw=0.5)
-    ax.axhline(0, color='#aaaaaa', lw=0.7)
-    ax.set_ylabel('Python − Julia')
     ax.set_xlabel('Wavelength (Å)')
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
 
-    # Stats placed after ylim is finalised
+    # Residual panel (top) — auto-scaled to actual differences
+    ax = axes[0]
+    ax.plot(wl_py, diff, '-', color='#555555', lw=0.5)
+    ax.axhline(0, color='#cccccc', lw=0.6)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['bottom'].set_visible(False)
+    ax.tick_params(bottom=False)
+    ax.set_ylabel('Δ flux', fontsize=8)
     ax.autoscale_view()
-    rms = np.sqrt(np.mean(diff**2))
-    ymax = ax.get_ylim()[1]
-    ax.text(WL_MIN + 0.3, ymax * 0.97,
-            f'max |Δ| = {abs_diff.max():.4f}   mean |Δ| = {abs_diff.mean():.4f}   RMS = {rms:.4f}',
-            va='top', ha='left', fontsize=7.5, color='#555555', family='monospace')
+    ymin, ymax = ax.get_ylim()
+    ax.text(WL_MAX - 0.4, ymax,
+            f'RMS={rms:.4f}  max|Δ|={abs_diff.max():.4f}',
+            ha='right', va='top', fontsize=7, color='#777777', family='monospace')
 
     plt.savefig(OUTPUT_PNG, dpi=150, bbox_inches='tight')
     print(f"\nPlot saved to {OUTPUT_PNG}")
