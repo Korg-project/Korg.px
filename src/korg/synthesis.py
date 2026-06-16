@@ -1598,11 +1598,21 @@ def synthesize_jit(
         if n_lines == 0:
             return alpha
 
-        # Integrated cross-section prefactor: (π e²/mc) × λ²/c  [cm³]
-        # The λ²/c converts from frequency-integrated to wavelength-integrated units.
+        n_wl = wavelengths_cm.shape[0]
+        # Window width: compute Voigt over at most W_MAX pixels per line instead
+        # of the full n_wl grid.  Evaluated at trace time so XLA sees a static shape.
+        # 128 pixels covers ±3.2 Å at 0.05 Å/px — wider than the significant wings of
+        # any line commonly encountered in optical stellar synthesis.
+        W_MAX = min(n_wl, 128)
+
         pi_e2_mc = jnp.pi * electron_charge_cgs**2 / (electron_mass_cgs * c_cgs)
 
-        def process_line(alpha_carry, line_idx):
+        # Starting pixel for each line's window, centred on the line (static shape).
+        i_center = jnp.searchsorted(wavelengths_cm, linelist_data.wl)      # (n_lines,)
+        i_lo = jnp.clip(i_center - W_MAX // 2, 0, n_wl - W_MAX)            # (n_lines,)
+
+        def per_line(line_idx):
+            """Return (n_layers, W_MAX) windowed opacity contribution for one line."""
             wl_center     = linelist_data.wl[line_idx]
             log_gf_val    = linelist_data.log_gf[line_idx]
             Z             = linelist_data.species_Z[line_idx]
@@ -1614,47 +1624,53 @@ def synthesize_jit(
             vdW_alpha_l   = linelist_data.vdW_alpha[line_idx]
             mass          = linelist_data.mass[line_idx]
 
-            nu = c_cgs / wl_center
-            sigma_ln = pi_e2_mc * wl_center**2 / c_cgs  # wavelength-integrated cross-section
+            nu       = c_cgs / wl_center
+            sigma_ln = pi_e2_mc * wl_center**2 / c_cgs
+
+            # Extract W_MAX-pixel window centred on the line  (static shape → XLA-friendly)
+            i_lo_l   = i_lo[line_idx]
+            wl_win   = jax.lax.dynamic_slice(wavelengths_cm, (i_lo_l,), (W_MAX,))
+            delta_wl = wl_win - wl_center  # (W_MAX,)
 
             def per_layer(T_i, ne_i, nH_I_i, n_neutral_i, n_ion_i):
                 n_species = jnp.where(charge == 0, n_neutral_i[Z - 1], n_ion_i[Z - 1])
-
                 log_T = jnp.log(T_i)
                 U = jnp.interp(log_T, data.chem_eq_data.log_T_grid,
                                data.chem_eq_data.partition_func_values[Z - 1, charge])
-
                 sigma_D = wl_center * jnp.sqrt(kboltz_cgs * T_i / mass + vmic_cm_s**2 / 2.0) / c_cgs
-
-                # Damping (rad/s): radiative + Stark + van der Waals
                 g_stark = gamma_stark_l * (T_i / 1e4) ** (1.0 / 6.0) * ne_i
-                # Simple vdW: sigma is the gamma at 10000 K (linear, not log)
-                # ABO: simplified temperature scaling
                 g_vdW = jnp.where(
                     vdW_alpha_l < 0.0,
                     vdW_sigma_l * (T_i / 1e4) ** 0.3 * nH_I_i,
                     2.0 * vdW_sigma_l * 1e6 * (T_i / 1e4) ** (0.5 * (1.0 - vdW_alpha_l)) * nH_I_i
                 )
                 gamma_total = gamma_rad_l + g_stark + g_vdW
-                # Convert rad/s → wavelength HWHM [cm]: γ_λ = γ_ω × λ²/(4πc)
                 gamma_L = gamma_total * wl_center**2 / (4.0 * jnp.pi * c_cgs)
-
                 stim = 1.0 - jnp.exp(-hplanck_eV * nu / (kboltz_eV * T_i))
                 boltz = jnp.exp(-E_lower / (kboltz_eV * T_i))
                 amplitude = (n_species / jnp.clip(U, 1e-10) *
                              10.0 ** log_gf_val * sigma_ln * boltz * stim)
+                return amplitude * _voigt_profile_jax(delta_wl, sigma_D, gamma_L)  # (W_MAX,)
 
-                # Harris-series Voigt profile at all wavelengths (broadcasting over n_wl)
-                return amplitude * _voigt_profile_jax(wavelengths_cm - wl_center, sigma_D, gamma_L)
+            return jax.vmap(per_layer)(T_layers, ne_calc, nH_I_all, n_neutral_all, n_ion_all)
 
-            # Compute contribution for every layer simultaneously: (n_layers, n_wl)
-            line_contrib = jax.vmap(per_layer)(
-                T_layers, ne_calc, nH_I_all, n_neutral_all, n_ion_all
-            )
-            return alpha_carry + line_contrib, None
+        # ── Phase 1: Compute all windowed contributions in parallel ──────────
+        # Shape: (n_lines, n_layers, W_MAX)  ← much smaller than (n_lines, n_layers, n_wl)
+        all_contribs = jax.vmap(per_line)(jnp.arange(n_lines))
 
-        alpha_final, _ = jax.lax.scan(process_line, alpha, jnp.arange(n_lines))
-        return alpha_final
+        # ── Phase 2: Scatter-add windows into the full α array ───────────────
+        # scatter_idx[l, w] = i_lo[l] + w  → destination pixel for (line l, offset w)
+        scatter_idx = i_lo[:, None] + jnp.arange(W_MAX)[None, :]        # (n_lines, W_MAX)
+        flat_idx    = scatter_idx.reshape(-1)                             # (n_lines * W_MAX,)
+
+        # Reorder to (n_layers, n_lines * W_MAX) for per-layer scatter
+        flat_contribs = all_contribs.transpose(1, 0, 2).reshape(n_layers, -1)
+
+        def scatter_layer(alpha_layer, flat_contrib):
+            return alpha_layer.at[flat_idx].add(flat_contrib)
+
+        line_alpha = jax.vmap(scatter_layer)(jnp.zeros((n_layers, n_wl)), flat_contribs)
+        return alpha + line_alpha
 
     # Add lines if present (function handles empty linelist internally)
     alpha_total = add_line_absorption(alpha_cntm_all)
