@@ -341,8 +341,10 @@ def read_vald_linelist(filename: str) -> list:
                     gamma_stark = 10**float(stark_str) if stark_str else None
 
                     # van der Waals damping (log scale in VALD or direct value)
+                    # 0.0 in VALD means "no data" — treat as None so create_line uses Unsöld
                     vdw_str = parts[7].strip()
-                    vdW = float(vdw_str) if vdw_str else None
+                    _vdw_raw = float(vdw_str) if vdw_str else None
+                    vdW = None if (_vdw_raw == 0.0) else _vdw_raw
 
                     # Create line
                     line_obj = create_line(wl_vac, log_gf, species, E_lower,
