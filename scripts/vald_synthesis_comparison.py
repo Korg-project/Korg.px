@@ -54,7 +54,7 @@ def run_python_synthesis():
     wl_hi_cm = (WL_MAX + line_buffer_ang) * 1e-8
     linelist_filtered = [l for l in linelist if wl_lo_cm <= l.wl <= wl_hi_cm]
     print(f"  Filtered linelist: {len(linelist_filtered)} lines in range")
-    linelist_data = preprocess_linelist(linelist_filtered)
+    linelist_data = preprocess_linelist(linelist_filtered, chem_eq_data=data.chem_eq_data)
     abundances = jnp.array(A_X_to_absolute(A_X))
 
     T_layers = jnp.array(atm.T)

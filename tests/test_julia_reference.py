@@ -3929,7 +3929,8 @@ class TestLinelistData:
             gamma_stark=jnp.array([1e-6, 2e-6]),
             vdW_sigma=jnp.array([1e-7, 2e-7]),
             vdW_alpha=jnp.array([-1.0, -1.0]),
-            mass=jnp.array([9.27e-23, 6.65e-23])
+            mass=jnp.array([9.27e-23, 6.65e-23]),
+            mol_species_idx=jnp.array([-1, -1], dtype=jnp.int32)
         )
 
         assert data.n_lines == 2
