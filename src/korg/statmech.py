@@ -40,6 +40,7 @@ class ChemicalEquilibriumData(NamedTuple):
     mol_charges: jnp.ndarray  # shape (n_molecules,)
     mol_n_atoms: jnp.ndarray  # shape (n_molecules,)
     mol_log_K_values: jnp.ndarray  # shape (n_molecules, n_temps) - log K on T grid
+    mol_partition_func_values: jnp.ndarray  # shape (n_molecules, n_temps) - U(T) for each molecule
 
 
 def hummer_mihalas_w(T, n_eff, nH, nHe, ne, use_hubeny_generalization=False):
@@ -711,6 +712,7 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
     mol_charges_list = []
     mol_n_atoms_list = []
     mol_log_K_list = []
+    mol_pf_list = []
 
     for mol in molecules_all:
         mol_charges_list.append(mol.charge)
@@ -728,17 +730,29 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
             # so JAX operations only compile once per unique knot shape
             mol_log_K_list.append(np.asarray(log_K_func(log_T_np)))
 
+        # Molecular partition function (needed for line opacity calculation)
+        pf_func = partition_funcs.get(mol, None)
+        if pf_func is not None:
+            if hasattr(pf_func, 'numpy_eval'):
+                mol_pf_list.append(pf_func.numpy_eval(log_T_np))
+            else:
+                mol_pf_list.append(np.asarray(pf_func(log_T_np)))
+        else:
+            mol_pf_list.append(np.ones(n_temps))  # fallback: U=1
+
     n_molecules = len(molecules_all)
     if n_molecules > 0:
         mol_atoms_array = jnp.array(mol_atoms_list, dtype=jnp.int32)
         mol_charges = jnp.array(mol_charges_list, dtype=jnp.int32)
         mol_n_atoms = jnp.array(mol_n_atoms_list, dtype=jnp.int32)
         mol_log_K_values = jnp.array(mol_log_K_list)
+        mol_partition_func_values = jnp.array(mol_pf_list)
     else:
         mol_atoms_array = jnp.zeros((0, 6), dtype=jnp.int32)
         mol_charges = jnp.array([], dtype=jnp.int32)
         mol_n_atoms = jnp.array([], dtype=jnp.int32)
         mol_log_K_values = jnp.zeros((0, n_temps))
+        mol_partition_func_values = jnp.zeros((0, n_temps))
 
     return ChemicalEquilibriumData(
         log_T_grid=log_T_grid,
@@ -748,7 +762,8 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
         mol_atoms_array=mol_atoms_array,
         mol_charges=mol_charges,
         mol_n_atoms=mol_n_atoms,
-        mol_log_K_values=mol_log_K_values
+        mol_log_K_values=mol_log_K_values,
+        mol_partition_func_values=mol_partition_func_values
     )
 
 
