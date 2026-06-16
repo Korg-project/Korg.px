@@ -13,8 +13,13 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+import jax.numpy as jnp
 import korg
 from korg.linelist import read_vald_linelist
+from korg.abundances import A_X_to_absolute
+from korg.synthesis import (precompute_synthesis_data, preprocess_linelist, synthesize_jit)
+from korg.data_loader import (ionization_energies, default_partition_funcs,
+                               default_log_equilibrium_constants)
 
 VALD_PATH = os.path.join(os.path.dirname(__file__), '..', 'src', 'korg', 'data',
                          'linelists', 'vald_extract_stellar_solar_threshold001.vald')
@@ -28,24 +33,58 @@ N_WL = 2000
 
 
 def run_python_synthesis():
-    print("=== Python Korg Synthesis ===")
+    print("=== Python Korg Synthesis (synthesize_jit) ===")
     linelist = read_vald_linelist(VALD_PATH)
     print(f"  Loaded {len(linelist)} lines from VALD")
 
     atm = korg.read_model_atmosphere(ATMOSPHERE_PATH)
     A_X = korg.format_A_X()
     wavelengths = np.linspace(WL_MIN, WL_MAX, N_WL)
+    wavelengths_cm = jnp.array(wavelengths * 1e-8)
+
+    # Pre-compute static data (not timed — one-time setup)
+    print("  Pre-computing synthesis data...")
+    data = precompute_synthesis_data(ionization_energies, default_partition_funcs,
+                                     default_log_equilibrium_constants)
+
+    # Filter linelist to synthesis range (+10 Å buffer) before JIT preprocessing.
+    # synthesize_jit cannot filter at runtime; all pre-filtered lines are processed.
+    line_buffer_ang = 10.0
+    wl_lo_cm = (WL_MIN - line_buffer_ang) * 1e-8
+    wl_hi_cm = (WL_MAX + line_buffer_ang) * 1e-8
+    linelist_filtered = [l for l in linelist if wl_lo_cm <= l.wl <= wl_hi_cm]
+    print(f"  Filtered linelist: {len(linelist_filtered)} lines in range")
+    linelist_data = preprocess_linelist(linelist_filtered)
+    abundances = jnp.array(A_X_to_absolute(A_X))
+
+    T_layers = jnp.array(atm.T)
+    n_total = jnp.array(atm.n_total)
+    ne_layers = jnp.array(atm.ne)
+    z_layers = jnp.array(atm.z)
+    log_tau_ref = jnp.array(atm.log_tau_ref)
 
     # Warmup call to trigger JAX compilation
-    print("  Warming up...")
-    korg.synthesize(atm, linelist, wavelengths, A_X, vmic=1.0, verbose=False)
+    print("  Warming up (JIT compile)...")
+    flux_w, cont_w = synthesize_jit(
+        wavelengths_cm=wavelengths_cm,
+        T_layers=T_layers, n_total_layers=n_total, ne_layers=ne_layers,
+        z_layers=z_layers, log_tau_ref=log_tau_ref,
+        abundances=abundances, vmic_cm_s=1.0e5, data=data, linelist_data=linelist_data
+    )
+    _ = float(flux_w[0])  # force device sync
 
     t0 = time.perf_counter()
-    result = korg.synthesize(atm, linelist, wavelengths, A_X, vmic=1.0, verbose=False)
+    flux_jit, cont_jit = synthesize_jit(
+        wavelengths_cm=wavelengths_cm,
+        T_layers=T_layers, n_total_layers=n_total, ne_layers=ne_layers,
+        z_layers=z_layers, log_tau_ref=log_tau_ref,
+        abundances=abundances, vmic_cm_s=1.0e5, data=data, linelist_data=linelist_data
+    )
+    _ = float(flux_jit[0])  # force device sync
     elapsed = time.perf_counter() - t0
 
-    flux = np.array(result.flux)
-    continuum = np.array(result.continuum)
+    flux = np.array(flux_jit)
+    continuum = np.array(cont_jit)
     cnorm = flux / continuum
 
     print(f"  Elapsed: {elapsed*1000:.1f} ms")
