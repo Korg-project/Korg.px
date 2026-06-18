@@ -707,7 +707,8 @@ def _line_absorption_fast(
                              np.sqrt(np.maximum(gamma_wl_all / (np.pi * rho_crit_all) -
                                                 gamma_wl_all**2, 0.0)))
     # Max window per line: (n_lines,)
-    max_wins = np.max(np.sqrt(win_G_all**2 + win_L_all**2), axis=1)
+    # Match Julia: take max of Gaussian and Lorentzian windows separately before combining.
+    max_wins = np.sqrt(np.max(win_G_all, axis=1)**2 + np.max(win_L_all, axis=1)**2)
 
     # --- Bucketed JAX Voigt accumulation ---
     # Lines are grouped by window size so each bucket fits a fixed W_MAX-pixel window.

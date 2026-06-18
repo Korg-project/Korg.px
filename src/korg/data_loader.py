@@ -822,7 +822,7 @@ def load_default_linelist(reference_wavelength_cm: float = 5e-5):
         Lines sorted by wavelength (ascending)
     """
     import csv
-    from .linelist import Line, Species
+    from .linelist import create_line, Species
 
     if reference_wavelength_cm != 5e-5:
         return []
@@ -854,6 +854,6 @@ def load_default_linelist(reference_wavelength_cm: float = 5e-5):
                     vdW = None
             else:
                 vdW = None
-            lines.append(Line(wl, log_gf, spec, E_lower,
-                              gamma_rad=gamma_rad, gamma_stark=gamma_stark, vdW=vdW))
+            lines.append(create_line(wl, log_gf, spec, E_lower,
+                                     gamma_rad=gamma_rad, gamma_stark=gamma_stark, vdW=vdW))
     return lines

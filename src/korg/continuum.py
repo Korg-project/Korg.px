@@ -956,8 +956,11 @@ def Heminus_ff(nu, T, nHe_I_div_partition, ne):
     #              = n(He I) / U(T)
     nHeI_groundstate = ndens_state_He_I(1, nHe_I_div_partition, T)
 
+    # Return 0 outside valid wavelength range (5063-151878 Å), matching Julia's bounds_checked_absorption
+    in_bounds = (lambda_angstrom >= 5063.0) & (lambda_angstrom <= 151878.0)
+
     # α = K * P_e * n(He I, n=1)
-    return K * P_e * nHeI_groundstate
+    return jnp.where(in_bounds, K * P_e * nHeI_groundstate, 0.0)
 
 
 def electron_scattering(ne):
@@ -1681,9 +1684,12 @@ def prepare_continuum_batch_fast(raw_arrays_list, partition_funcs, T_arr):
             else:
                 metal_bf_dens_arr[i, j] = ra['doubly_ionized_dens'][z_idx]
 
-    # Z=1 FF (all singly ionized except Peach + H_II) and Z=2 FF
+    # Z=1 FF: all singly ionized except Peach species (He_II, C_II, Si_II, Mg_II at indices 1,5,13,11)
     peach_z_idx = {z_idx for z_idx, _ in _PEACH_IDX}
-    n_Z1_ff_arr = np.array([ra['ionized_dens'].sum() - ra['ionized_dens'][1] for ra in raw_arrays_list])
+    n_Z1_ff_arr = np.array([
+        ra['ionized_dens'].sum() - sum(ra['ionized_dens'][z_idx] for z_idx in peach_z_idx)
+        for ra in raw_arrays_list
+    ])
     n_Z2_ff_arr = np.array([ra['doubly_ionized_dens'].sum() for ra in raw_arrays_list])
 
     return dict(
