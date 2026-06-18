@@ -920,7 +920,8 @@ from .statmech import (ChemicalEquilibriumData, precompute_chemical_equilibrium_
                        _compute_mol_densities_jit,
                        _chemical_equilibrium_batch_jit,
                        _compute_mol_densities_batch_jit,
-                       _compute_saha_weights_batch_jit)
+                       _compute_saha_weights_batch_jit,
+                       _chem_eq_newton_batch_jit)
 from .continuum import (_batch_continuum_vmap, _get_metal_bf_idx,
                         get_metal_bf_cross_sections, _PEACH_IDX, _H2_MOL_IDX)
 
@@ -1068,6 +1069,7 @@ def save_synthesis_data(data: SynthesisData, path: str) -> None:
         mol_charges=np.asarray(data.chem_eq_data.mol_charges),
         mol_n_atoms=np.asarray(data.chem_eq_data.mol_n_atoms),
         mol_log_K_values=np.asarray(data.chem_eq_data.mol_log_K_values),
+        mol_log_K_z=np.asarray(data.chem_eq_data.mol_log_K_z),
         mol_partition_func_values=np.asarray(data.chem_eq_data.mol_partition_func_values),
         mol_partition_func_z=np.asarray(data.chem_eq_data.mol_partition_func_z),
         mol_atom_consume=np.asarray(data.chem_eq_data.mol_atom_consume),
@@ -1121,6 +1123,7 @@ def load_synthesis_data(path: Optional[str] = None) -> SynthesisData:
             mol_charges=jnp.array(f['mol_charges']),
             mol_n_atoms=jnp.array(f['mol_n_atoms']),
             mol_log_K_values=jnp.array(f['mol_log_K_values']),
+            mol_log_K_z=jnp.array(f['mol_log_K_z']),
             mol_partition_func_values=jnp.array(f['mol_partition_func_values']),
             mol_partition_func_z=jnp.array(f['mol_partition_func_z']),
             mol_atom_consume=jnp.array(f['mol_atom_consume']),
@@ -1794,60 +1797,32 @@ def synthesize_jit(
     n_wl = wavelengths_cm.shape[0]
     lambda_ref_cm = 5e-5  # 5000 Å reference wavelength
 
-    # ── Phase 1: Batch Picard iteration for ne and neutral fractions ─────────
-    # Processes all layers at once; returns (n_layers,) and (n_layers, 92).
-    ne_all, nf_picard = _chemical_equilibrium_batch_jit(
+    # ── Phase 1: Picard initial guess for Newton solver ──────────────────────
+    # A single Picard pass (300 iterations, all layers at once) gives ne and
+    # neutral fractions close enough that Newton converges in ~5 iterations.
+    ne_init, nf_init = _chemical_equilibrium_batch_jit(
         T_layers, n_total_layers, ne_layers, abundances, data.chem_eq_data
     )
 
-    # ── Phase 2: Molecular depletion correction ──────────────────────────────
-    # Matches chemical_equilibrium_all_layers: 5 outer iterations that each run
-    # 5 inner molecular-density passes then issue a dampened Picard ne update.
-    # This converges to the same C2/CO densities as the non-JIT path; a flat
-    # 5-pass loop without the ne update oscillates and leaves C2 ~21% low in
-    # the coolest layers.
-    M_consume = data.chem_eq_data.mol_atom_consume                          # (n_mols, 92)
+    # ── Phase 2: Newton solver — matches Julia's _solve_chemical_equilibrium ──
+    # 93-dim Newton (∞-norm, ftol=1e-8, full Jacobian via jacfwd, LU solve).
+    # WARNING: first JIT compile is slow (minutes) because jacfwd differentiates
+    # through the 306-molecule lax.scan body.  Subsequent calls are fast.
+    ne_all, nf_sol = _chem_eq_newton_batch_jit(
+        T_layers, n_total_layers, ne_init, nf_init, abundances, data.chem_eq_data
+    )
 
-    # Initial molecular densities from uncorrected Picard fractions
+    # Derive number densities from Newton solution
+    atom_dens_all      = abundances[None, :] * (n_total_layers - ne_all)[:, None]  # (n_layers, 92)
+    neutral_dens_final = atom_dens_all * nf_sol                                     # (n_layers, 92)
+    wII_all, wIII_all  = _compute_saha_weights_batch_jit(T_layers, ne_all, data.chem_eq_data)
+    ionized_dens_final = wII_all * neutral_dens_final                               # (n_layers, 92)
+    doubly_dens_final  = wIII_all * neutral_dens_final                              # (n_layers, 92)
+
+    # Molecular densities from Newton-solved neutral fractions
     mol_dens = _compute_mol_densities_batch_jit(
-        T_layers, n_total_layers, ne_all, abundances, nf_picard, data.chem_eq_data
+        T_layers, n_total_layers, ne_all, abundances, nf_sol, data.chem_eq_data
     )  # (n_layers, n_mols)
-
-    ne_work  = ne_all
-    wII_work, wIII_work = _compute_saha_weights_batch_jit(T_layers, ne_work, data.chem_eq_data)
-
-    for _outer in range(5):
-        atom_dens_w = abundances[None, :] * (n_total_layers - ne_work)[:, None]  # (n_layers, 92)
-        nf_w = 1.0 / (1.0 + wII_work + wIII_work)                               # (n_layers, 92)
-
-        for _inner in range(5):
-            mol_corr   = mol_dens @ M_consume                                     # (n_layers, 92)
-            total_corr = jnp.maximum(atom_dens_w - mol_corr, 1e-99)
-            nf_corr    = total_corr * nf_w / jnp.maximum(atom_dens_w, 1e-99)
-            mol_dens   = _compute_mol_densities_batch_jit(
-                T_layers, n_total_layers, ne_work, abundances, nf_corr, data.chem_eq_data
-            )
-
-        # Dampened Picard update for ne (matches chemical_equilibrium_all_layers)
-        mol_corr_last   = mol_dens @ M_consume
-        total_corr_last = jnp.maximum(atom_dens_w - mol_corr_last, 1e-99)
-        ioniz_fac = (wII_work + 2.0 * wIII_work) / jnp.maximum(
-            1.0 + wII_work + wIII_work, 1e-300
-        )
-        ne_new  = jnp.clip(jnp.sum(ioniz_fac * total_corr_last, axis=1), 1.0, None)
-        log_ne  = (0.3 * jnp.log(jnp.clip(ne_work, 1e-99, None)) +
-                   0.7 * jnp.log(jnp.clip(ne_new,  1e-99, None)))
-        ne_work = jnp.exp(log_ne)
-        wII_work, wIII_work = _compute_saha_weights_batch_jit(
-            T_layers, ne_work, data.chem_eq_data
-        )
-
-    ne_all             = ne_work
-    neutral_dens_final = total_corr_last * nf_w                            # (n_layers, 92)
-    wII_all            = wII_work
-    wIII_all           = wIII_work
-    ionized_dens_final = wII_all * neutral_dens_final                      # (n_layers, 92)
-    doubly_dens_final  = wIII_all * neutral_dens_final                     # (n_layers, 92)
 
     nH_I_all  = neutral_dens_final[:, 0]   # (n_layers,)
     nH_II_all = ionized_dens_final[:, 0]
@@ -1882,8 +1857,10 @@ def synthesize_jit(
     _peach_z = jnp.array([z for z, _ in _PEACH_IDX])    # [1, 5, 13, 11]
     n_peach = ionized_dens_final[:, _peach_z]            # (n_layers, 4)
 
-    # Z=1 FF: sum of all singly-ionized minus He II (index 1) — matches prepare_continuum_batch_fast
-    n_Z1_ff = ionized_dens_final.sum(axis=1) - ionized_dens_final[:, 1]    # (n_layers,)
+    # Z=1 FF: sum of all singly-ionized minus all Peach species (He_II, C_II, Si_II, Mg_II)
+    # Peach species are handled separately with Peach (1970) corrections; subtracting all 4
+    # matches prepare_continuum_batch_fast which excludes all peach_z_idx from n_Z1_ff.
+    n_Z1_ff = ionized_dens_final.sum(axis=1) - ionized_dens_final[:, _peach_z].sum(axis=1)    # (n_layers,)
 
     # Z=2 FF: sum of all doubly-ionized
     n_Z2_ff = doubly_dens_final.sum(axis=1)                                 # (n_layers,)
@@ -1939,6 +1916,11 @@ def synthesize_jit(
             _sym = atomic_symbols[_Z - 1]
             _nd_ref[Species(f'{_sym}_I')]  = _neutral_np[:, _Z - 1]
             _nd_ref[Species(f'{_sym}_II')] = _ionized_np[:, _Z - 1]
+        # Include molecular densities so reference linelist molecular lines (OZr, OV, HMg, etc.)
+        # contribute to alpha_ref, matching Julia's behavior.
+        _mol_np = np.asarray(mol_dens)
+        for _i, _mol_sp in enumerate(default_mol_species):
+            _nd_ref[_mol_sp] = _mol_np[:, _i]
         _cntm_coarse_np = np.asarray(alpha_cntm_coarse)
         def _cntm_at_ref_jit_fn(wl_cm):
             wl_arr = np.atleast_1d(wl_cm)
@@ -1997,7 +1979,9 @@ def synthesize_jit(
             win_L_arg = gamma_np / (np.pi * rho_crit)
             win_L = np.where(win_L_arg <= gamma_np**2, 0.0,
                              np.sqrt(np.maximum(win_L_arg - gamma_np**2, 0.0)))
-        max_wins = np.max(np.sqrt(win_G**2 + win_L**2), axis=1)   # (n_lines,)
+        # Match Julia: max of Gaussian window and max of Lorentzian window are taken
+        # separately before combining, giving a larger (more conservative) window.
+        max_wins = np.sqrt(np.max(win_G, axis=1)**2 + np.max(win_L, axis=1)**2)  # (n_lines,)
         max_wins_px = np.clip(
             np.ceil(2.0 * max_wins / wl_spacing + 2).astype(int), 0, n_wl
         )

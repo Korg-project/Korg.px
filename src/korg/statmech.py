@@ -48,6 +48,7 @@ class ChemicalEquilibriumData(NamedTuple):
     mol_charges: jnp.ndarray  # shape (n_molecules,)
     mol_n_atoms: jnp.ndarray  # shape (n_molecules,)
     mol_log_K_values: jnp.ndarray  # shape (n_molecules, n_temps) - log K on T grid
+    mol_log_K_z: jnp.ndarray       # shape (n_molecules, n_temps) - cubic spline z for log K
     mol_partition_func_values: jnp.ndarray  # shape (n_molecules, n_temps) - U(T) for each molecule
     mol_partition_func_z: jnp.ndarray  # cubic spline z for mol partition funcs: (n_molecules, n_temps)
     mol_atom_consume: jnp.ndarray  # shape (n_molecules, 92) - atoms of each element per molecule
@@ -784,7 +785,13 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
         mol_atoms_array = jnp.array(mol_atoms_list, dtype=jnp.int32)
         mol_charges = jnp.array(mol_charges_list, dtype=jnp.int32)
         mol_n_atoms = jnp.array(mol_n_atoms_list, dtype=jnp.int32)
-        mol_log_K_values = jnp.array(mol_log_K_list)
+        mol_log_K_np = np.array(mol_log_K_list)
+        mol_log_K_values = jnp.array(mol_log_K_np)
+        mol_log_K_z_np = np.zeros_like(mol_log_K_np)
+        for i in range(n_molecules):
+            cs = _make_cubic_spline(log_T_np, mol_log_K_np[i], extrapolate=True)
+            mol_log_K_z_np[i] = np.asarray(cs.z)
+        mol_log_K_z = jnp.array(mol_log_K_z_np)
         mol_pf_np = np.array(mol_pf_list)
         mol_partition_func_values = jnp.array(mol_pf_np)
         mol_pf_z_np = np.zeros_like(mol_pf_np)
@@ -803,6 +810,7 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
         mol_charges = jnp.array([], dtype=jnp.int32)
         mol_n_atoms = jnp.array([], dtype=jnp.int32)
         mol_log_K_values = jnp.zeros((0, n_temps))
+        mol_log_K_z = jnp.zeros((0, n_temps))
         mol_partition_func_values = jnp.zeros((0, n_temps))
         mol_partition_func_z = jnp.zeros((0, n_temps))
         mol_atom_consume = jnp.zeros((0, MAX_ATOMIC_NUMBER))
@@ -822,6 +830,7 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
         mol_charges=mol_charges,
         mol_n_atoms=mol_n_atoms,
         mol_log_K_values=mol_log_K_values,
+        mol_log_K_z=mol_log_K_z,
         mol_partition_func_values=mol_partition_func_values,
         mol_partition_func_z=mol_partition_func_z,
         mol_atom_consume=mol_atom_consume
@@ -851,9 +860,12 @@ def _compute_saha_weights_jit(T, ne, data):
         χI = data.ionization_energies[Z, 0]
         χII = data.ionization_energies[Z, 1]
 
-        UI = jnp.interp(log_T, data.log_T_grid, data.partition_func_values[Z, 0])
-        UII = jnp.interp(log_T, data.log_T_grid, data.partition_func_values[Z, 1])
-        UIII = jnp.interp(log_T, data.log_T_grid, data.partition_func_values[Z, 2])
+        UI   = _eval_atomic_pf_jit(log_T, data.pf_orig_t[Z, 0], data.pf_orig_u[Z, 0],
+                                    data.pf_orig_h[Z, 0], data.pf_orig_z[Z, 0], data.pf_orig_n[Z, 0])
+        UII  = _eval_atomic_pf_jit(log_T, data.pf_orig_t[Z, 1], data.pf_orig_u[Z, 1],
+                                    data.pf_orig_h[Z, 1], data.pf_orig_z[Z, 1], data.pf_orig_n[Z, 1])
+        UIII = _eval_atomic_pf_jit(log_T, data.pf_orig_t[Z, 2], data.pf_orig_u[Z, 2],
+                                    data.pf_orig_h[Z, 2], data.pf_orig_z[Z, 2], data.pf_orig_n[Z, 2])
 
         # Saha equation for first ionization
         wII = 2.0 / ne_clipped * (UII / jnp.clip(UI, 1e-99, jnp.inf)) * transU * jnp.exp(-χI / (kboltz_eV * T))
@@ -872,10 +884,46 @@ def _compute_saha_weights_jit(T, ne, data):
     return wII_array, wIII_array
 
 
+def _eval_atomic_pf_jit(log_T, t_arr, u_arr, h_arr, z_arr, n_knots):
+    """Evaluate atomic partition function via cubic spline (JIT-compatible).
+
+    Matches Julia's CubicSpline evaluation exactly. Uses original non-uniform knots.
+    """
+    t_max = t_arr[n_knots - 1]
+    log_T_c = jnp.clip(log_T, t_arr[0], t_max)
+    i = jnp.clip(jnp.searchsorted(t_arr, log_T_c, side='right') - 1, 0, n_knots - 2)
+    ti  = t_arr[i];   ti1 = t_arr[i + 1]
+    ui  = u_arr[i];   ui1 = u_arr[i + 1]
+    zi  = z_arr[i];   zi1 = z_arr[i + 1]
+    hi1 = h_arr[i + 1]
+    return (zi  * (ti1 - log_T_c)**3 / (6.0 * hi1)
+            + zi1 * (log_T_c - ti )**3 / (6.0 * hi1)
+            + (ui1 / hi1 - zi1 * hi1 / 6.0) * (log_T_c - ti )
+            + (ui  / hi1 - zi  * hi1 / 6.0) * (ti1 - log_T_c))
+
+
+def _cubic_spline_eval_logK(log_T, data, mol_idx):
+    """Cubic spline interpolation for log K using precomputed z (second derivatives)."""
+    t_grid = data.log_T_grid
+    h_grid = data.log_T_h
+    u_vals = data.mol_log_K_values[mol_idx]
+    z_vals = data.mol_log_K_z[mol_idx]
+    log_T_c = jnp.clip(log_T, t_grid[0], t_grid[-1])
+    i = jnp.clip(jnp.searchsorted(t_grid, log_T_c, side='right') - 1, 0, t_grid.shape[0] - 2)
+    ti  = t_grid[i];   ti1 = t_grid[i + 1]
+    ui  = u_vals[i];   ui1 = u_vals[i + 1]
+    zi  = z_vals[i];   zi1 = z_vals[i + 1]
+    hi1 = h_grid[i + 1]
+    return (zi  * (ti1 - log_T_c)**3 / (6.0 * hi1)
+            + zi1 * (log_T_c - ti )**3 / (6.0 * hi1)
+            + (ui1 / hi1 - zi1 * hi1 / 6.0) * (log_T_c - ti )
+            + (ui  / hi1 - zi  * hi1 / 6.0) * (ti1 - log_T_c))
+
+
 def _get_log_nK_jit(mol_idx, log_T, data):
     """Get log equilibrium constant in number density form (JIT-compatible)."""
-    # Interpolate log K from precomputed values
-    log_K_p = jnp.interp(log_T, data.log_T_grid, data.mol_log_K_values[mol_idx])
+    # Cubic spline interpolation for log K (matches Julia's CubicSpline exactly)
+    log_K_p = _cubic_spline_eval_logK(log_T, data, mol_idx)
 
     # Number of atoms
     n_atoms = data.mol_n_atoms[mol_idx]
@@ -1188,6 +1236,136 @@ _compute_mol_densities_batch_jit = jax.jit(
 )
 _compute_saha_weights_batch_jit = jax.jit(
     jax.vmap(_compute_saha_weights_jit, in_axes=(0, 0, None))
+)
+
+
+# ── Newton solver for chemical equilibrium (matches Julia's _solve_chemical_equilibrium) ──
+
+def _chem_eq_residuals_newton(x, T, n_total, abundances, data):
+    """
+    93-dim chemical equilibrium residuals with explicit temperature.
+
+    State vector x: x[:92] = neutral_fractions, x[92] = ne/(n_total·1e-5).
+    Matches Julia's `setup_chemical_equilibrium_residuals` / `residuals!` exactly.
+    """
+    nf = jnp.abs(x[:MAX_ATOMIC_NUMBER])
+    ne = jnp.maximum(jnp.abs(x[MAX_ATOMIC_NUMBER]) * n_total * 1e-5, 1.0)
+
+    atom_dens = abundances * (n_total - ne)          # (92,)
+    neutral_dens = atom_dens * nf                    # (92,)
+
+    # Saha weights with ne factored out: wII = wII_ne1/ne, wIII = wIII_ne1/ne²
+    wII_ne1, wIII_ne1 = _compute_saha_weights_jit(T, 1.0, data)
+    wII = wII_ne1 / ne
+    wIII = wIII_ne1 / ne ** 2
+
+    # Element and electron conservation residuals (before molecules)
+    F_atom = atom_dens - (1.0 + wII + wIII) * neutral_dens   # (92,)
+    F_ne   = jnp.sum((wII + 2.0 * wIII) * neutral_dens) - ne
+
+    F = jnp.concatenate([F_atom, jnp.array([F_ne])])  # (93,)
+
+    # Molecular corrections via lax.scan (matches Julia's molecule loop)
+    log_T = jnp.log(T)
+    log_nd = jnp.log10(jnp.maximum(neutral_dens, 1e-300))
+
+    def process_mol(F, mol_idx):
+        atoms  = data.mol_atoms_array[mol_idx]       # (6,) 0-indexed Z, -1=padding
+        charge = data.mol_charges[mol_idx]
+        n_ats  = data.mol_n_atoms[mol_idx]
+        log_nK = _get_log_nK_jit(mol_idx, log_T, data)
+        valid  = jnp.isfinite(log_nK)
+
+        def neutral_mol(F):
+            log_sum = jnp.sum(jnp.where(jnp.arange(6) < n_ats, log_nd[atoms], 0.0))
+            n_mol   = jnp.power(10.0, jnp.clip(log_sum - log_nK, -300.0, 300.0))
+            upd = jnp.where(jnp.arange(6) < n_ats, -n_mol, 0.0)
+            F2 = F.at[atoms[0]].add(jnp.where(n_ats > 0, upd[0], 0.0))
+            F2 = F2.at[atoms[1]].add(jnp.where(n_ats > 1, upd[1], 0.0))
+            F2 = F2.at[atoms[2]].add(jnp.where(n_ats > 2, upd[2], 0.0))
+            F2 = F2.at[atoms[3]].add(jnp.where(n_ats > 3, upd[3], 0.0))
+            F2 = F2.at[atoms[4]].add(jnp.where(n_ats > 4, upd[4], 0.0))
+            F2 = F2.at[atoms[5]].add(jnp.where(n_ats > 5, upd[5], 0.0))
+            return F2
+
+        def ionic_mol(F):
+            # First atom is the ionized species (lower Z, same convention as Julia)
+            idx1, idx2 = atoms[0], atoms[1]
+            log_n_ion1 = log_nd[idx1] + jnp.log10(jnp.maximum(wII[idx1], 1e-300))
+            n_mol = jnp.power(10.0, jnp.clip(log_n_ion1 + log_nd[idx2] - log_nK, -300.0, 300.0))
+            F2 = F.at[idx1].add(-n_mol)
+            F2 = F2.at[idx2].add(-n_mol)
+            F2 = F2.at[-1].add(n_mol)   # ionic molecule contributes to electron balance
+            return F2
+
+        F_upd = jax.lax.cond(
+            valid,
+            lambda F: jax.lax.cond(charge == 0, neutral_mol, ionic_mol, F),
+            lambda F: F,
+            F,
+        )
+        return F_upd, None
+
+    n_mols = data.mol_charges.shape[0]
+    if n_mols > 0:
+        F, _ = jax.lax.scan(process_mol, F, jnp.arange(n_mols))
+
+    # Normalize: element residuals by total atom density, electron by ne·1e-5
+    F = F.at[:MAX_ATOMIC_NUMBER].set(
+        F[:MAX_ATOMIC_NUMBER] / jnp.maximum(atom_dens, 1e-300)
+    )
+    F = F.at[-1].set(F[-1] / jnp.maximum(ne * 1e-5, 1e-300))
+
+    return F
+
+
+def _chem_eq_newton_layer_jit(T, n_total, ne_guess, nf_guess, abundances, data):
+    """
+    Single-layer Newton solver for chemical equilibrium.
+
+    Matches Julia's `_solve_chemical_equilibrium`:
+    - Method: Newton (full Jacobian via forward-mode AD)
+    - Convergence: ∞-norm < 1e-8
+    - Max iterations: 1000
+    - Linear solve: LU (jnp.linalg.solve)
+    - Line search: static (full step, α=1)
+    - Regularisation: 1e-12·I (matches `newton_solve_jax`)
+    """
+    x0 = jnp.concatenate([
+        jnp.clip(nf_guess, 1e-20, 1.0),
+        jnp.array([jnp.maximum(ne_guess, 1.0) / (n_total * 1e-5)]),
+    ])
+
+    def F(x):
+        return _chem_eq_residuals_newton(x, T, n_total, abundances, data)
+
+    def cond(state):
+        x, norm, step = state
+        return (norm > 1e-8) & (step < 1000) & jnp.all(jnp.isfinite(x))
+
+    def body(state):
+        x, _, step = state
+        F_val = F(x)
+        norm  = jnp.max(jnp.abs(F_val))
+        J     = jax.jacfwd(F)(x)
+        dx    = jnp.linalg.solve(J + 1e-12 * jnp.eye(MAX_ATOMIC_NUMBER + 1), -F_val)
+        dx    = jnp.where(jnp.isfinite(dx), dx, 0.0)
+        return x + dx, norm, step + 1
+
+    F0    = F(x0)
+    norm0 = jnp.max(jnp.abs(F0))
+    x_sol, _, _ = jax.lax.while_loop(cond, body, (x0, norm0, jnp.array(0)))
+
+    ne_sol = jnp.maximum(jnp.abs(x_sol[MAX_ATOMIC_NUMBER]) * n_total * 1e-5, 1.0)
+    nf_sol = jnp.abs(x_sol[:MAX_ATOMIC_NUMBER])
+    return ne_sol, nf_sol
+
+
+# Batch (all layers) Newton solver — vmapped; JIT-compiled on first call.
+# NOTE: first JIT compile is slow (~minutes) because jacfwd differentiates
+#       through the 306-molecule lax.scan body.  Subsequent calls are fast.
+_chem_eq_newton_batch_jit = jax.jit(
+    jax.vmap(_chem_eq_newton_layer_jit, in_axes=(0, 0, 0, 0, None, None))
 )
 
 
