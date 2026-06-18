@@ -1800,41 +1800,54 @@ def synthesize_jit(
         T_layers, n_total_layers, ne_layers, abundances, data.chem_eq_data
     )
 
-    # ── Phase 2: Molecular depletion correction (5 passes) ───────────────────
-    # The Picard iteration doesn't account for atoms locked in molecules (e.g.
-    # CO depletes 22% of C at 4500 K), causing n(C I) and hence n(C2) to be
-    # overestimated.  We iterate: subtract molecular consumption from neutral
-    # atom densities, recompute molecular densities, repeat until convergence.
-    atom_dens = abundances[None, :] * (n_total_layers - ne_all)[:, None]   # (n_layers, 92)
-    neutral_dens_picard = atom_dens * nf_picard                             # (n_layers, 92)
+    # ── Phase 2: Molecular depletion correction ──────────────────────────────
+    # Matches chemical_equilibrium_all_layers: 5 outer iterations that each run
+    # 5 inner molecular-density passes then issue a dampened Picard ne update.
+    # This converges to the same C2/CO densities as the non-JIT path; a flat
+    # 5-pass loop without the ne update oscillates and leaves C2 ~21% low in
+    # the coolest layers.
     M_consume = data.chem_eq_data.mol_atom_consume                          # (n_mols, 92)
 
-    # Initial molecular densities (will be refined by correction loop)
+    # Initial molecular densities from uncorrected Picard fractions
     mol_dens = _compute_mol_densities_batch_jit(
         T_layers, n_total_layers, ne_all, abundances, nf_picard, data.chem_eq_data
     )  # (n_layers, n_mols)
 
-    # 5 correction passes (unrolled at trace-time — XLA can fuse across passes).
-    # Each pass: subtract molecular atom consumption from picard neutral densities →
-    # recompute neutral fractions → recompute molecular densities.
-    # neutral_dens_corr after the loop is picard - mol_{n-1} @ M (matching
-    # chemical_equilibrium_all_layers which sets neutral_dens_all = neutral_dens_corrected
-    # from the last loop body, while mol_dens is mol_n from the same body).
-    neutral_dens_corr = neutral_dens_picard
-    for _ in range(5):
-        mol_atom_corr = mol_dens @ M_consume                                # (n_layers, 92)
-        neutral_dens_corr = jnp.maximum(neutral_dens_picard - mol_atom_corr, 1e-99)
-        nf_corr = neutral_dens_corr / jnp.maximum(atom_dens, 1e-99)
-        mol_dens = _compute_mol_densities_batch_jit(
-            T_layers, n_total_layers, ne_all, abundances, nf_corr, data.chem_eq_data
+    ne_work  = ne_all
+    wII_work, wIII_work = _compute_saha_weights_batch_jit(T_layers, ne_work, data.chem_eq_data)
+
+    for _outer in range(5):
+        atom_dens_w = abundances[None, :] * (n_total_layers - ne_work)[:, None]  # (n_layers, 92)
+        nf_w = 1.0 / (1.0 + wII_work + wIII_work)                               # (n_layers, 92)
+
+        for _inner in range(5):
+            mol_corr   = mol_dens @ M_consume                                     # (n_layers, 92)
+            total_corr = jnp.maximum(atom_dens_w - mol_corr, 1e-99)
+            nf_corr    = total_corr * nf_w / jnp.maximum(atom_dens_w, 1e-99)
+            mol_dens   = _compute_mol_densities_batch_jit(
+                T_layers, n_total_layers, ne_work, abundances, nf_corr, data.chem_eq_data
+            )
+
+        # Dampened Picard update for ne (matches chemical_equilibrium_all_layers)
+        mol_corr_last   = mol_dens @ M_consume
+        total_corr_last = jnp.maximum(atom_dens_w - mol_corr_last, 1e-99)
+        ioniz_fac = (wII_work + 2.0 * wIII_work) / jnp.maximum(
+            1.0 + wII_work + wIII_work, 1e-300
+        )
+        ne_new  = jnp.clip(jnp.sum(ioniz_fac * total_corr_last, axis=1), 1.0, None)
+        log_ne  = (0.3 * jnp.log(jnp.clip(ne_work, 1e-99, None)) +
+                   0.7 * jnp.log(jnp.clip(ne_new,  1e-99, None)))
+        ne_work = jnp.exp(log_ne)
+        wII_work, wIII_work = _compute_saha_weights_batch_jit(
+            T_layers, ne_work, data.chem_eq_data
         )
 
-    # neutral_dens_corr = picard - mol_{n-1} @ M  (matches chemical_equilibrium_all_layers)
-    # mol_dens          = mol_n  (final molecular densities)
-    neutral_dens_final = neutral_dens_corr
-    wII_all, wIII_all = _compute_saha_weights_batch_jit(T_layers, ne_all, data.chem_eq_data)
-    ionized_dens_final = wII_all * neutral_dens_final                       # (n_layers, 92)
-    doubly_dens_final  = wIII_all * neutral_dens_final                      # (n_layers, 92)
+    ne_all             = ne_work
+    neutral_dens_final = total_corr_last * nf_w                            # (n_layers, 92)
+    wII_all            = wII_work
+    wIII_all           = wIII_work
+    ionized_dens_final = wII_all * neutral_dens_final                      # (n_layers, 92)
+    doubly_dens_final  = wIII_all * neutral_dens_final                     # (n_layers, 92)
 
     nH_I_all  = neutral_dens_final[:, 0]   # (n_layers,)
     nH_II_all = ionized_dens_final[:, 0]

@@ -2,7 +2,8 @@
 Compare Python Korg vs Julia Korg.jl for a 100 Å synthesis with VALD linelist.
 
 Synthesizes wl = linspace(5000, 5100, 2000) with the solar VALD linelist
-using both Python and Julia, then creates a comparison plot.
+using both Python (JIT and non-JIT) and Julia, then creates a six-panel
+comparison plot.
 """
 import numpy as np
 import matplotlib.pyplot as plt
@@ -16,8 +17,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import jax.numpy as jnp
 import korg
 from korg.linelist import read_vald_linelist
-from korg.abundances import A_X_to_absolute
-from korg.synthesis import (precompute_synthesis_data, preprocess_linelist, synthesize_jit)
+from korg.abundances import A_X_to_absolute, format_A_X
+from korg.synthesis import (precompute_synthesis_data, preprocess_linelist,
+                             synthesize_jit, synthesize)
 from korg.data_loader import (ionization_energies, default_partition_funcs,
                                default_log_equilibrium_constants)
 
@@ -32,7 +34,7 @@ WL_MAX = 5100.0  # Å
 N_WL = 2000
 
 
-def run_python_synthesis():
+def run_python_synthesis_jit():
     print("=== Python Korg Synthesis (synthesize_jit) ===")
     linelist = read_vald_linelist(VALD_PATH)
     print(f"  Loaded {len(linelist)} lines from VALD")
@@ -42,13 +44,10 @@ def run_python_synthesis():
     wavelengths = np.linspace(WL_MIN, WL_MAX, N_WL)
     wavelengths_cm = jnp.array(wavelengths * 1e-8)
 
-    # Pre-compute static data (not timed — one-time setup)
     print("  Pre-computing synthesis data...")
     data = precompute_synthesis_data(ionization_energies, default_partition_funcs,
                                      default_log_equilibrium_constants)
 
-    # Filter linelist to synthesis range (+10 Å buffer) before JIT preprocessing.
-    # synthesize_jit cannot filter at runtime; all pre-filtered lines are processed.
     line_buffer_ang = 10.0
     wl_lo_cm = (WL_MIN - line_buffer_ang) * 1e-8
     wl_hi_cm = (WL_MAX + line_buffer_ang) * 1e-8
@@ -63,7 +62,6 @@ def run_python_synthesis():
     z_layers = jnp.array(atm.z)
     log_tau_ref = jnp.array(atm.log_tau_ref)
 
-    # Warmup call to trigger JAX compilation
     print("  Warming up (JIT compile)...")
     flux_w, cont_w = synthesize_jit(
         wavelengths_cm=wavelengths_cm,
@@ -71,7 +69,7 @@ def run_python_synthesis():
         z_layers=z_layers, log_tau_ref=log_tau_ref,
         abundances=abundances, vmic_cm_s=1.0e5, data=data, linelist_data=linelist_data
     )
-    _ = float(flux_w[0])  # force device sync
+    _ = float(flux_w[0])
 
     t0 = time.perf_counter()
     flux_jit, cont_jit = synthesize_jit(
@@ -80,11 +78,41 @@ def run_python_synthesis():
         z_layers=z_layers, log_tau_ref=log_tau_ref,
         abundances=abundances, vmic_cm_s=1.0e5, data=data, linelist_data=linelist_data
     )
-    _ = float(flux_jit[0])  # force device sync
+    _ = float(flux_jit[0])
     elapsed = time.perf_counter() - t0
 
     flux = np.array(flux_jit)
     continuum = np.array(cont_jit)
+    cnorm = flux / continuum
+
+    print(f"  Elapsed: {elapsed*1000:.1f} ms")
+    print(f"  Min normalized flux: {cnorm.min():.4f}")
+    return wavelengths, flux, continuum, cnorm, elapsed
+
+
+def run_python_synthesis_nonjit():
+    print("\n=== Python Korg Synthesis (synthesize, non-JIT) ===")
+    linelist = read_vald_linelist(VALD_PATH)
+    print(f"  Loaded {len(linelist)} lines from VALD")
+
+    atm = korg.read_model_atmosphere(ATMOSPHERE_PATH)
+    A_X = korg.format_A_X()
+    wavelengths = np.linspace(WL_MIN, WL_MAX, N_WL)
+    abundances = np.array(A_X_to_absolute(A_X))
+
+    t0 = time.perf_counter()
+    result = synthesize(
+        atmosphere=atm,
+        linelist=linelist,
+        wavelengths_angstrom=wavelengths,
+        abundances=abundances,
+        vmic=1.0,
+        verbose=False,
+    )
+    elapsed = time.perf_counter() - t0
+
+    flux = np.array(result.flux)
+    continuum = np.array(result.continuum)
     cnorm = flux / continuum
 
     print(f"  Elapsed: {elapsed*1000:.1f} ms")
@@ -98,7 +126,7 @@ def run_julia_synthesis():
     vald_abs = os.path.abspath(VALD_PATH)
     atm_abs = os.path.abspath(ATMOSPHERE_PATH)
 
-    line_buffer_cm = 10.0 * 1e-8  # 10 Å in cm
+    line_buffer_cm = 10.0 * 1e-8
     wl_min_cm = WL_MIN * 1e-8
     wl_max_cm = WL_MAX * 1e-8
 
@@ -111,7 +139,6 @@ println("  Loading atmosphere...")
 atm = Korg.read_model_atmosphere("{atm_abs}")
 println("  Loading VALD linelist...")
 all_lines = Korg.read_linelist("{vald_abs}", format="vald")
-# Pre-filter to synthesis range (matching Python's line_buffer=10Å default)
 linelist = filter(l -> ({wl_min_cm} - {line_buffer_cm}) <= l.wl <= ({wl_max_cm} + {line_buffer_cm}), all_lines)
 println("  Using ", length(linelist), " lines in range")
 
@@ -166,48 +193,120 @@ println("  Saved to {OUTPUT_H5}")
     return wl_jl, flux_jl, cntm_jl, cnorm_jl, julia_ms
 
 
-def make_plot(wl_py, cnorm_py, py_ms,
+def _ms(elapsed_s):
+    return elapsed_s * 1000
+
+
+def make_plot(wl_jit, cnorm_jit, jit_elapsed,
+              wl_nonjit, cnorm_nonjit, nonjit_elapsed,
               wl_jl, cnorm_jl, julia_ms):
-    diff = cnorm_py - np.interp(wl_py, wl_jl, cnorm_jl)
-    abs_diff = np.abs(diff)
-    rms = np.sqrt(np.mean(diff**2))
-    speedup = julia_ms / (py_ms * 1000)
 
-    fig, axes = plt.subplots(2, 1, figsize=(18, 4),
-                             gridspec_kw={'height_ratios': [1, 3]},
-                             sharex=True)
-    fig.subplots_adjust(hspace=0.04)
+    jit_ms = _ms(jit_elapsed)
+    nonjit_ms = _ms(nonjit_elapsed)
 
-    # Spectrum panel (bottom)
-    ax = axes[1]
-    ax.plot(wl_jl, cnorm_jl, '-', color='#333333', lw=0.6)
-    ax.plot(wl_py, cnorm_py, '-', color='#999999', lw=0.5)
-    # Direct labels — no legend box
-    ax.text(WL_MAX - 0.4, 1.058, f'Korg.jl  {julia_ms:.0f} ms',
-            ha='right', va='center', fontsize=8, color='#333333')
-    ax.text(WL_MAX - 0.4, 1.038, f'Korg.py  {py_ms*1000:.0f} ms  ·  {speedup:.1f}× faster',
-            ha='right', va='center', fontsize=8, color='#999999')
-    ax.set_ylabel('Normalized flux')
-    ax.set_ylim(-0.02, 1.09)
-    ax.set_xlim(WL_MIN, WL_MAX)
-    ax.set_xlabel('Wavelength (Å)')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+    # Interpolate all onto the JIT wavelength grid for residuals
+    cnorm_jl_i = np.interp(wl_jit, wl_jl, cnorm_jl)
+    cnorm_nonjit_i = np.interp(wl_jit, wl_nonjit, cnorm_nonjit)
 
-    # Residual panel (top) — auto-scaled to actual differences
-    ax = axes[0]
-    ax.plot(wl_py, diff, '-', color='#555555', lw=0.5)
-    ax.axhline(0, color='#cccccc', lw=0.6)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['bottom'].set_visible(False)
-    ax.tick_params(bottom=False)
-    ax.set_ylabel('Δ flux', fontsize=8)
-    ax.autoscale_view()
-    ymin, ymax = ax.get_ylim()
-    ax.text(WL_MAX - 0.4, ymax,
-            f'RMS={rms:.4f}  max|Δ|={abs_diff.max():.4f}',
-            ha='right', va='top', fontsize=7, color='#777777', family='monospace')
+    # Consistent encoding across all panels:
+    #   Korg.jl    — solid black
+    #   Korg.py JIT    — solid gray
+    #   Korg.py non-JIT — dashed gray (same shade; style distinguishes, not hue)
+    C_JL = '#111111'
+    C_PY = '#777777'
+    LS_JIT = '-'
+    LS_NONJIT = '--'
+
+    comparisons = [
+        {
+            'label_a': f'Korg.jl ({julia_ms:.0f} ms)',
+            'label_b': f'Korg.py JIT ({jit_ms:.0f} ms)',
+            'color_a': C_JL, 'ls_a': '-',
+            'color_b': C_PY, 'ls_b': LS_JIT,
+            'wl_a': wl_jl, 'cnorm_a': cnorm_jl,
+            'wl_b': wl_jit, 'cnorm_b': cnorm_jit,
+            'diff': cnorm_jit - cnorm_jl_i,
+            'title': 'Korg.jl vs Korg.py JIT',
+        },
+        {
+            'label_a': f'Korg.jl ({julia_ms:.0f} ms)',
+            'label_b': f'Korg.py non-JIT ({nonjit_ms:.0f} ms)',
+            'color_a': C_JL, 'ls_a': '-',
+            'color_b': C_PY, 'ls_b': LS_NONJIT,
+            'wl_a': wl_jl, 'cnorm_a': cnorm_jl,
+            'wl_b': wl_nonjit, 'cnorm_b': cnorm_nonjit,
+            'diff': cnorm_nonjit_i - cnorm_jl_i,
+            'title': 'Korg.jl vs Korg.py non-JIT',
+        },
+        {
+            'label_a': f'Korg.py JIT ({jit_ms:.0f} ms)',
+            'label_b': f'Korg.py non-JIT ({nonjit_ms:.0f} ms)',
+            'color_a': C_PY, 'ls_a': LS_JIT,
+            'color_b': C_PY, 'ls_b': LS_NONJIT,
+            'wl_a': wl_jit, 'cnorm_a': cnorm_jit,
+            'wl_b': wl_nonjit, 'cnorm_b': cnorm_nonjit,
+            'diff': cnorm_nonjit_i - cnorm_jit,
+            'title': 'Korg.py JIT vs non-JIT',
+        },
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 6),
+                             gridspec_kw={'height_ratios': [1, 3]})
+    fig.subplots_adjust(hspace=0.04, wspace=0.06)
+
+    # Compute shared residual y-limits across all three panels (identical scale for comparison)
+    all_diffs = np.concatenate([cmp['diff'] for cmp in comparisons])
+    d_abs_max = np.abs(all_diffs).max() * 1.15
+    res_ylim = (-d_abs_max, d_abs_max)
+
+    for col, cmp in enumerate(comparisons):
+        ax_res = axes[0, col]
+        ax_spec = axes[1, col]
+
+        # --- Residual panel (top) ---
+        diff = cmp['diff']
+        rms = np.sqrt(np.mean(diff**2))
+        ax_res.plot(wl_jit, diff, '-', color='#444444', lw=0.5)
+        ax_res.axhline(0, color='#cccccc', lw=0.6, zorder=0)
+        ax_res.set_xlim(WL_MIN, WL_MAX)
+        ax_res.set_ylim(*res_ylim)
+        ax_res.spines['top'].set_visible(False)
+        ax_res.spines['right'].set_visible(False)
+        ax_res.spines['bottom'].set_visible(False)
+        ax_res.tick_params(bottom=False, labelbottom=False)
+        # Title above residual panel; stats inlined as annotation
+        ax_res.set_title(cmp['title'], fontsize=9, pad=3, loc='left')
+        ax_res.text(0.99, 0.97, f'RMS {rms:.4f}  max|Δ| {np.abs(diff).max():.4f}',
+                    transform=ax_res.transAxes,
+                    ha='right', va='top', fontsize=7, color='#777777', family='monospace')
+        if col == 0:
+            ax_res.set_ylabel('Δ flux', fontsize=8)
+        else:
+            ax_res.tick_params(labelleft=False)
+
+        # --- Spectrum panel (bottom) ---
+        ax_spec.plot(cmp['wl_a'], cmp['cnorm_a'], cmp['ls_a'], color=cmp['color_a'], lw=0.6)
+        ax_spec.plot(cmp['wl_b'], cmp['cnorm_b'], cmp['ls_b'], color=cmp['color_b'], lw=0.6, alpha=0.85)
+        ax_spec.set_ylim(-0.02, 1.09)
+        ax_spec.set_xlim(WL_MIN, WL_MAX)
+        ax_spec.spines['top'].set_visible(False)
+        ax_spec.spines['right'].set_visible(False)
+
+        # Direct labels near top-right of spectrum panel, matching line color
+        ax_spec.text(0.99, 0.98, cmp['label_a'],
+                     transform=ax_spec.transAxes,
+                     ha='right', va='top', fontsize=7.5, color=cmp['color_a'])
+        ax_spec.text(0.99, 0.91, cmp['label_b'],
+                     transform=ax_spec.transAxes,
+                     ha='right', va='top', fontsize=7.5, color=cmp['color_b'])
+
+        # Single x-axis label on center column only
+        if col == 1:
+            ax_spec.set_xlabel('Wavelength (Å)')
+        if col == 0:
+            ax_spec.set_ylabel('Normalized flux')
+        else:
+            ax_spec.tick_params(labelleft=False)
 
     plt.savefig(OUTPUT_PNG, dpi=150, bbox_inches='tight')
     print(f"\nPlot saved to {OUTPUT_PNG}")
@@ -215,8 +314,10 @@ def make_plot(wl_py, cnorm_py, py_ms,
 
 
 if __name__ == '__main__':
-    wl_py, flux_py, cntm_py, cnorm_py, py_elapsed = run_python_synthesis()
+    wl_jit, flux_jit, cntm_jit, cnorm_jit, jit_elapsed = run_python_synthesis_jit()
+    wl_nonjit, flux_nonjit, cntm_nonjit, cnorm_nonjit, nonjit_elapsed = run_python_synthesis_nonjit()
     wl_jl, flux_jl, cntm_jl, cnorm_jl, julia_ms = run_julia_synthesis()
-    make_plot(wl_py, cnorm_py, py_elapsed,
+    make_plot(wl_jit, cnorm_jit, jit_elapsed,
+              wl_nonjit, cnorm_nonjit, nonjit_elapsed,
               wl_jl, cnorm_jl, julia_ms)
     print("\nDone.")
