@@ -1016,10 +1016,6 @@ class PrecomputedAtmosphereData(NamedTuple):
     # Source function
     S_all: jnp.ndarray            # (n_layers, n_wl) Planck function
 
-    # Precomputed line absorption (computed by precompute_atmosphere)
-    alpha_lines_all: jnp.ndarray  # (n_layers, n_wl) Voigt + H-line opacity
-    continuum_flux: jnp.ndarray   # (n_wl,) continuum flux [erg cm⁻² s⁻¹ Å⁻¹]
-
 
 def precompute_synthesis_data(
     ionization_energies_dict,
@@ -1265,130 +1261,6 @@ def precompute_atmosphere(
     # Source function
     S_all = jax.vmap(lambda T_i: blackbody(T_i, wavelengths_cm))(T_layers)
 
-    # ── Phase 4: Line absorption (precomputed) ────────────────────────────────
-    n_wl_pre = wavelengths_cm.shape[0]
-    n_lines_pre = linelist_data.wl.shape[0] if linelist_data is not None else 0
-
-    if n_lines_pre == 0 or linelist_data is None:
-        line_alpha_pre = jnp.zeros((n_layers, n_wl_pre))
-    else:
-        amp_jax_pre, sigma_D_jax_pre, gamma_L_jax_pre = _compute_line_params_jit(
-            T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
-            mol_densities_all, linelist_data, data, vmic_cm_s
-        )
-        amp_np_pre   = np.asarray(amp_jax_pre)
-        sigma_np_pre = np.asarray(sigma_D_jax_pre)
-        gamma_np_pre = np.asarray(gamma_L_jax_pre)
-
-        wl_np_pre  = linelist_data.wl_np_cached if linelist_data.wl_np_cached is not None else np.asarray(wavelengths_cm)
-        wls_np_pre = linelist_data.wls_np_cached if linelist_data.wls_np_cached is not None else np.asarray(linelist_data.wl)
-        wl_spacing_pre = linelist_data.wl_spacing_cached if linelist_data.wl_spacing_cached is not None else (
-            float(np.median(np.diff(wl_np_pre))) if n_wl_pre > 1 else 5e-9
-        )
-
-        cntm_coarse_np_pre = np.asarray(alpha_cntm_coarse)
-        cntm_at_center_pre = np.array(
-            [np.interp(wls_np_pre, cntm_wl_np_cached, cntm_coarse_np_pre[i]) for i in range(n_layers)]
-        ).T
-
-        _CUTOFF_PRE = 3e-4
-        rho_pre     = _CUTOFF_PRE * cntm_at_center_pre / np.maximum(np.abs(amp_np_pre), 1e-300)
-        sqrt2pi_pre = np.sqrt(2.0 * np.pi)
-        log_arg_pre = sqrt2pi_pre * sigma_np_pre * rho_pre
-        with np.errstate(invalid='ignore', divide='ignore'):
-            win_G_pre = np.where(log_arg_pre >= 1.0, 0.0,
-                                 sigma_np_pre * np.sqrt(-2.0 * np.log(np.maximum(log_arg_pre, 1e-300))))
-            win_L_arg_pre = gamma_np_pre / (np.pi * rho_pre)
-            win_L_pre = np.where(win_L_arg_pre <= gamma_np_pre**2, 0.0,
-                                 np.sqrt(np.maximum(win_L_arg_pre - gamma_np_pre**2, 0.0)))
-        max_wins_pre    = np.sqrt(np.max(win_G_pre, axis=1)**2 + np.max(win_L_pre, axis=1)**2)
-        max_wins_px_pre = np.clip(
-            np.ceil(2.0 * max_wins_pre / wl_spacing_pre + 2).astype(int), 0, n_wl_pre
-        )
-
-        alpha_lines_np_pre = np.zeros((n_layers, n_wl_pre))
-        BUCKET_WIDTHS_PRE  = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, n_wl_pre]
-        prev_W_pre = 0
-        for W_MAX_PRE in BUCKET_WIDTHS_PRE:
-            W_pre = min(W_MAX_PRE, n_wl_pre)
-            in_bucket_pre = (max_wins_px_pre > prev_W_pre) & (max_wins_px_pre <= W_MAX_PRE)
-            n_b_pre = int(in_bucket_pre.sum())
-            if n_b_pre == 0:
-                prev_W_pre = W_MAX_PRE
-                continue
-            idx_b_pre  = np.where(in_bucket_pre)[0]
-            wls_b_pre  = wls_np_pre[idx_b_pre]
-            i_lo_b_pre = np.clip(
-                np.searchsorted(wl_np_pre, wls_b_pre - max_wins_pre[idx_b_pre]).astype(int),
-                0, n_wl_pre - W_pre
-            )
-            pix_idx_pre = i_lo_b_pre[:, None] + np.arange(W_pre, dtype=int)[None, :]
-            wl_win_pre  = wl_np_pre[pix_idx_pre]
-            delta_b_pre = wl_win_pre - wls_b_pre[:, None]
-            mask_b_pre  = np.abs(delta_b_pre) <= max_wins_pre[idx_b_pre, None]
-            profiles_pre = np.asarray(_voigt_profile_jax_jit(
-                jnp.asarray(delta_b_pre[:, None, :]),
-                jnp.asarray(sigma_np_pre[idx_b_pre, :, None]),
-                jnp.asarray(gamma_np_pre[idx_b_pre, :, None]),
-            ))
-            contrib_pre = mask_b_pre[:, None, :] * amp_np_pre[idx_b_pre, :, None] * profiles_pre
-            for il_pre, i_lo_pre in enumerate(i_lo_b_pre):
-                alpha_lines_np_pre[:, i_lo_pre:i_lo_pre + W_pre] += contrib_pre[il_pre]
-            prev_W_pre = W_MAX_PRE
-
-        line_alpha_pre = jnp.asarray(alpha_lines_np_pre)
-
-    # ── Phase 4.5: H-line absorption (precomputed) ────────────────────────────
-    _RYDBERG_CM_PRE    = 1.0973731568539e5
-    _H_LINE_WINDOW_PRE = 150.0 * 1e-8
-    wl_min_cm_pre = float(wavelengths_cm[0])
-    wl_max_cm_pre = float(wavelengths_cm[-1])
-    nearby_stark_pre = {
-        k: v for k, v in hline_stark_profiles.items()
-        if (wl_min_cm_pre - _H_LINE_WINDOW_PRE
-            <= 1.0 / (_RYDBERG_CM_PRE * (1.0 / v.lower**2 - 1.0 / v.upper**2))
-            <= wl_max_cm_pre + _H_LINE_WINDOW_PRE)
-    }
-
-    T_np_pre    = np.asarray(T_layers)
-    ne_np_pre   = np.asarray(ne_all)
-    nH_I_np_pre = np.asarray(nH_I_all)
-    nHe_I_np_pre = np.asarray(nHe_I_all)
-    U_H_I_np_pre = np.asarray(U_H_I_all)
-    wl_cm_np_pre = np.asarray(wavelengths_cm)
-
-    ws_all_h_pre = precompute_hummer_ws(T_np_pre, nH_I_np_pre, nHe_I_np_pre, ne_np_pre)
-    h_alpha_pre  = np.zeros((n_layers, n_wl_pre))
-    if nearby_stark_pre:
-        h_alpha_pre += hydrogen_line_absorption_stark_batched(
-            wl_cm_np_pre, T_np_pre, ne_np_pre, nH_I_np_pre, U_H_I_np_pre,
-            _H_LINE_WINDOW_PRE, float(vmic_cm_s), ws_all_h_pre, nearby_stark_pre
-        )
-    brackett_in_range_pre = any(
-        wl_min_cm_pre - _H_LINE_WINDOW_PRE
-        <= 1.0 / (_RYDBERG_CM_PRE * (1.0 / 16.0 - 1.0 / m**2))
-        <= wl_max_cm_pre + _H_LINE_WINDOW_PRE
-        for m in range(5, 31)
-    )
-    if brackett_in_range_pre:
-        for _i_pre in range(n_layers):
-            h_alpha_pre[_i_pre] += hydrogen_line_absorption(
-                wl_cm_np_pre, T_np_pre[_i_pre], ne_np_pre[_i_pre],
-                nH_I_np_pre[_i_pre], nHe_I_np_pre[_i_pre],
-                float(U_H_I_np_pre[_i_pre]), float(vmic_cm_s),
-                _H_LINE_WINDOW_PRE, use_MHD=True, ws=ws_all_h_pre[_i_pre],
-                stark_profiles={}
-            )
-
-    alpha_lines_all_pre = line_alpha_pre + jnp.asarray(h_alpha_pre)
-
-    # ── Continuum RT (precomputed) ────────────────────────────────────────────
-    from .radiative_transfer import radiative_transfer_jit as _rt_jit_pre
-    flux_cntm_pre, _ = _rt_jit_pre(
-        alpha_cntm_all.T, S_all.T, z_layers, log_tau_ref, alpha_ref_all
-    )
-    continuum_flux_pre = flux_cntm_pre * 1e-8
-
     return PrecomputedAtmosphereData(
         T_layers=T_layers,
         ne_all=ne_all,
@@ -1408,8 +1280,6 @@ def precompute_atmosphere(
         alpha_cntm_coarse=alpha_cntm_coarse,
         cntm_wl_np=cntm_wl_np_cached,
         S_all=S_all,
-        alpha_lines_all=alpha_lines_all_pre,
-        continuum_flux=continuum_flux_pre,
     )
 
 
@@ -2201,17 +2071,26 @@ def synthesize_jit(
     n_wl = wavelengths_cm.shape[0]
 
     if precomputed_atm is not None:
-        # Full precomputed path — skip phases 1-4.5, only 1 RT call needed
-        alpha_total_pre = precomputed_atm.alpha_cntm_all + precomputed_atm.alpha_lines_all
-        from .radiative_transfer import radiative_transfer_jit as _rt_jit_fast
-        flux_pre, _ = _rt_jit_fast(
-            alpha_total_pre.T,
-            precomputed_atm.S_all.T,
-            precomputed_atm.z_layers,
-            precomputed_atm.log_tau_ref,
-            precomputed_atm.alpha_ref_all,
-        )
-        return flux_pre * 1e-8, precomputed_atm.continuum_flux
+        # Unpack precomputed quantities — skip phases 1-3
+        T_layers          = precomputed_atm.T_layers
+        ne_all            = precomputed_atm.ne_all
+        z_layers          = precomputed_atm.z_layers
+        log_tau_ref       = precomputed_atm.log_tau_ref
+        vmic_cm_s         = precomputed_atm.vmic_cm_s
+        nf_sol            = precomputed_atm.nf_sol
+        neutral_dens_final = precomputed_atm.neutral_dens
+        ionized_dens_final = precomputed_atm.ionized_dens
+        mol_densities_all = precomputed_atm.mol_dens_padded
+        nH_I_all          = precomputed_atm.nH_I_all
+        nH_II_all         = precomputed_atm.nH_II_all
+        nHe_I_all         = precomputed_atm.nHe_I_all
+        U_H_I_all         = precomputed_atm.U_H_I_all
+        alpha_cntm_all    = precomputed_atm.alpha_cntm_all
+        alpha_ref_all     = precomputed_atm.alpha_ref_all
+        alpha_cntm_coarse = precomputed_atm.alpha_cntm_coarse
+        cntm_wl_np_cached = precomputed_atm.cntm_wl_np
+        S_all             = precomputed_atm.S_all
+        n_layers = T_layers.shape[0]
     else:
         n_layers = T_layers.shape[0]
         lambda_ref_cm = 5e-5  # 5000 Å reference wavelength

@@ -33,7 +33,6 @@ OUTPUT_PNG = os.path.join(os.path.dirname(__file__), '..', 'vald_synthesis_compa
 WL_MIN = 5000.0  # Å
 WL_MAX = 5100.0  # Å
 N_WL = 2000
-K = 5  # number of timed trials (min is reported)
 
 
 def run_python_synthesis_jit():
@@ -103,13 +102,13 @@ def run_python_synthesis_jit():
     _ = float(synthesize_jit(**kw_fast)[0][0])
     _ = float(synthesize_jit(**kw_fast)[0][0])
     times_fast = []
-    for _ in range(K):
+    for _ in range(3):
         t0 = time.perf_counter()
         flux_fast, cont_fast = synthesize_jit(**kw_fast)
         _ = float(flux_fast[0])
         times_fast.append(time.perf_counter() - t0)
     elapsed_fast = min(times_fast)
-    print(f"  Elapsed (precomputed): {elapsed_fast*1000:.1f} ms  ({elapsed/elapsed_fast:.1f}x vs non-precomputed)  [min of {K}]")
+    print(f"  Elapsed (precomputed): {elapsed_fast*1000:.1f} ms  ({elapsed/elapsed_fast:.1f}x vs non-precomputed)")
 
     return wavelengths, flux, continuum, cnorm, elapsed, elapsed_fast
 
@@ -172,18 +171,11 @@ wavelengths = collect(range({WL_MIN}, {WL_MAX}, length={N_WL}))
 # Warmup call
 Korg.synthesize(atm, linelist, A_X, wavelengths, vmic=1.0)
 
-println("  Synthesizing (timed, {K} trials)...")
-K = {K}
-times = Float64[]
-sol = Korg.synthesize(atm, linelist, A_X, wavelengths, vmic=1.0)  # pre-declare
-for k in 1:K
-    t0 = time()
-    sol = Korg.synthesize(atm, linelist, A_X, wavelengths, vmic=1.0)
-    push!(times, time() - t0)
-    println("  Trial ", k, ": ", round(times[end]*1000, digits=1), " ms")
-end
-elapsed = minimum(times)
-println("  Fastest of ", K, ": ", round(elapsed*1000, digits=1), " ms")
+println("  Synthesizing (timed)...")
+t0 = time()
+sol = Korg.synthesize(atm, linelist, A_X, wavelengths, vmic=1.0)
+elapsed = time() - t0
+println("  Elapsed: ", round(elapsed*1000, digits=1), " ms")
 println("  Min normalized flux: ", minimum(sol.flux ./ sol.cntm))
 
 h5open("{OUTPUT_H5}", "w") do f
@@ -290,5 +282,5 @@ if __name__ == '__main__':
     wl_jl, flux_jl, cntm_jl, cnorm_jl, julia_ms = run_julia_synthesis()
     speedup = julia_ms / 1000 / jit_fast_elapsed
     print(f"\n  Speedup (precomputed vs Julia): {speedup:.1f}×  ({jit_fast_elapsed*1000:.1f} ms vs {julia_ms:.1f} ms)")
-    make_plot(wl_jit, cnorm_jit, jit_fast_elapsed, wl_jl, cnorm_jl, julia_ms)
+    make_plot(wl_jit, cnorm_jit, jit_elapsed, wl_jl, cnorm_jl, julia_ms)
     print("\nDone.")
