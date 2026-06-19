@@ -921,7 +921,8 @@ from .statmech import (ChemicalEquilibriumData, precompute_chemical_equilibrium_
                        _chemical_equilibrium_batch_jit,
                        _compute_mol_densities_batch_jit,
                        _compute_saha_weights_batch_jit,
-                       _chem_eq_newton_batch_jit)
+                       _chem_eq_newton_batch_jit,
+                       _chem_eq_newton_scan_jit)
 from .continuum import (_batch_continuum_vmap, _get_metal_bf_idx,
                         get_metal_bf_cross_sections, _PEACH_IDX, _H2_MOL_IDX)
 
@@ -1806,9 +1807,11 @@ def synthesize_jit(
 
     # ── Phase 2: Newton solver — matches Julia's _solve_chemical_equilibrium ──
     # 93-dim Newton (∞-norm, ftol=1e-8, full Jacobian via jacfwd, LU solve).
+    # Layers are sorted by temperature so each layer inherits the previous
+    # converged (ne, nf) as its warm-start, reducing iterations from ~5–8 to ~2–3.
     # WARNING: first JIT compile is slow (minutes) because jacfwd differentiates
     # through the 306-molecule lax.scan body.  Subsequent calls are fast.
-    ne_all, nf_sol = _chem_eq_newton_batch_jit(
+    ne_all, nf_sol = _chem_eq_newton_scan_jit(
         T_layers, n_total_layers, ne_init, nf_init, abundances, data.chem_eq_data
     )
 
