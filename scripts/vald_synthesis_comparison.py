@@ -19,7 +19,8 @@ import korg
 from korg.linelist import read_vald_linelist
 from korg.abundances import A_X_to_absolute, format_A_X
 from korg.synthesis import (precompute_synthesis_data, preprocess_linelist,
-                             synthesize_jit, synthesize)
+                             synthesize_jit, synthesize,
+                             precompute_atmosphere, PrecomputedAtmosphereData)
 from korg.data_loader import (ionization_energies, default_partition_funcs,
                                default_log_equilibrium_constants)
 
@@ -86,6 +87,29 @@ def run_python_synthesis_jit():
 
     print(f"  Elapsed: {elapsed*1000:.1f} ms")
     print(f"  Min normalized flux: {cnorm.min():.4f}")
+
+    # --- Precomputed atmosphere workflow ---
+    print("\n  Pre-computing atmosphere (one-time cost)...")
+    atm_precomputed = precompute_atmosphere(
+        wavelengths_cm, T_layers, n_total, ne_layers, z_layers, log_tau_ref,
+        abundances, 1.0e5, data, linelist_data
+    )
+    print("  Timing synthesize_jit WITH precomputed atmosphere...")
+    kw_fast = dict(wavelengths_cm=wavelengths_cm, T_layers=T_layers, n_total_layers=n_total,
+                   ne_layers=ne_layers, z_layers=z_layers, log_tau_ref=log_tau_ref,
+                   abundances=abundances, vmic_cm_s=1.0e5, data=data,
+                   linelist_data=linelist_data, precomputed_atm=atm_precomputed)
+    _ = float(synthesize_jit(**kw_fast)[0][0])
+    _ = float(synthesize_jit(**kw_fast)[0][0])
+    times_fast = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        flux_fast, cont_fast = synthesize_jit(**kw_fast)
+        _ = float(flux_fast[0])
+        times_fast.append(time.perf_counter() - t0)
+    elapsed_fast = min(times_fast)
+    print(f"  Elapsed (precomputed): {elapsed_fast*1000:.1f} ms  ({elapsed/elapsed_fast:.1f}x speedup)")
+
     return wavelengths, flux, continuum, cnorm, elapsed
 
 

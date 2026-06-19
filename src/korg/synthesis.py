@@ -980,6 +980,43 @@ class SynthesisData(NamedTuple):
     metal_bf_charge_arr: jnp.ndarray # shape (n_metal,) int32 — ionization charge per species
 
 
+class PrecomputedAtmosphereData(NamedTuple):
+    """
+    Pre-computed atmosphere-dependent quantities for fast synthesis.
+
+    Call precompute_atmosphere() once per (atmosphere, abundances, vmic, wavelengths)
+    combination. Pass to synthesize_jit as precomputed_atm=... to skip the ~28 ms
+    chemical-equilibrium and continuum phases.
+    """
+    # Atmosphere arrays (needed by line params and RT)
+    T_layers: jnp.ndarray         # (n_layers,)
+    ne_all: jnp.ndarray           # (n_layers,)
+    z_layers: jnp.ndarray         # (n_layers,)
+    log_tau_ref: jnp.ndarray      # (n_layers,)
+    vmic_cm_s: float
+
+    # Chemical equilibrium results
+    nf_sol: jnp.ndarray           # (n_layers, 92) neutral fractions
+    neutral_dens: jnp.ndarray     # (n_layers, 92) neutral number densities
+    ionized_dens: jnp.ndarray     # (n_layers, 92) ionized number densities
+    mol_dens_padded: jnp.ndarray  # (n_layers, n_mols+1) mol densities + zero column
+    nH_I_all: jnp.ndarray         # (n_layers,)
+    nH_II_all: jnp.ndarray        # (n_layers,)
+    nHe_I_all: jnp.ndarray        # (n_layers,)
+    U_H_I_all: jnp.ndarray        # (n_layers,)
+
+    # Continuum (already interpolated to fine wavelength grid)
+    alpha_cntm_all: jnp.ndarray   # (n_layers, n_wl) fine-grid continuum opacity
+    alpha_ref_all: jnp.ndarray    # (n_layers,) continuum+line opacity at lambda_ref
+
+    # Coarse continuum grid (for line-center window-size computation)
+    alpha_cntm_coarse: jnp.ndarray    # (n_layers, n_cntm) coarse continuum opacity
+    cntm_wl_np: np.ndarray            # (n_cntm,) coarse wavelength grid [cm] as numpy array
+
+    # Source function
+    S_all: jnp.ndarray            # (n_layers, n_wl) Planck function
+
+
 def precompute_synthesis_data(
     ionization_energies_dict,
     partition_funcs,
@@ -1050,6 +1087,199 @@ def precompute_synthesis_data(
         metal_bf_logT_grid=metal_bf_logT_grid,
         metal_bf_z_arr=metal_bf_z_arr,
         metal_bf_charge_arr=metal_bf_charge_arr,
+    )
+
+
+def precompute_atmosphere(
+    wavelengths_cm,
+    T_layers,
+    n_total_layers,
+    ne_layers,
+    z_layers,
+    log_tau_ref,
+    abundances,
+    vmic_cm_s,
+    data: SynthesisData,
+    linelist_data,
+) -> PrecomputedAtmosphereData:
+    """
+    Pre-compute all atmosphere-dependent quantities for fast synthesis.
+
+    Call this once whenever the atmosphere model or abundances change.
+    Pass the result to synthesize_jit(precomputed_atm=...) to skip
+    chemical equilibrium and continuum computation (~28 ms savings).
+
+    Parameters
+    ----------
+    wavelengths_cm : array, shape (n_wl,)
+        Wavelength grid [cm]
+    T_layers : array, shape (n_layers,)
+        Temperature at each layer [K]
+    n_total_layers : array, shape (n_layers,)
+        Total number density at each layer [cm⁻³]
+    ne_layers : array, shape (n_layers,)
+        Electron density at each layer [cm⁻³]
+    z_layers : array, shape (n_layers,)
+        Height coordinate at each layer [cm]
+    log_tau_ref : array, shape (n_layers,)
+        Log optical depth at reference wavelength
+    abundances : array, shape (92,)
+        Absolute abundances N(X)/N_total
+    vmic_cm_s : float
+        Microturbulent velocity [cm/s]
+    data : SynthesisData
+        Pre-computed synthesis data
+    linelist_data : LinelistData
+        Pre-processed linelist (used for cached wavelength grids)
+
+    Returns
+    -------
+    PrecomputedAtmosphereData
+        All atmosphere-dependent quantities ready for fast synthesis.
+    """
+    import jax
+    n_layers = T_layers.shape[0]
+    lambda_ref_cm = 5e-5  # 5000 Å reference wavelength
+    c_cgs_float = float(c_cgs)
+
+    # ── Phase 1: Picard initial guess ────────────────────────────────────────
+    ne_init, nf_init = _chemical_equilibrium_batch_jit(
+        T_layers, n_total_layers, ne_layers, abundances, data.chem_eq_data
+    )
+
+    # ── Phase 2: Newton solver ────────────────────────────────────────────────
+    ne_all, nf_sol = _chem_eq_newton_batch_jit(
+        T_layers, n_total_layers, ne_init, nf_init, abundances, data.chem_eq_data
+    )
+
+    # Derive number densities from Newton solution
+    atom_dens_all      = abundances[None, :] * (n_total_layers - ne_all)[:, None]
+    neutral_dens_final = atom_dens_all * nf_sol
+    wII_all, wIII_all  = _compute_saha_weights_batch_jit(T_layers, ne_all, data.chem_eq_data)
+    ionized_dens_final = wII_all * neutral_dens_final
+    doubly_dens_final  = wIII_all * neutral_dens_final
+
+    mol_dens = _compute_mol_densities_batch_jit(
+        T_layers, n_total_layers, ne_all, abundances, nf_sol, data.chem_eq_data
+    )  # (n_layers, n_mols)
+
+    nH_I_all  = neutral_dens_final[:, 0]
+    nH_II_all = ionized_dens_final[:, 0]
+    nHe_I_all = neutral_dens_final[:, 1]
+
+    # Partition functions for H I and He I
+    log_T_all = jnp.log(T_layers)
+    U_H_I_all = jax.vmap(
+        lambda lt: _pf_orig_eval(
+            lt, data.chem_eq_data.pf_orig_t[0, 0], data.chem_eq_data.pf_orig_u[0, 0],
+            data.chem_eq_data.pf_orig_h[0, 0], data.chem_eq_data.pf_orig_z[0, 0],
+            data.chem_eq_data.pf_orig_n[0, 0],
+        )
+    )(log_T_all)
+    U_He_I_all = jax.vmap(
+        lambda lt: _pf_orig_eval(
+            lt, data.chem_eq_data.pf_orig_t[1, 0], data.chem_eq_data.pf_orig_u[1, 0],
+            data.chem_eq_data.pf_orig_h[1, 0], data.chem_eq_data.pf_orig_z[1, 0],
+            data.chem_eq_data.pf_orig_n[1, 0],
+        )
+    )(log_T_all)
+
+    # Pad mol_dens with a zero column
+    mol_densities_all = jnp.concatenate(
+        [mol_dens, jnp.zeros((n_layers, 1))], axis=1
+    )  # (n_layers, n_mols+1)
+
+    nH2_all = mol_dens[:, _H2_MOL_IDX]
+
+    _peach_z = jnp.array([z for z, _ in _PEACH_IDX])
+    n_peach = ionized_dens_final[:, _peach_z]
+    n_Z1_ff = ionized_dens_final.sum(axis=1) - ionized_dens_final[:, _peach_z].sum(axis=1)
+    n_Z2_ff = doubly_dens_final.sum(axis=1)
+    n_neutral_metal = neutral_dens_final[:, data.metal_bf_z_arr]
+    n_ionized_metal = ionized_dens_final[:, data.metal_bf_z_arr]
+    n_doubly_metal  = doubly_dens_final[:, data.metal_bf_z_arr]
+    metal_bf_dens = jnp.where(
+        data.metal_bf_charge_arr[None, :] == 0, n_neutral_metal,
+        jnp.where(data.metal_bf_charge_arr[None, :] == 1, n_ionized_metal, n_doubly_metal)
+    )
+
+    # ── Phase 3: Continuum opacity ────────────────────────────────────────────
+    if linelist_data is not None and linelist_data.cntm_wl_np_cached is not None:
+        cntm_wl_np_cached = linelist_data.cntm_wl_np_cached
+    else:
+        wl_min_cm = float(wavelengths_cm[0])
+        wl_max_cm = float(wavelengths_cm[-1])
+        cntm_step_cm = 1e-8
+        cntm_wl_np_cached = np.arange(wl_min_cm - cntm_step_cm, wl_max_cm + 2 * cntm_step_cm, cntm_step_cm)
+    cntm_nu_np = c_cgs_float / cntm_wl_np_cached
+
+    alpha_cntm_coarse = _batch_continuum_vmap(
+        jnp.array(cntm_nu_np), T_layers, ne_all, U_H_I_all, U_He_I_all,
+        nH_I_all, nH_II_all, nHe_I_all, nH2_all,
+        n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
+        data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
+    )  # (n_layers, n_cntm)
+
+    cntm_wl_jnp = jnp.array(cntm_wl_np_cached)
+    alpha_cntm_all = jax.vmap(
+        lambda row: jnp.interp(wavelengths_cm, cntm_wl_jnp, row)
+    )(alpha_cntm_coarse)  # (n_layers, n_wl)
+
+    alpha_ref_all = jax.vmap(
+        lambda row: jnp.interp(jnp.array([lambda_ref_cm]), cntm_wl_jnp, row)[0]
+    )(alpha_cntm_coarse)  # (n_layers,)
+
+    # Add line absorption at reference wavelength
+    from .data_loader import load_default_linelist as _load_ref_ll
+    _ref_ll = _load_ref_ll(lambda_ref_cm)
+    if _ref_ll:
+        _T_np = np.asarray(T_layers)
+        _ne_np = np.asarray(ne_all)
+        _neutral_np = np.asarray(neutral_dens_final)
+        _ionized_np = np.asarray(ionized_dens_final)
+        _nd_ref = {}
+        for _Z in range(1, 93):
+            _sym = atomic_symbols[_Z - 1]
+            _nd_ref[Species(f'{_sym}_I')]  = _neutral_np[:, _Z - 1]
+            _nd_ref[Species(f'{_sym}_II')] = _ionized_np[:, _Z - 1]
+        _mol_np = np.asarray(mol_dens)
+        for _i, _mol_sp in enumerate(default_mol_species):
+            _nd_ref[_mol_sp] = _mol_np[:, _i]
+        _cntm_coarse_np = np.asarray(alpha_cntm_coarse)
+        def _cntm_at_ref_fn(wl_cm):
+            wl_arr = np.atleast_1d(wl_cm)
+            result = np.stack([np.interp(wl_arr, cntm_wl_np_cached, _cntm_coarse_np[i]) for i in range(n_layers)], axis=-1)
+            return result if np.ndim(wl_cm) > 0 else result[0]
+        _line_at_ref = line_absorption(
+            _ref_ll, np.array([lambda_ref_cm]),
+            _T_np, _ne_np, _nd_ref,
+            default_partition_funcs, float(vmic_cm_s), _cntm_at_ref_fn,
+            cutoff_threshold=3e-4,
+        )  # (n_layers, 1)
+        alpha_ref_all = alpha_ref_all + jnp.array(_line_at_ref[:, 0])
+
+    # Source function
+    S_all = jax.vmap(lambda T_i: blackbody(T_i, wavelengths_cm))(T_layers)
+
+    return PrecomputedAtmosphereData(
+        T_layers=T_layers,
+        ne_all=ne_all,
+        z_layers=z_layers,
+        log_tau_ref=log_tau_ref,
+        vmic_cm_s=float(vmic_cm_s),
+        nf_sol=nf_sol,
+        neutral_dens=neutral_dens_final,
+        ionized_dens=ionized_dens_final,
+        mol_dens_padded=mol_densities_all,
+        nH_I_all=nH_I_all,
+        nH_II_all=nH_II_all,
+        nHe_I_all=nHe_I_all,
+        U_H_I_all=U_H_I_all,
+        alpha_cntm_all=alpha_cntm_all,
+        alpha_ref_all=alpha_ref_all,
+        alpha_cntm_coarse=alpha_cntm_coarse,
+        cntm_wl_np=cntm_wl_np_cached,
+        S_all=S_all,
     )
 
 
@@ -1800,6 +2030,7 @@ def synthesize_jit(
     vmic_cm_s: float,
     data: SynthesisData,
     linelist_data: LinelistData,
+    precomputed_atm: Optional['PrecomputedAtmosphereData'] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Fully JIT-compatible spectral synthesis.
@@ -1826,6 +2057,9 @@ def synthesize_jit(
         Pre-computed synthesis data
     linelist_data : LinelistData
         Pre-processed linelist
+    precomputed_atm : PrecomputedAtmosphereData, optional
+        Pre-computed atmosphere-dependent quantities from precompute_atmosphere().
+        When provided, skips chemical equilibrium and continuum phases (~28 ms).
 
     Returns
     -------
@@ -1834,153 +2068,176 @@ def synthesize_jit(
     continuum : array, shape (n_wl,)
         Continuum flux [erg cm⁻² s⁻¹ cm⁻¹]
     """
-    n_layers = T_layers.shape[0]
     n_wl = wavelengths_cm.shape[0]
-    lambda_ref_cm = 5e-5  # 5000 Å reference wavelength
 
-    # ── Phase 1: Picard initial guess for Newton solver ──────────────────────
-    # A single Picard pass (300 iterations, all layers at once) gives ne and
-    # neutral fractions close enough that Newton converges in ~5 iterations.
-    ne_init, nf_init = _chemical_equilibrium_batch_jit(
-        T_layers, n_total_layers, ne_layers, abundances, data.chem_eq_data
-    )
-
-    # ── Phase 2: Newton solver — matches Julia's _solve_chemical_equilibrium ──
-    # 93-dim Newton (∞-norm, ftol=1e-8, analytical Jacobian, LU solve).
-    # Layers solved in parallel via vmap; Picard guess gives 3-4 Newton iterations.
-    ne_all, nf_sol = _chem_eq_newton_batch_jit(
-        T_layers, n_total_layers, ne_init, nf_init, abundances, data.chem_eq_data
-    )
-
-    # Derive number densities from Newton solution
-    atom_dens_all      = abundances[None, :] * (n_total_layers - ne_all)[:, None]  # (n_layers, 92)
-    neutral_dens_final = atom_dens_all * nf_sol                                     # (n_layers, 92)
-    wII_all, wIII_all  = _compute_saha_weights_batch_jit(T_layers, ne_all, data.chem_eq_data)
-    ionized_dens_final = wII_all * neutral_dens_final                               # (n_layers, 92)
-    doubly_dens_final  = wIII_all * neutral_dens_final                              # (n_layers, 92)
-
-    # Molecular densities from Newton-solved neutral fractions
-    mol_dens = _compute_mol_densities_batch_jit(
-        T_layers, n_total_layers, ne_all, abundances, nf_sol, data.chem_eq_data
-    )  # (n_layers, n_mols)
-
-    nH_I_all  = neutral_dens_final[:, 0]   # (n_layers,)
-    nH_II_all = ionized_dens_final[:, 0]
-    nHe_I_all = neutral_dens_final[:, 1]
-
-    # Partition functions for H I and He I at each layer (original knots — exact match to synthesize)
-    log_T_all = jnp.log(T_layers)
-    U_H_I_all = jax.vmap(
-        lambda lt: _pf_orig_eval(
-            lt, data.chem_eq_data.pf_orig_t[0, 0], data.chem_eq_data.pf_orig_u[0, 0],
-            data.chem_eq_data.pf_orig_h[0, 0], data.chem_eq_data.pf_orig_z[0, 0],
-            data.chem_eq_data.pf_orig_n[0, 0],
-        )
-    )(log_T_all)  # (n_layers,)
-    U_He_I_all = jax.vmap(
-        lambda lt: _pf_orig_eval(
-            lt, data.chem_eq_data.pf_orig_t[1, 0], data.chem_eq_data.pf_orig_u[1, 0],
-            data.chem_eq_data.pf_orig_h[1, 0], data.chem_eq_data.pf_orig_z[1, 0],
-            data.chem_eq_data.pf_orig_n[1, 0],
-        )
-    )(log_T_all)  # (n_layers,)
-
-    # Pad mol_dens with a zero column so mol_species_idx == -1 can safely index it
-    mol_densities_all = jnp.concatenate(
-        [mol_dens, jnp.zeros((n_layers, 1))], axis=1
-    )  # (n_layers, n_mols+1)
-
-    # H2 density from molecular densities (index 50 in default mol list)
-    nH2_all = mol_dens[:, _H2_MOL_IDX]  # (n_layers,)
-
-    # Peach FF species: He_II (z=1), C_II (z=5), Si_II (z=13), Mg_II (z=11)
-    _peach_z = jnp.array([z for z, _ in _PEACH_IDX])    # [1, 5, 13, 11]
-    n_peach = ionized_dens_final[:, _peach_z]            # (n_layers, 4)
-
-    # Z=1 FF: sum of all singly-ionized minus all Peach species (He_II, C_II, Si_II, Mg_II)
-    # Peach species are handled separately with Peach (1970) corrections; subtracting all 4
-    # matches prepare_continuum_batch_fast which excludes all peach_z_idx from n_Z1_ff.
-    n_Z1_ff = ionized_dens_final.sum(axis=1) - ionized_dens_final[:, _peach_z].sum(axis=1)    # (n_layers,)
-
-    # Z=2 FF: sum of all doubly-ionized
-    n_Z2_ff = doubly_dens_final.sum(axis=1)                                 # (n_layers,)
-
-    # Metal bound-free densities: select neutral/ionized/doubly column per species
-    n_neutral_metal = neutral_dens_final[:, data.metal_bf_z_arr]   # (n_layers, n_metal)
-    n_ionized_metal = ionized_dens_final[:, data.metal_bf_z_arr]   # (n_layers, n_metal)
-    n_doubly_metal  = doubly_dens_final[:, data.metal_bf_z_arr]    # (n_layers, n_metal)
-    metal_bf_dens = jnp.where(
-        data.metal_bf_charge_arr[None, :] == 0, n_neutral_metal,
-        jnp.where(data.metal_bf_charge_arr[None, :] == 1, n_ionized_metal, n_doubly_metal)
-    )  # (n_layers, n_metal)
-
-    # ── Phase 3: Continuum opacity + source function (batched over all layers) ─
-    # Uses synthesize's coarse 1 Å grid + linear interpolation to match exactly.
-    # synthesize computes continuum at cntm_step=1.0 Å grid, then interp1d(kind='linear').
-    c_cgs_float = float(c_cgs)
-    # Use cached coarse continuum wavelength grid from linelist_data if available,
-    # otherwise compute it here (backward compatibility).
-    if linelist_data.cntm_wl_np_cached is not None:
-        cntm_wl_np_cached = linelist_data.cntm_wl_np_cached
+    if precomputed_atm is not None:
+        # Unpack precomputed quantities — skip phases 1-3
+        T_layers          = precomputed_atm.T_layers
+        ne_all            = precomputed_atm.ne_all
+        z_layers          = precomputed_atm.z_layers
+        log_tau_ref       = precomputed_atm.log_tau_ref
+        vmic_cm_s         = precomputed_atm.vmic_cm_s
+        nf_sol            = precomputed_atm.nf_sol
+        neutral_dens_final = precomputed_atm.neutral_dens
+        ionized_dens_final = precomputed_atm.ionized_dens
+        mol_densities_all = precomputed_atm.mol_dens_padded
+        nH_I_all          = precomputed_atm.nH_I_all
+        nH_II_all         = precomputed_atm.nH_II_all
+        nHe_I_all         = precomputed_atm.nHe_I_all
+        U_H_I_all         = precomputed_atm.U_H_I_all
+        alpha_cntm_all    = precomputed_atm.alpha_cntm_all
+        alpha_ref_all     = precomputed_atm.alpha_ref_all
+        alpha_cntm_coarse = precomputed_atm.alpha_cntm_coarse
+        cntm_wl_np_cached = precomputed_atm.cntm_wl_np
+        S_all             = precomputed_atm.S_all
+        n_layers = T_layers.shape[0]
     else:
-        wl_min_cm = float(wavelengths_cm[0])
-        wl_max_cm = float(wavelengths_cm[-1])
-        cntm_step_cm = 1e-8  # 1.0 Å, matching synthesize default cntm_step
-        cntm_wl_np_cached = np.arange(wl_min_cm - cntm_step_cm, wl_max_cm + 2 * cntm_step_cm, cntm_step_cm)
-    cntm_nu_np = c_cgs_float / cntm_wl_np_cached  # (n_cntm,) decreasing frequencies
+        n_layers = T_layers.shape[0]
+        lambda_ref_cm = 5e-5  # 5000 Å reference wavelength
 
-    alpha_cntm_coarse = _batch_continuum_vmap(
-        jnp.array(cntm_nu_np), T_layers, ne_all, U_H_I_all, U_He_I_all,
-        nH_I_all, nH_II_all, nHe_I_all, nH2_all,
-        n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
-        data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
-    )  # (n_layers, n_cntm)
+        # ── Phase 1: Picard initial guess for Newton solver ──────────────────────
+        # A single Picard pass (300 iterations, all layers at once) gives ne and
+        # neutral fractions close enough that Newton converges in ~5 iterations.
+        ne_init, nf_init = _chemical_equilibrium_batch_jit(
+            T_layers, n_total_layers, ne_layers, abundances, data.chem_eq_data
+        )
 
-    # Interpolate to fine output grid (matches synthesize's interp1d linear)
-    cntm_wl_jnp = jnp.array(cntm_wl_np_cached)
-    alpha_cntm_all = jax.vmap(
-        lambda row: jnp.interp(wavelengths_cm, cntm_wl_jnp, row)
-    )(alpha_cntm_coarse)  # (n_layers, n_wl)
+        # ── Phase 2: Newton solver — matches Julia's _solve_chemical_equilibrium ──
+        # 93-dim Newton (∞-norm, ftol=1e-8, analytical Jacobian, LU solve).
+        # Layers solved in parallel via vmap; Picard guess gives 3-4 Newton iterations.
+        ne_all, nf_sol = _chem_eq_newton_batch_jit(
+            T_layers, n_total_layers, ne_init, nf_init, abundances, data.chem_eq_data
+        )
 
-    # Reference opacity at lambda_ref from coarse grid (matches synthesize's alpha_cntm_interp(lambda_ref))
-    alpha_ref_all = jax.vmap(
-        lambda row: jnp.interp(jnp.array([lambda_ref_cm]), cntm_wl_jnp, row)[0]
-    )(alpha_cntm_coarse)  # (n_layers,)
+        # Derive number densities from Newton solution
+        atom_dens_all      = abundances[None, :] * (n_total_layers - ne_all)[:, None]  # (n_layers, 92)
+        neutral_dens_final = atom_dens_all * nf_sol                                     # (n_layers, 92)
+        wII_all, wIII_all  = _compute_saha_weights_batch_jit(T_layers, ne_all, data.chem_eq_data)
+        ionized_dens_final = wII_all * neutral_dens_final                               # (n_layers, 92)
+        doubly_dens_final  = wIII_all * neutral_dens_final                              # (n_layers, 92)
 
-    # Add line absorption at reference wavelength to alpha_ref_all (matching Julia).
-    # Julia's alpha_ref = continuum + lines at 5000 Å.
-    from .data_loader import load_default_linelist as _load_ref_ll
-    _ref_ll = _load_ref_ll(lambda_ref_cm)
-    if _ref_ll:
-        _T_np = np.asarray(T_layers)
-        _ne_np = np.asarray(ne_all)
-        _neutral_np = np.asarray(neutral_dens_final)   # (n_layers, 92)
-        _ionized_np = np.asarray(ionized_dens_final)   # (n_layers, 92)
-        _nd_ref = {}
-        for _Z in range(1, 93):
-            _sym = atomic_symbols[_Z - 1]
-            _nd_ref[Species(f'{_sym}_I')]  = _neutral_np[:, _Z - 1]
-            _nd_ref[Species(f'{_sym}_II')] = _ionized_np[:, _Z - 1]
-        # Include molecular densities so reference linelist molecular lines (OZr, OV, HMg, etc.)
-        # contribute to alpha_ref, matching Julia's behavior.
-        _mol_np = np.asarray(mol_dens)
-        for _i, _mol_sp in enumerate(default_mol_species):
-            _nd_ref[_mol_sp] = _mol_np[:, _i]
-        _cntm_coarse_np = np.asarray(alpha_cntm_coarse)
-        def _cntm_at_ref_jit_fn(wl_cm):
-            wl_arr = np.atleast_1d(wl_cm)
-            result = np.stack([np.interp(wl_arr, cntm_wl_np_cached, _cntm_coarse_np[i]) for i in range(n_layers)], axis=-1)
-            return result if np.ndim(wl_cm) > 0 else result[0]
-        _line_at_ref = line_absorption(
-            _ref_ll, np.array([lambda_ref_cm]),
-            _T_np, _ne_np, _nd_ref,
-            default_partition_funcs, float(vmic_cm_s), _cntm_at_ref_jit_fn,
-            cutoff_threshold=3e-4,
-        )  # (n_layers, 1)
-        alpha_ref_all = alpha_ref_all + jnp.array(_line_at_ref[:, 0])
+        # Molecular densities from Newton-solved neutral fractions
+        mol_dens = _compute_mol_densities_batch_jit(
+            T_layers, n_total_layers, ne_all, abundances, nf_sol, data.chem_eq_data
+        )  # (n_layers, n_mols)
 
-    # Source function: Planck function per layer at all wavelengths
-    S_all = jax.vmap(lambda T_i: blackbody(T_i, wavelengths_cm))(T_layers)  # (n_layers, n_wl)
+        nH_I_all  = neutral_dens_final[:, 0]   # (n_layers,)
+        nH_II_all = ionized_dens_final[:, 0]
+        nHe_I_all = neutral_dens_final[:, 1]
+
+        # Partition functions for H I and He I at each layer (original knots — exact match to synthesize)
+        log_T_all = jnp.log(T_layers)
+        U_H_I_all = jax.vmap(
+            lambda lt: _pf_orig_eval(
+                lt, data.chem_eq_data.pf_orig_t[0, 0], data.chem_eq_data.pf_orig_u[0, 0],
+                data.chem_eq_data.pf_orig_h[0, 0], data.chem_eq_data.pf_orig_z[0, 0],
+                data.chem_eq_data.pf_orig_n[0, 0],
+            )
+        )(log_T_all)  # (n_layers,)
+        U_He_I_all = jax.vmap(
+            lambda lt: _pf_orig_eval(
+                lt, data.chem_eq_data.pf_orig_t[1, 0], data.chem_eq_data.pf_orig_u[1, 0],
+                data.chem_eq_data.pf_orig_h[1, 0], data.chem_eq_data.pf_orig_z[1, 0],
+                data.chem_eq_data.pf_orig_n[1, 0],
+            )
+        )(log_T_all)  # (n_layers,)
+
+        # Pad mol_dens with a zero column so mol_species_idx == -1 can safely index it
+        mol_densities_all = jnp.concatenate(
+            [mol_dens, jnp.zeros((n_layers, 1))], axis=1
+        )  # (n_layers, n_mols+1)
+
+        # H2 density from molecular densities (index 50 in default mol list)
+        nH2_all = mol_dens[:, _H2_MOL_IDX]  # (n_layers,)
+
+        # Peach FF species: He_II (z=1), C_II (z=5), Si_II (z=13), Mg_II (z=11)
+        _peach_z = jnp.array([z for z, _ in _PEACH_IDX])    # [1, 5, 13, 11]
+        n_peach = ionized_dens_final[:, _peach_z]            # (n_layers, 4)
+
+        # Z=1 FF: sum of all singly-ionized minus all Peach species (He_II, C_II, Si_II, Mg_II)
+        # Peach species are handled separately with Peach (1970) corrections; subtracting all 4
+        # matches prepare_continuum_batch_fast which excludes all peach_z_idx from n_Z1_ff.
+        n_Z1_ff = ionized_dens_final.sum(axis=1) - ionized_dens_final[:, _peach_z].sum(axis=1)    # (n_layers,)
+
+        # Z=2 FF: sum of all doubly-ionized
+        n_Z2_ff = doubly_dens_final.sum(axis=1)                                 # (n_layers,)
+
+        # Metal bound-free densities: select neutral/ionized/doubly column per species
+        n_neutral_metal = neutral_dens_final[:, data.metal_bf_z_arr]   # (n_layers, n_metal)
+        n_ionized_metal = ionized_dens_final[:, data.metal_bf_z_arr]   # (n_layers, n_metal)
+        n_doubly_metal  = doubly_dens_final[:, data.metal_bf_z_arr]    # (n_layers, n_metal)
+        metal_bf_dens = jnp.where(
+            data.metal_bf_charge_arr[None, :] == 0, n_neutral_metal,
+            jnp.where(data.metal_bf_charge_arr[None, :] == 1, n_ionized_metal, n_doubly_metal)
+        )  # (n_layers, n_metal)
+
+        # ── Phase 3: Continuum opacity + source function (batched over all layers) ─
+        # Uses synthesize's coarse 1 Å grid + linear interpolation to match exactly.
+        # synthesize computes continuum at cntm_step=1.0 Å grid, then interp1d(kind='linear').
+        c_cgs_float = float(c_cgs)
+        # Use cached coarse continuum wavelength grid from linelist_data if available,
+        # otherwise compute it here (backward compatibility).
+        if linelist_data.cntm_wl_np_cached is not None:
+            cntm_wl_np_cached = linelist_data.cntm_wl_np_cached
+        else:
+            wl_min_cm = float(wavelengths_cm[0])
+            wl_max_cm = float(wavelengths_cm[-1])
+            cntm_step_cm = 1e-8  # 1.0 Å, matching synthesize default cntm_step
+            cntm_wl_np_cached = np.arange(wl_min_cm - cntm_step_cm, wl_max_cm + 2 * cntm_step_cm, cntm_step_cm)
+        cntm_nu_np = c_cgs_float / cntm_wl_np_cached  # (n_cntm,) decreasing frequencies
+
+        alpha_cntm_coarse = _batch_continuum_vmap(
+            jnp.array(cntm_nu_np), T_layers, ne_all, U_H_I_all, U_He_I_all,
+            nH_I_all, nH_II_all, nHe_I_all, nH2_all,
+            n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
+            data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
+        )  # (n_layers, n_cntm)
+
+        # Interpolate to fine output grid (matches synthesize's interp1d linear)
+        cntm_wl_jnp = jnp.array(cntm_wl_np_cached)
+        alpha_cntm_all = jax.vmap(
+            lambda row: jnp.interp(wavelengths_cm, cntm_wl_jnp, row)
+        )(alpha_cntm_coarse)  # (n_layers, n_wl)
+
+        # Reference opacity at lambda_ref from coarse grid (matches synthesize's alpha_cntm_interp(lambda_ref))
+        alpha_ref_all = jax.vmap(
+            lambda row: jnp.interp(jnp.array([lambda_ref_cm]), cntm_wl_jnp, row)[0]
+        )(alpha_cntm_coarse)  # (n_layers,)
+
+        # Add line absorption at reference wavelength to alpha_ref_all (matching Julia).
+        # Julia's alpha_ref = continuum + lines at 5000 Å.
+        from .data_loader import load_default_linelist as _load_ref_ll
+        _ref_ll = _load_ref_ll(lambda_ref_cm)
+        if _ref_ll:
+            _T_np = np.asarray(T_layers)
+            _ne_np = np.asarray(ne_all)
+            _neutral_np = np.asarray(neutral_dens_final)   # (n_layers, 92)
+            _ionized_np = np.asarray(ionized_dens_final)   # (n_layers, 92)
+            _nd_ref = {}
+            for _Z in range(1, 93):
+                _sym = atomic_symbols[_Z - 1]
+                _nd_ref[Species(f'{_sym}_I')]  = _neutral_np[:, _Z - 1]
+                _nd_ref[Species(f'{_sym}_II')] = _ionized_np[:, _Z - 1]
+            # Include molecular densities so reference linelist molecular lines (OZr, OV, HMg, etc.)
+            # contribute to alpha_ref, matching Julia's behavior.
+            _mol_np = np.asarray(mol_dens)
+            for _i, _mol_sp in enumerate(default_mol_species):
+                _nd_ref[_mol_sp] = _mol_np[:, _i]
+            _cntm_coarse_np = np.asarray(alpha_cntm_coarse)
+            def _cntm_at_ref_jit_fn(wl_cm):
+                wl_arr = np.atleast_1d(wl_cm)
+                result = np.stack([np.interp(wl_arr, cntm_wl_np_cached, _cntm_coarse_np[i]) for i in range(n_layers)], axis=-1)
+                return result if np.ndim(wl_cm) > 0 else result[0]
+            _line_at_ref = line_absorption(
+                _ref_ll, np.array([lambda_ref_cm]),
+                _T_np, _ne_np, _nd_ref,
+                default_partition_funcs, float(vmic_cm_s), _cntm_at_ref_jit_fn,
+                cutoff_threshold=3e-4,
+            )  # (n_layers, 1)
+            alpha_ref_all = alpha_ref_all + jnp.array(_line_at_ref[:, 0])
+
+        # Source function: Planck function per layer at all wavelengths
+        S_all = jax.vmap(lambda T_i: blackbody(T_i, wavelengths_cm))(T_layers)  # (n_layers, n_wl)
 
     # ── Phase 4: Line absorption with exact bucketing (matches _line_absorption_fast) ──
     # Strategy: compute amplitude/sigma_D/gamma_L per (line, layer) via JIT, then
