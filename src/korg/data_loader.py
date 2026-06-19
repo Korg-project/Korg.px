@@ -6,6 +6,7 @@ and other tabulated data needed for spectral synthesis.
 """
 
 import os
+import functools
 import numpy as np
 import h5py
 from .species import Species
@@ -804,6 +805,7 @@ default_chem_eq_data = _precompute_chem_eq(
 default_mol_species = list(default_log_equilibrium_constants.keys())
 
 
+@functools.lru_cache(maxsize=None)
 def load_default_linelist(reference_wavelength_cm: float = 5e-5):
     """
     Load the built-in fallback linelist for a given reference wavelength.

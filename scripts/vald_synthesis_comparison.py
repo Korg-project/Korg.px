@@ -53,7 +53,10 @@ def run_python_synthesis_jit():
     wl_hi_cm = (WL_MAX + line_buffer_ang) * 1e-8
     linelist_filtered = [l for l in linelist if wl_lo_cm <= l.wl <= wl_hi_cm]
     print(f"  Filtered linelist: {len(linelist_filtered)} lines in range")
-    linelist_data = preprocess_linelist(linelist_filtered, chem_eq_data=data.chem_eq_data)
+    linelist_data = preprocess_linelist(
+        linelist_filtered, chem_eq_data=data.chem_eq_data,
+        wavelengths_cm=np.asarray(wavelengths_cm)
+    )
     abundances = jnp.array(A_X_to_absolute(A_X))
 
     T_layers = jnp.array(atm.T)
@@ -63,23 +66,19 @@ def run_python_synthesis_jit():
     log_tau_ref = jnp.array(atm.log_tau_ref)
 
     print("  Warming up (JIT compile)...")
-    flux_w, cont_w = synthesize_jit(
-        wavelengths_cm=wavelengths_cm,
-        T_layers=T_layers, n_total_layers=n_total, ne_layers=ne_layers,
-        z_layers=z_layers, log_tau_ref=log_tau_ref,
-        abundances=abundances, vmic_cm_s=1.0e5, data=data, linelist_data=linelist_data
-    )
-    _ = float(flux_w[0])
+    kw = dict(wavelengths_cm=wavelengths_cm, T_layers=T_layers, n_total_layers=n_total,
+              ne_layers=ne_layers, z_layers=z_layers, log_tau_ref=log_tau_ref,
+              abundances=abundances, vmic_cm_s=1.0e5, data=data, linelist_data=linelist_data)
+    _ = float(synthesize_jit(**kw)[0][0])
+    _ = float(synthesize_jit(**kw)[0][0])
 
-    t0 = time.perf_counter()
-    flux_jit, cont_jit = synthesize_jit(
-        wavelengths_cm=wavelengths_cm,
-        T_layers=T_layers, n_total_layers=n_total, ne_layers=ne_layers,
-        z_layers=z_layers, log_tau_ref=log_tau_ref,
-        abundances=abundances, vmic_cm_s=1.0e5, data=data, linelist_data=linelist_data
-    )
-    _ = float(flux_jit[0])
-    elapsed = time.perf_counter() - t0
+    times = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        flux_jit, cont_jit = synthesize_jit(**kw)
+        _ = float(flux_jit[0])
+        times.append(time.perf_counter() - t0)
+    elapsed = min(times)
 
     flux = np.array(flux_jit)
     continuum = np.array(cont_jit)
@@ -197,116 +196,54 @@ def _ms(elapsed_s):
     return elapsed_s * 1000
 
 
-def make_plot(wl_jit, cnorm_jit, jit_elapsed,
-              wl_nonjit, cnorm_nonjit, nonjit_elapsed,
-              wl_jl, cnorm_jl, julia_ms):
-
+def make_plot(wl_jit, cnorm_jit, jit_elapsed, wl_jl, cnorm_jl, julia_ms):
     jit_ms = _ms(jit_elapsed)
-    nonjit_ms = _ms(nonjit_elapsed)
 
-    # Interpolate all onto the JIT wavelength grid for residuals
     cnorm_jl_i = np.interp(wl_jit, wl_jl, cnorm_jl)
-    cnorm_nonjit_i = np.interp(wl_jit, wl_nonjit, cnorm_nonjit)
+    diff = cnorm_jit - cnorm_jl_i
+    rms = np.sqrt(np.mean(diff**2))
 
-    # Consistent encoding across all panels:
-    #   Korg.jl    — solid black
-    #   Korg.py JIT    — solid gray
-    #   Korg.py non-JIT — dashed gray (same shade; style distinguishes, not hue)
     C_JL = '#111111'
     C_PY = '#777777'
-    LS_JIT = '-'
-    LS_NONJIT = '--'
 
-    comparisons = [
-        {
-            'label_a': f'Korg.jl ({julia_ms:.0f} ms)',
-            'label_b': f'Korg.py JIT ({jit_ms:.0f} ms)',
-            'color_a': C_JL, 'ls_a': '-',
-            'color_b': C_PY, 'ls_b': LS_JIT,
-            'wl_a': wl_jl, 'cnorm_a': cnorm_jl,
-            'wl_b': wl_jit, 'cnorm_b': cnorm_jit,
-            'diff': cnorm_jit - cnorm_jl_i,
-            'title': 'Korg.jl vs Korg.py JIT',
-        },
-        {
-            'label_a': f'Korg.jl ({julia_ms:.0f} ms)',
-            'label_b': f'Korg.py non-JIT ({nonjit_ms:.0f} ms)',
-            'color_a': C_JL, 'ls_a': '-',
-            'color_b': C_PY, 'ls_b': LS_NONJIT,
-            'wl_a': wl_jl, 'cnorm_a': cnorm_jl,
-            'wl_b': wl_nonjit, 'cnorm_b': cnorm_nonjit,
-            'diff': cnorm_nonjit_i - cnorm_jl_i,
-            'title': 'Korg.jl vs Korg.py non-JIT',
-        },
-        {
-            'label_a': f'Korg.py JIT ({jit_ms:.0f} ms)',
-            'label_b': f'Korg.py non-JIT ({nonjit_ms:.0f} ms)',
-            'color_a': C_PY, 'ls_a': LS_JIT,
-            'color_b': C_PY, 'ls_b': LS_NONJIT,
-            'wl_a': wl_jit, 'cnorm_a': cnorm_jit,
-            'wl_b': wl_nonjit, 'cnorm_b': cnorm_nonjit,
-            'diff': cnorm_nonjit_i - cnorm_jit,
-            'title': 'Korg.py JIT vs non-JIT',
-        },
-    ]
+    fig = plt.figure(figsize=(14, 8))
+    gs = fig.add_gridspec(2, 2, height_ratios=[3, 1], hspace=0.08, wspace=0.08)
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 6),
-                             gridspec_kw={'height_ratios': [1, 3]})
-    fig.subplots_adjust(hspace=0.04, wspace=0.06)
+    ax_jl = fig.add_subplot(gs[0, 0])
+    ax_py = fig.add_subplot(gs[0, 1], sharey=ax_jl)
+    ax_res = fig.add_subplot(gs[1, :])
 
-    # Compute shared residual y-limits across all three panels (identical scale for comparison)
-    all_diffs = np.concatenate([cmp['diff'] for cmp in comparisons])
-    d_abs_max = np.abs(all_diffs).max() * 1.15
-    res_ylim = (-d_abs_max, d_abs_max)
+    # --- Korg.jl spectrum ---
+    ax_jl.plot(wl_jl, cnorm_jl, '-', color=C_JL, lw=0.6)
+    ax_jl.set_title(f'Korg.jl  ({julia_ms:.0f} ms)', fontsize=9, loc='left', pad=3)
+    ax_jl.set_xlim(WL_MIN, WL_MAX)
+    ax_jl.set_ylim(-0.02, 1.09)
+    ax_jl.set_ylabel('Normalized flux')
+    ax_jl.tick_params(labelbottom=False)
+    ax_jl.spines['top'].set_visible(False)
+    ax_jl.spines['right'].set_visible(False)
 
-    for col, cmp in enumerate(comparisons):
-        ax_res = axes[0, col]
-        ax_spec = axes[1, col]
+    # --- Korg.py JIT spectrum ---
+    ax_py.plot(wl_jit, cnorm_jit, '-', color=C_PY, lw=0.6)
+    ax_py.set_title(f'Korg.py JIT  ({jit_ms:.0f} ms)', fontsize=9, loc='left', pad=3)
+    ax_py.set_xlim(WL_MIN, WL_MAX)
+    ax_py.tick_params(labelbottom=False, labelleft=False)
+    ax_py.spines['top'].set_visible(False)
+    ax_py.spines['right'].set_visible(False)
 
-        # --- Residual panel (top) ---
-        diff = cmp['diff']
-        rms = np.sqrt(np.mean(diff**2))
-        ax_res.plot(wl_jit, diff, '-', color='#444444', lw=0.5)
-        ax_res.axhline(0, color='#cccccc', lw=0.6, zorder=0)
-        ax_res.set_xlim(WL_MIN, WL_MAX)
-        ax_res.set_ylim(*res_ylim)
-        ax_res.spines['top'].set_visible(False)
-        ax_res.spines['right'].set_visible(False)
-        ax_res.spines['bottom'].set_visible(False)
-        ax_res.tick_params(bottom=False, labelbottom=False)
-        # Title above residual panel; stats inlined as annotation
-        ax_res.set_title(cmp['title'], fontsize=9, pad=3, loc='left')
-        ax_res.text(0.99, 0.97, f'RMS {rms:.4f}  max|Δ| {np.abs(diff).max():.4f}',
-                    transform=ax_res.transAxes,
-                    ha='right', va='top', fontsize=7, color='#777777', family='monospace')
-        if col == 0:
-            ax_res.set_ylabel('Δ flux', fontsize=8)
-        else:
-            ax_res.tick_params(labelleft=False)
-
-        # --- Spectrum panel (bottom) ---
-        ax_spec.plot(cmp['wl_a'], cmp['cnorm_a'], cmp['ls_a'], color=cmp['color_a'], lw=0.6)
-        ax_spec.plot(cmp['wl_b'], cmp['cnorm_b'], cmp['ls_b'], color=cmp['color_b'], lw=0.6, alpha=0.85)
-        ax_spec.set_ylim(-0.02, 1.09)
-        ax_spec.set_xlim(WL_MIN, WL_MAX)
-        ax_spec.spines['top'].set_visible(False)
-        ax_spec.spines['right'].set_visible(False)
-
-        # Direct labels near top-right of spectrum panel, matching line color
-        ax_spec.text(0.99, 0.98, cmp['label_a'],
-                     transform=ax_spec.transAxes,
-                     ha='right', va='top', fontsize=7.5, color=cmp['color_a'])
-        ax_spec.text(0.99, 0.91, cmp['label_b'],
-                     transform=ax_spec.transAxes,
-                     ha='right', va='top', fontsize=7.5, color=cmp['color_b'])
-
-        # Single x-axis label on center column only
-        if col == 1:
-            ax_spec.set_xlabel('Wavelength (Å)')
-        if col == 0:
-            ax_spec.set_ylabel('Normalized flux')
-        else:
-            ax_spec.tick_params(labelleft=False)
+    # --- Residuals (JIT − Julia) ---
+    d_abs_max = np.abs(diff).max() * 1.15
+    ax_res.plot(wl_jit, diff, '-', color='#444444', lw=0.5)
+    ax_res.axhline(0, color='#cccccc', lw=0.6, zorder=0)
+    ax_res.set_xlim(WL_MIN, WL_MAX)
+    ax_res.set_ylim(-d_abs_max, d_abs_max)
+    ax_res.set_xlabel('Wavelength (Å)')
+    ax_res.set_ylabel('Δ (JIT − Julia)', fontsize=8)
+    ax_res.text(0.99, 0.97, f'RMS {rms:.4f}  max|Δ| {np.abs(diff).max():.4f}',
+                transform=ax_res.transAxes,
+                ha='right', va='top', fontsize=7, color='#777777', family='monospace')
+    ax_res.spines['top'].set_visible(False)
+    ax_res.spines['right'].set_visible(False)
 
     plt.savefig(OUTPUT_PNG, dpi=150, bbox_inches='tight')
     print(f"\nPlot saved to {OUTPUT_PNG}")
@@ -315,9 +252,6 @@ def make_plot(wl_jit, cnorm_jit, jit_elapsed,
 
 if __name__ == '__main__':
     wl_jit, flux_jit, cntm_jit, cnorm_jit, jit_elapsed = run_python_synthesis_jit()
-    wl_nonjit, flux_nonjit, cntm_nonjit, cnorm_nonjit, nonjit_elapsed = run_python_synthesis_nonjit()
     wl_jl, flux_jl, cntm_jl, cnorm_jl, julia_ms = run_julia_synthesis()
-    make_plot(wl_jit, cnorm_jit, jit_elapsed,
-              wl_nonjit, cnorm_nonjit, nonjit_elapsed,
-              wl_jl, cnorm_jl, julia_ms)
+    make_plot(wl_jit, cnorm_jit, jit_elapsed, wl_jl, cnorm_jl, julia_ms)
     print("\nDone.")

@@ -1846,12 +1846,9 @@ def synthesize_jit(
     )
 
     # ── Phase 2: Newton solver — matches Julia's _solve_chemical_equilibrium ──
-    # 93-dim Newton (∞-norm, ftol=1e-8, full Jacobian via jacfwd, LU solve).
-    # Layers are sorted by temperature so each layer inherits the previous
-    # converged (ne, nf) as its warm-start, reducing iterations from ~5–8 to ~2–3.
-    # WARNING: first JIT compile is slow (minutes) because jacfwd differentiates
-    # through the 306-molecule lax.scan body.  Subsequent calls are fast.
-    ne_all, nf_sol = _chem_eq_newton_scan_jit(
+    # 93-dim Newton (∞-norm, ftol=1e-8, analytical Jacobian, LU solve).
+    # Layers solved in parallel via vmap; Picard guess gives 3-4 Newton iterations.
+    ne_all, nf_sol = _chem_eq_newton_batch_jit(
         T_layers, n_total_layers, ne_init, nf_init, abundances, data.chem_eq_data
     )
 
