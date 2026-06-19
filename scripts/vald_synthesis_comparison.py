@@ -206,6 +206,9 @@ def make_plot(wl_jit, cnorm_jit, jit_elapsed, wl_jl, cnorm_jl, julia_ms):
     C_JL = '#111111'
     C_PY = '#777777'
 
+    C_PY = "tab:blue"
+    C_JL = "tab:red"
+
     fig = plt.figure(figsize=(14, 8))
     gs = fig.add_gridspec(2, 2, height_ratios=[3, 1], hspace=0.08, wspace=0.08)
 
@@ -225,7 +228,7 @@ def make_plot(wl_jit, cnorm_jit, jit_elapsed, wl_jl, cnorm_jl, julia_ms):
 
     # --- Korg.py JIT spectrum ---
     ax_py.plot(wl_jit, cnorm_jit, '-', color=C_PY, lw=0.6)
-    ax_py.set_title(f'Korg.py JIT  ({jit_ms:.0f} ms)', fontsize=9, loc='left', pad=3)
+    ax_py.set_title(f'Korg.py  ({jit_ms:.0f} ms)', fontsize=9, loc='left', pad=3)
     ax_py.set_xlim(WL_MIN, WL_MAX)
     ax_py.tick_params(labelbottom=False, labelleft=False)
     ax_py.spines['top'].set_visible(False)
