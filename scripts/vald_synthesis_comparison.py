@@ -108,9 +108,9 @@ def run_python_synthesis_jit():
         _ = float(flux_fast[0])
         times_fast.append(time.perf_counter() - t0)
     elapsed_fast = min(times_fast)
-    print(f"  Elapsed (precomputed): {elapsed_fast*1000:.1f} ms  ({elapsed/elapsed_fast:.1f}x speedup)")
+    print(f"  Elapsed (precomputed): {elapsed_fast*1000:.1f} ms  ({elapsed/elapsed_fast:.1f}x vs non-precomputed)")
 
-    return wavelengths, flux, continuum, cnorm, elapsed
+    return wavelengths, flux, continuum, cnorm, elapsed, elapsed_fast
 
 
 def run_python_synthesis_nonjit():
@@ -278,7 +278,9 @@ def make_plot(wl_jit, cnorm_jit, jit_elapsed, wl_jl, cnorm_jl, julia_ms):
 
 
 if __name__ == '__main__':
-    wl_jit, flux_jit, cntm_jit, cnorm_jit, jit_elapsed = run_python_synthesis_jit()
+    wl_jit, flux_jit, cntm_jit, cnorm_jit, jit_elapsed, jit_fast_elapsed = run_python_synthesis_jit()
     wl_jl, flux_jl, cntm_jl, cnorm_jl, julia_ms = run_julia_synthesis()
+    speedup = julia_ms / 1000 / jit_fast_elapsed
+    print(f"\n  Speedup (precomputed vs Julia): {speedup:.1f}×  ({jit_fast_elapsed*1000:.1f} ms vs {julia_ms:.1f} ms)")
     make_plot(wl_jit, cnorm_jit, jit_elapsed, wl_jl, cnorm_jl, julia_ms)
     print("\nDone.")
