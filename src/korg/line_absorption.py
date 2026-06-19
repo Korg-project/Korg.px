@@ -728,7 +728,9 @@ def _line_absorption_fast(
         (np.ceil(2.0 * max_wins / wl_spacing) + 2).astype(int), 0, n_wl
     )
 
-    alpha = np.zeros((n_layers, n_wl))
+    # alpha accumulator in float32 — Voigt profiles need only ~4–5 digits.
+    # Cast back to float64 before returning so callers see the expected dtype.
+    alpha = np.zeros((n_layers, n_wl), dtype=np.float32)
 
     BUCKET_WIDTHS = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, n_wl]
     prev_W = 0
@@ -752,21 +754,31 @@ def _line_absorption_fast(
         # Window mask: (n_b, W_MAX)
         mask_b = np.abs(wl_win - wls[idx_b, None]) <= max_wins[idx_b, None]
 
-        # JAX Voigt profiles: broadcast to (n_b, n_layers, W_MAX) then compute
-        delta = jnp.asarray((wl_win - wls[idx_b, None])[:, None, :])  # (n_b, 1, W_MAX)
-        sigma = jnp.asarray(sigma_all[idx_b, :, None])                  # (n_b, n_layers, 1)
-        gamma = jnp.asarray(gamma_wl_all[idx_b, :, None])               # (n_b, n_layers, 1)
+        # Cast per-line arrays to float32 before the JAX Voigt kernel.
+        # Profiles need only ~4–5 significant digits; float32 halves memory
+        # bandwidth through XLA and roughly doubles throughput.
+        delta = jnp.asarray((wl_win - wls[idx_b, None])[:, None, :],
+                            dtype=jnp.float32)           # (n_b, 1, W_MAX)
+        sigma = jnp.asarray(sigma_all[idx_b, :, None],
+                            dtype=jnp.float32)           # (n_b, n_layers, 1)
+        gamma = jnp.asarray(gamma_wl_all[idx_b, :, None],
+                            dtype=jnp.float32)           # (n_b, n_layers, 1)
 
-        profiles = np.asarray(_voigt_jit(delta, sigma, gamma))  # (n_b, n_layers, W_MAX)
+        profiles = np.asarray(_voigt_jit(delta, sigma, gamma),
+                              dtype=np.float32)           # (n_b, n_layers, W_MAX)
 
-        contrib = mask_b[:, None, :] * amplitude_all[idx_b, :, None] * profiles
+        # amplitude_all is float64; cast to float32 for the multiply so that
+        # contrib stays float32 and the scatter into alpha remains float32.
+        amp_f32 = amplitude_all[idx_b, :, None].astype(np.float32)  # (n_b, n_layers, 1)
+        contrib = mask_b[:, None, :] * amp_f32 * profiles            # (n_b, n_layers, W_MAX)
 
         for il, i_lo in enumerate(i_lo_b):
             alpha[:, i_lo:i_lo + W_MAX] += contrib[il]
 
         prev_W = W_MAX_raw
 
-    return alpha
+    # Return float64 so callers don't need to know about the internal precision.
+    return alpha.astype(np.float64)
 
 
 def _build_line_data(linelist, unique_species):
