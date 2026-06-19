@@ -1319,17 +1319,288 @@ def _chem_eq_residuals_newton(x, T, n_total, abundances, data):
     return F
 
 
+def _chem_eq_analytical_jacobian(x, F_val, T, n_total, abundances, data):
+    """
+    Analytical 93x93 Jacobian for the normalised chemical equilibrium residuals.
+
+    Replaces jax.jacfwd inside the Newton loop, cutting compile time by avoiding
+    93 separate JVP traces through the molecule scan.
+
+    Parameters
+    ----------
+    x : jax array, shape (93,)
+        Current state vector: x[:92]=neutral_fractions, x[92]=ne/(n_total*1e-5)
+    F_val : jax array, shape (93,)
+        Pre-computed residuals F(x) = _chem_eq_residuals_newton(x, ...).
+        Passed in to avoid re-evaluating the residuals inside this function.
+    T, n_total, abundances, data : same as _chem_eq_residuals_newton
+
+    Derivation summary
+    ------------------
+    State:  x[:92] = nf (neutral fractions),  x[92] = ne_scaled = ne/(n_total*1e-5)
+    Normalised residuals:
+        F[Z]  = G[Z]  / atom_dens[Z]          (element conservation)
+        F[92] = G[92] / (ne * 1e-5)           (electron conservation)
+    where G is the un-normalised residual.
+
+    Jacobian blocks (N = MAX_ATOMIC_NUMBER = 92):
+      J[:N, :N]  -- partial F[Z] / partial nf[Z']
+      J[:N,  N]  -- partial F[Z] / partial ne_scaled
+      J[N,  :N]  -- partial F[92] / partial nf[Z']
+      J[N,   N]  -- partial F[92] / partial ne_scaled
+
+    Molecular derivatives use dn_mol/d_nf[Z'] = n_mol * cnt(Z',m) / nf[Z'] (neutral)
+    or n_mol / nf[idx1,2] (ionic), accumulated via jax.lax.scan.
+    """
+    N = MAX_ATOMIC_NUMBER          # 92
+    ne_scale = n_total * 1e-5     # converts ne_scaled -> ne
+
+    nf = jnp.abs(x[:N])
+    ne_scaled_raw = jnp.abs(x[N])
+    ne = jnp.maximum(ne_scaled_raw * ne_scale, 1.0)
+
+    atom_dens    = abundances * (n_total - ne)        # (92,)
+    neutral_dens = atom_dens * nf                     # (92,)
+
+    wII_ne1, wIII_ne1 = _compute_saha_weights_jit(T, 1.0, data)
+    wII  = wII_ne1  / ne
+    wIII = wIII_ne1 / ne ** 2
+    W    = 1.0 + wII + wIII                           # (92,)
+
+    log_T = jnp.log(T)
+    log_nd = jnp.log10(jnp.maximum(neutral_dens, 1e-300))  # (92,)
+
+    # scalar: d log10(atom_dens[Z]) / d ne_scaled = -ne_scale / ((n_total-ne) * ln10)
+    inv_n_minus_ne = 1.0 / jnp.maximum(n_total - ne, 1e-300)
+
+    safe_nf   = jnp.maximum(nf, 1e-300)          # avoid /0
+    safe_ad   = jnp.maximum(atom_dens, 1e-300)   # avoid /0
+
+    # -------------------------------------------------------------------------
+    # Accumulate molecular contributions to the Jacobian via lax.scan.
+    # carry: (dJnfnf (N,N), dne_col (N,), dne_ne_row (N,))
+    # -------------------------------------------------------------------------
+    def mol_jac_step(carry, mol_idx):
+        dJnfnf, dJne_col, dJnf_ne_row = carry
+        atoms  = data.mol_atoms_array[mol_idx]       # (6,) 0-indexed, -1=pad
+        charge = data.mol_charges[mol_idx]
+        n_ats  = data.mol_n_atoms[mol_idx]
+        log_nK = _get_log_nK_jit(mol_idx, log_T, data)
+        valid  = jnp.isfinite(log_nK)
+
+        def neutral_mol(_):
+            log_sum = jnp.sum(jnp.where(jnp.arange(6) < n_ats, log_nd[atoms], 0.0))
+            n_mol   = jnp.power(10.0, jnp.clip(log_sum - log_nK, -300.0, 300.0))
+
+            # cnt[Z] = number of times element Z appears in this molecule
+            cnt = (jnp.zeros(N)
+                   .at[atoms[0]].add(jnp.where(n_ats > 0, 1.0, 0.0))
+                   .at[atoms[1]].add(jnp.where(n_ats > 1, 1.0, 0.0))
+                   .at[atoms[2]].add(jnp.where(n_ats > 2, 1.0, 0.0))
+                   .at[atoms[3]].add(jnp.where(n_ats > 3, 1.0, 0.0))
+                   .at[atoms[4]].add(jnp.where(n_ats > 4, 1.0, 0.0))
+                   .at[atoms[5]].add(jnp.where(n_ats > 5, 1.0, 0.0)))
+
+            # d F[Z''] / d nf[Z'] += -cnt[Z''] * n_mol * cnt[Z'] / nf[Z'] / atom_dens[Z'']
+            col_factor = cnt / safe_ad           # (N,)
+            row_factor = cnt / safe_nf           # (N,)
+            dJ = -n_mol * jnp.outer(col_factor, row_factor)   # (N, N)
+
+            # d F[Z] / d ne_scaled from this molecule (dn_mol/dne_scaled = -n_mol*n_ats*ne_scale*inv_n_minus_ne):
+            dne = cnt * (n_mol * n_ats * ne_scale * inv_n_minus_ne) / safe_ad  # (N,)
+
+            return dJ, dne, jnp.zeros(N)
+
+        def ionic_mol(_):
+            idx1, idx2 = atoms[0], atoms[1]
+            log_n_ion1 = log_nd[idx1] + jnp.log10(jnp.maximum(wII[idx1], 1e-300))
+            n_mol = jnp.power(10.0, jnp.clip(log_n_ion1 + log_nd[idx2] - log_nK, -300.0, 300.0))
+
+            # Molecule contributes -n_mol to G[idx1], -n_mol to G[idx2], +n_mol to G[92].
+            # d n_mol / d nf[Z'] arises from:
+            #   - the log_nd[idx1] term: sensitivity n_mol/nf[idx1] wrt nf[idx1]
+            #   - the log_nd[idx2] term: sensitivity n_mol/nf[idx2] wrt nf[idx2]
+            # Each "atom slot" contributes independently, so for homonuclear (idx1==idx2)
+            # we correctly accumulate 2*n_mol/nf[k] by doing two .add operations.
+            #
+            # dJ[r, c] = d F[r] / d nf[c] += d(-n_mol)/d nf[c] / ad[r]
+            # We have two atom slots: (idx1 affects nf sensitivity via slot 1)
+            #                         (idx2 affects nf sensitivity via slot 2)
+            # So we add contributions from each slot to the affected rows:
+            #   Slot 1 (log_nd[idx1] term):
+            #     d(-n_mol)/d nf[idx1] = -n_mol/nf[idx1]
+            #     affects rows idx1 and idx2 (both get -n_mol contribution to G)
+            #   Slot 2 (log_nd[idx2] term):
+            #     d(-n_mol)/d nf[idx2] = -n_mol/nf[idx2]
+            #     affects rows idx1 and idx2
+            dJ = (jnp.zeros((N, N))
+                  .at[idx1, idx1].add(-n_mol / (safe_nf[idx1] * safe_ad[idx1]))
+                  .at[idx1, idx2].add(-n_mol / (safe_nf[idx2] * safe_ad[idx1]))
+                  .at[idx2, idx1].add(-n_mol / (safe_nf[idx1] * safe_ad[idx2]))
+                  .at[idx2, idx2].add(-n_mol / (safe_nf[idx2] * safe_ad[idx2])))
+
+            # d F[92] / d nf[Z'] from ionic molecule (+n_mol to G[92]):
+            # Two slots contribute: +n_mol/nf[idx1] from slot 1, +n_mol/nf[idx2] from slot 2
+            dne_ne_row = (jnp.zeros(N)
+                          .at[idx1].add(n_mol / safe_nf[idx1])
+                          .at[idx2].add(n_mol / safe_nf[idx2]))
+
+            # d n_mol / d ne_scaled:
+            # log10(n_mol) = log10(wII[idx1]) + log10(nd[idx1]) + log10(nd[idx2]) - log_nK
+            # d log10(wII[idx1]) / d ne_scaled = -ne_scale / (ne * ln10)
+            # d log10(nd[Z]) / d ne_scaled     = dlog10_atom_dne = -ne_scale*inv_n_minus_ne/ln10
+            # => dn_mol/dne_scaled = n_mol * ln10 * (-ne_scale/(ne*ln10) + 2*dlog10_atom_dne)
+            #                      = n_mol * (-ne_scale/ne - 2*ne_scale*inv_n_minus_ne)
+            dn_mol_dne = n_mol * (-ne_scale / ne - 2.0 * ne_scale * inv_n_minus_ne)
+            # Contribution to G[idx1]: -n_mol, to G[idx2]: -n_mol (both negative of n_mol)
+            dne_col = (jnp.zeros(N)
+                       .at[idx1].add(-dn_mol_dne / safe_ad[idx1])
+                       .at[idx2].add(-dn_mol_dne / safe_ad[idx2]))
+
+            return dJ, dne_col, dne_ne_row
+
+        dJ_mol, dne_col_mol, dne_ne_mol = jax.lax.cond(
+            valid,
+            lambda _: jax.lax.cond(charge == 0, neutral_mol, ionic_mol, None),
+            lambda _: (jnp.zeros((N, N)), jnp.zeros(N), jnp.zeros(N)),
+            None,
+        )
+
+        return (dJnfnf + dJ_mol, dJne_col + dne_col_mol, dJnf_ne_row + dne_ne_mol), None
+
+    n_mols = data.mol_charges.shape[0]
+    init_carry = (jnp.zeros((N, N)), jnp.zeros(N), jnp.zeros(N))
+
+    if n_mols > 0:
+        (mol_Jnfnf, mol_dne_col, mol_dne_row), _ = jax.lax.scan(
+            mol_jac_step, init_carry, jnp.arange(n_mols)
+        )
+    else:
+        mol_Jnfnf  = jnp.zeros((N, N))
+        mol_dne_col = jnp.zeros(N)
+        mol_dne_row = jnp.zeros(N)
+
+    # -------------------------------------------------------------------------
+    # Block 1: upper-left NxN  (partial F[Z] / partial nf[Z'])
+    # Atomic diagonal: d G[Z]_atomic / d nf[Z] = -W[Z]*atom_dens[Z] -> -W[Z] after normalizing
+    # -------------------------------------------------------------------------
+    J_nf_nf = -jnp.diag(W) + mol_Jnfnf   # (N, N)
+
+    # -------------------------------------------------------------------------
+    # Block 2: right column  (partial F[Z] / partial ne_scaled)
+    # G[Z]_atomic = atom_dens[Z]*(1 - W[Z]*nf[Z])
+    # d G[Z]_atomic / d ne_scaled
+    #   = -abundances[Z]*ne_scale*(1-W*nf) + neutral_dens*(wII+2*wIII)*ne_scale/ne
+    # Normalised by atom_dens[Z]:
+    # We also need the normalization-denominator correction:
+    #   d F[Z] / d ne_scaled = d(G[Z]/atom_dens[Z]) / d ne_scaled
+    #                        = dG[Z]/dne_scaled / atom_dens[Z]
+    #                          + G[Z] * abundances[Z]*ne_scale / atom_dens[Z]^2
+    # The second term = F[Z] * abundances[Z]*ne_scale / atom_dens[Z]
+    # We compute F[Z] via the residuals function (one extra call, but avoids code duplication).
+    # -------------------------------------------------------------------------
+    # d G[Z]_atomic / d ne_scaled / atom_dens[Z]:
+    #   = ne_scale * [-(1-W*nf)/(n_total-ne) + (wII+2*wIII)*nf/ne]
+    # Note: neutral_dens / atom_dens = nf, and 1/(n_total-ne) = inv_n_minus_ne.
+    G_atom_norm = 1.0 - W * nf   # = G[Z]_atomic / atom_dens[Z], shape (N,)
+    dFatom_dne  = ne_scale * (
+        -G_atom_norm * inv_n_minus_ne
+        + (wII + 2.0 * wIII) * nf / ne
+    )   # (N,) -- d(G[Z]_atomic/atom_dens) / d ne_scaled
+
+    # Plus normalization-denominator correction:
+    #   d(1/atom_dens)/d ne_scaled * G[Z] = F[Z] * abundances*ne_scale / atom_dens
+    #                                     = F[Z] * ne_scale * inv_n_minus_ne
+    # (since abundances[Z]/atom_dens[Z] = 1/(n_total-ne) = inv_n_minus_ne)
+    # F_val must be provided externally (computed once in the Newton loop body)
+    # to avoid an extra residual evaluation here.
+    norm_corr = F_val[:N] * ne_scale * inv_n_minus_ne   # (N,)
+
+    J_ne_col = dFatom_dne + mol_dne_col + norm_corr   # (N,)
+
+    # -------------------------------------------------------------------------
+    # Block 3: bottom row  (partial F[92] / partial nf[Z'])
+    # G[92] = sum_Z (wII+2wIII)*neutral_dens - ne + ionic_mol corrections
+    # d G[92] / d nf[Z'] = (wII[Z']+2wIII[Z'])*atom_dens[Z']  (atomic term)
+    # Normalised by ne*1e-5:
+    # -------------------------------------------------------------------------
+    ne_norm = jnp.maximum(ne * 1e-5, 1e-300)
+    J_ne_row = ((wII + 2.0 * wIII) * atom_dens + mol_dne_row) / ne_norm   # (N,)
+
+    # -------------------------------------------------------------------------
+    # Block 4: bottom-right corner  (partial F[92] / partial ne_scaled)
+    # d G[92]_atomic / d ne_scaled:
+    #   d(wII*neutral_dens)/dne_scaled = -ne_scale*wII*nd*(1/ne + 1/(n_total-ne))
+    #   d(2wIII*neutral_dens)/dne_scaled = -ne_scale*2wIII*nd*(2/ne + 1/(n_total-ne))
+    #   d(-ne)/dne_scaled = -ne_scale
+    # -------------------------------------------------------------------------
+    dG92_atomic_dne = (
+        -ne_scale * jnp.sum(
+            (wII * (1.0/ne + inv_n_minus_ne)
+             + 2.0*wIII * (2.0/ne + inv_n_minus_ne)) * neutral_dens
+        ) - ne_scale
+    )
+
+    # Ionic molecule contributions to d G[92] / d ne_scaled (separate scan to get scalar).
+    def mol_dG92_dne_step(acc, mol_idx):
+        atoms  = data.mol_atoms_array[mol_idx]
+        charge = data.mol_charges[mol_idx]
+        log_nK = _get_log_nK_jit(mol_idx, log_T, data)
+        valid  = jnp.isfinite(log_nK)
+
+        def ionic_contrib(_):
+            idx1, idx2 = atoms[0], atoms[1]
+            log_n_ion1 = log_nd[idx1] + jnp.log10(jnp.maximum(wII[idx1], 1e-300))
+            n_mol = jnp.power(10.0, jnp.clip(log_n_ion1 + log_nd[idx2] - log_nK, -300.0, 300.0))
+            return -n_mol * ne_scale * (1.0/ne + 2.0*inv_n_minus_ne)
+
+        return acc + jax.lax.cond(
+            valid & (charge != 0), ionic_contrib, lambda _: 0.0, None
+        ), None
+
+    if n_mols > 0:
+        dG92_mol_dne, _ = jax.lax.scan(mol_dG92_dne_step, 0.0, jnp.arange(n_mols))
+    else:
+        dG92_mol_dne = 0.0
+
+    # Full d F[92] / d ne_scaled including normalization correction:
+    # F[92] = G[92] / (ne*1e-5), so d F[92]/d ne_scaled includes -F[92] * ne_scale*1e-5 / (ne*1e-5)
+    J_ne_ne = ((dG92_atomic_dne + dG92_mol_dne) / ne_norm
+               - F_val[N] * ne_scale * 1e-5 / ne_norm)
+
+    # -------------------------------------------------------------------------
+    # Assemble full (N+1) x (N+1) Jacobian
+    # -------------------------------------------------------------------------
+    J = jnp.zeros((N + 1, N + 1))
+    J = J.at[:N, :N].set(J_nf_nf)
+    J = J.at[:N, N].set(J_ne_col)
+    J = J.at[N, :N].set(J_ne_row)
+    J = J.at[N, N].set(J_ne_ne)
+
+    # Chain-rule correction for abs() and maximum():
+    # The residuals use nf = abs(x[:N]) and ne = max(abs(x[N])*ne_scale, 1.0).
+    # The Jacobian of F w.r.t. x[j] is dF/dnf[j] * sign(x[j]) for j < N,
+    # and dF/dne_scaled * sign(x[N]) for j = N (when ne > 1, i.e. the max is active).
+    # Multiply each column j by sign(x[j]).
+    sign_x = jnp.sign(x)
+    # Avoid sign=0 (which only happens at exactly x=0); treat as +1 to match abs gradient.
+    sign_x = jnp.where(sign_x == 0, 1.0, sign_x)
+    J = J * sign_x[jnp.newaxis, :]   # broadcast over rows
+
+    return J
+
+
 def _chem_eq_newton_layer_jit(T, n_total, ne_guess, nf_guess, abundances, data):
     """
     Single-layer Newton solver for chemical equilibrium.
 
     Matches Julia's `_solve_chemical_equilibrium`:
-    - Method: Newton (full Jacobian via forward-mode AD)
-    - Convergence: ∞-norm < 1e-8
+    - Method: Newton (analytical Jacobian -- no jacfwd)
+    - Convergence: inf-norm < 1e-8
     - Max iterations: 1000
     - Linear solve: LU (jnp.linalg.solve)
-    - Line search: static (full step, α=1)
-    - Regularisation: 1e-12·I (matches `newton_solve_jax`)
+    - Line search: static (full step, alpha=1)
+    - Regularisation: 1e-12*I (matches `newton_solve_jax`)
     """
     x0 = jnp.concatenate([
         jnp.clip(nf_guess, 1e-20, 1.0),
@@ -1347,7 +1618,7 @@ def _chem_eq_newton_layer_jit(T, n_total, ne_guess, nf_guess, abundances, data):
         x, _, step = state
         F_val = F(x)
         norm  = jnp.max(jnp.abs(F_val))
-        J     = jax.jacfwd(F)(x)
+        J     = _chem_eq_analytical_jacobian(x, F_val, T, n_total, abundances, data)
         dx    = jnp.linalg.solve(J + 1e-12 * jnp.eye(MAX_ATOMIC_NUMBER + 1), -F_val)
         dx    = jnp.where(jnp.isfinite(dx), dx, 0.0)
         return x + dx, norm, step + 1
@@ -1361,9 +1632,8 @@ def _chem_eq_newton_layer_jit(T, n_total, ne_guess, nf_guess, abundances, data):
     return ne_sol, nf_sol
 
 
-# Batch (all layers) Newton solver — vmapped; JIT-compiled on first call.
-# NOTE: first JIT compile is slow (~minutes) because jacfwd differentiates
-#       through the 306-molecule lax.scan body.  Subsequent calls are fast.
+# Batch (all layers) Newton solver -- vmapped; JIT-compiled on first call.
+# With the analytical Jacobian, compile time is significantly reduced vs jacfwd.
 _chem_eq_newton_batch_jit = jax.jit(
     jax.vmap(_chem_eq_newton_layer_jit, in_axes=(0, 0, 0, 0, None, None))
 )
