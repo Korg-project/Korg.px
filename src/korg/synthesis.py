@@ -933,7 +933,7 @@ class LinelistData(NamedTuple):
 
     All arrays have shape (n_lines,) unless otherwise noted.
 
-    The optional ``_wl_np``, ``_wls_np``, ``_wl_spacing``, and ``_cntm_wl_np``
+    The optional ``wl_np_cached``, ``wls_np_cached``, ``wl_spacing_cached``, and ``cntm_wl_np_cached``
     fields cache wavelength-grid-derived numpy arrays used in ``synthesize_jit``
     to avoid recomputing them on every call.  They are populated when
     ``wavelengths_cm`` is passed to :func:`preprocess_linelist`, and are
@@ -952,10 +952,10 @@ class LinelistData(NamedTuple):
     mass: jnp.ndarray         # Species mass [g]
     mol_species_idx: jnp.ndarray  # Index into mol_densities array; -1 for atomic species
     # --- Cached wavelength-grid-derived arrays (optional) ---
-    _wl_np: Optional[np.ndarray] = None      # wavelengths_cm as numpy float64, shape (n_wl,)
-    _wls_np: Optional[np.ndarray] = None     # linelist wl as numpy float64, shape (n_lines,)
-    _wl_spacing: Optional[float] = None      # median pixel spacing [cm]
-    _cntm_wl_np: Optional[np.ndarray] = None  # coarse continuum wavelength grid [cm]
+    wl_np_cached: Optional[np.ndarray] = None      # wavelengths_cm as numpy float64, shape (n_wl,)
+    wls_np_cached: Optional[np.ndarray] = None     # linelist wl as numpy float64, shape (n_lines,)
+    wl_spacing_cached: Optional[float] = None      # median pixel spacing [cm]
+    cntm_wl_np_cached: Optional[np.ndarray] = None  # coarse continuum wavelength grid [cm]
 
 
 class SynthesisData(NamedTuple):
@@ -1266,19 +1266,19 @@ def preprocess_linelist(linelist: List[Line], chem_eq_data=None,
 
     # Precompute wavelength-grid-derived numpy arrays if wavelengths_cm was provided.
     # These are reused by synthesize_jit on every call, saving repeated recomputation.
-    _wl_np = _wls_np = _wl_spacing = _cntm_wl_np = None
+    wl_np_cached = wls_np_cached = wl_spacing_cached = cntm_wl_np_cached = None
     if wavelengths_cm is not None:
         import numpy as _np_wl
-        _wl_np = _np_wl.asarray(wavelengths_cm, dtype=_np_wl.float64)
-        _wls_np = _np_wl.array([line.wl for line in linelist], dtype=_np_wl.float64)
-        n_wl = len(_wl_np)
-        diffs = _np_wl.diff(_wl_np)
-        _wl_spacing = float(_np_wl.median(diffs)) if len(diffs) > 0 else 5e-9
+        wl_np_cached = _np_wl.asarray(wavelengths_cm, dtype=_np_wl.float64)
+        wls_np_cached = _np_wl.array([line.wl for line in linelist], dtype=_np_wl.float64)
+        n_wl = len(wl_np_cached)
+        diffs = _np_wl.diff(wl_np_cached)
+        wl_spacing_cached = float(_np_wl.median(diffs)) if len(diffs) > 0 else 5e-9
         # Coarse continuum wavelength grid (1 Å step, matching synthesize_jit default)
         cntm_step_cm = 1e-8
-        wl_min_cm = float(_wl_np[0])
-        wl_max_cm = float(_wl_np[-1])
-        _cntm_wl_np = _np_wl.arange(
+        wl_min_cm = float(wl_np_cached[0])
+        wl_max_cm = float(wl_np_cached[-1])
+        cntm_wl_np_cached = _np_wl.arange(
             wl_min_cm - cntm_step_cm, wl_max_cm + 2 * cntm_step_cm, cntm_step_cm,
             dtype=_np_wl.float64,
         )
@@ -1296,10 +1296,10 @@ def preprocess_linelist(linelist: List[Line], chem_eq_data=None,
         vdW_alpha=vdW_alpha,
         mass=jnp.array(masses),
         mol_species_idx=jnp.array(mol_species_idx_list, dtype=jnp.int32),
-        _wl_np=_wl_np,
-        _wls_np=_wls_np,
-        _wl_spacing=_wl_spacing,
-        _cntm_wl_np=_cntm_wl_np,
+        wl_np_cached=wl_np_cached,
+        wls_np_cached=wls_np_cached,
+        wl_spacing_cached=wl_spacing_cached,
+        cntm_wl_np_cached=cntm_wl_np_cached,
     )
 
 
@@ -1923,14 +1923,14 @@ def synthesize_jit(
     c_cgs_float = float(c_cgs)
     # Use cached coarse continuum wavelength grid from linelist_data if available,
     # otherwise compute it here (backward compatibility).
-    if linelist_data._cntm_wl_np is not None:
-        cntm_wl_np = linelist_data._cntm_wl_np
+    if linelist_data.cntm_wl_np_cached is not None:
+        cntm_wl_np_cached = linelist_data.cntm_wl_np_cached
     else:
         wl_min_cm = float(wavelengths_cm[0])
         wl_max_cm = float(wavelengths_cm[-1])
         cntm_step_cm = 1e-8  # 1.0 Å, matching synthesize default cntm_step
-        cntm_wl_np = np.arange(wl_min_cm - cntm_step_cm, wl_max_cm + 2 * cntm_step_cm, cntm_step_cm)
-    cntm_nu_np = c_cgs_float / cntm_wl_np  # (n_cntm,) decreasing frequencies
+        cntm_wl_np_cached = np.arange(wl_min_cm - cntm_step_cm, wl_max_cm + 2 * cntm_step_cm, cntm_step_cm)
+    cntm_nu_np = c_cgs_float / cntm_wl_np_cached  # (n_cntm,) decreasing frequencies
 
     alpha_cntm_coarse = _batch_continuum_vmap(
         jnp.array(cntm_nu_np), T_layers, ne_all, U_H_I_all, U_He_I_all,
@@ -1940,7 +1940,7 @@ def synthesize_jit(
     )  # (n_layers, n_cntm)
 
     # Interpolate to fine output grid (matches synthesize's interp1d linear)
-    cntm_wl_jnp = jnp.array(cntm_wl_np)
+    cntm_wl_jnp = jnp.array(cntm_wl_np_cached)
     alpha_cntm_all = jax.vmap(
         lambda row: jnp.interp(wavelengths_cm, cntm_wl_jnp, row)
     )(alpha_cntm_coarse)  # (n_layers, n_wl)
@@ -1972,7 +1972,7 @@ def synthesize_jit(
         _cntm_coarse_np = np.asarray(alpha_cntm_coarse)
         def _cntm_at_ref_jit_fn(wl_cm):
             wl_arr = np.atleast_1d(wl_cm)
-            result = np.stack([np.interp(wl_arr, cntm_wl_np, _cntm_coarse_np[i]) for i in range(n_layers)], axis=-1)
+            result = np.stack([np.interp(wl_arr, cntm_wl_np_cached, _cntm_coarse_np[i]) for i in range(n_layers)], axis=-1)
             return result if np.ndim(wl_cm) > 0 else result[0]
         _line_at_ref = line_absorption(
             _ref_ll, np.array([lambda_ref_cm]),
@@ -2007,16 +2007,16 @@ def synthesize_jit(
         gamma_np   = np.asarray(gamma_L_jax)
         # Use cached numpy arrays from linelist_data when available (avoids repeated
         # array allocation + median computation on every synthesize_jit call).
-        if linelist_data._wl_np is not None:
-            wl_np = linelist_data._wl_np
+        if linelist_data.wl_np_cached is not None:
+            wl_np = linelist_data.wl_np_cached
         else:
             wl_np = np.asarray(wavelengths_cm)
-        if linelist_data._wls_np is not None:
-            wls_np = linelist_data._wls_np
+        if linelist_data.wls_np_cached is not None:
+            wls_np = linelist_data.wls_np_cached
         else:
             wls_np = np.asarray(linelist_data.wl)
-        if linelist_data._wl_spacing is not None:
-            wl_spacing = linelist_data._wl_spacing
+        if linelist_data.wl_spacing_cached is not None:
+            wl_spacing = linelist_data.wl_spacing_cached
         else:
             wl_spacing = float(np.median(np.diff(wl_np))) if n_wl > 1 else 5e-9
 
@@ -2024,7 +2024,7 @@ def synthesize_jit(
         # matching synthesize's alpha_cntm_interp(wl_centers) exactly)
         cntm_coarse_np = np.asarray(alpha_cntm_coarse)
         cntm_at_center = np.array(
-            [np.interp(wls_np, cntm_wl_np, cntm_coarse_np[i]) for i in range(n_layers)]
+            [np.interp(wls_np, cntm_wl_np_cached, cntm_coarse_np[i]) for i in range(n_layers)]
         ).T  # (n_lines, n_layers)
 
         _CUTOFF = 3e-4
