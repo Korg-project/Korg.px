@@ -7,6 +7,7 @@ line profiles, and radiative transfer) to compute synthetic stellar spectra.
 Reference: Korg.jl synthesize.jl
 """
 
+import functools
 import numpy as np
 import jax.numpy as jnp
 from dataclasses import dataclass
@@ -927,6 +928,16 @@ from .continuum import (_batch_continuum_vmap, _get_metal_bf_idx,
                         get_metal_bf_cross_sections, _PEACH_IDX, _H2_MOL_IDX)
 
 
+class BucketGeometry(NamedTuple):
+    """Per-bucket precomputed window geometry for fast Voigt + scatter."""
+    W: int                      # pixel window width (static for JIT)
+    n_b: int                    # number of lines in this bucket
+    amp_idx: np.ndarray         # (n_b,) indices into full linelist
+    i_lo: jnp.ndarray           # (n_b,) starting pixels (centered windows)
+    max_wins: jnp.ndarray       # (n_b,) half-widths [cm]
+    wls: jnp.ndarray            # (n_b,) line center wavelengths [cm]
+
+
 class LinelistData(NamedTuple):
     """
     Linelist data stored as JAX-compatible arrays.
@@ -1015,6 +1026,26 @@ class PrecomputedAtmosphereData(NamedTuple):
 
     # Source function
     S_all: jnp.ndarray            # (n_layers, n_wl) Planck function
+
+    # Pre-computed Hummer broadening widths for H-line absorption (per-layer, NOT per-line)
+    ws_all_h: object = None       # list of per-layer dicts, or None
+
+    # Fixed Voigt window width (pixels) for mega-JIT line path (0 = not computed yet)
+    W_line: int = 0
+
+    # Per-bucket geometry for fast bucket-JIT line absorption (None = not precomputed)
+    bucket_geometry: tuple = None  # tuple of BucketGeometry
+
+    # Cached JAX wavelength grid (avoids jnp.array(wl_np) on every synthesize_jit call)
+    wl_jax: object = None         # jnp.ndarray (n_wl,) or None
+
+    # Cached numpy conversions of atmospheric arrays (avoids repeated device→host copies)
+    T_np: object = None           # np.ndarray (n_layers,)
+    ne_np: object = None          # np.ndarray (n_layers,)
+    nH_I_np: object = None        # np.ndarray (n_layers,)
+    nHe_I_np: object = None       # np.ndarray (n_layers,)
+    U_H_I_np: object = None       # np.ndarray (n_layers,)
+    wl_cm_np: object = None       # np.ndarray (n_wl,)
 
 
 def precompute_synthesis_data(
@@ -1261,6 +1292,88 @@ def precompute_atmosphere(
     # Source function
     S_all = jax.vmap(lambda T_i: blackbody(T_i, wavelengths_cm))(T_layers)
 
+    # ── Pre-compute Hummer widths for H-line absorption (per-layer, not per-line) ──
+    _T_np_h   = np.asarray(T_layers)
+    _nH_np_h  = np.asarray(nH_I_all)
+    _nHe_np_h = np.asarray(nHe_I_all)
+    _ne_np_h  = np.asarray(ne_all)
+    _ws_all_h_pre = precompute_hummer_ws(_T_np_h, _nH_np_h, _nHe_np_h, _ne_np_h)
+
+    # ── Pre-compute per-bucket window geometry for fast Voigt + scatter ───────
+    # One-time cost: compute line params, determine max_wins per line, assign to
+    # buckets (same widths as _line_absorption_fast), precompute centered i_lo.
+    # Stored as BucketGeometry NamedTuples so synthesize_jit can avoid Python scatter.
+    _bucket_geometry = None
+    if linelist_data is not None and linelist_data.wl.shape[0] > 0:
+        _amp_w, _sig_w, _gam_w = _compute_line_params_jit(
+            T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
+            mol_densities_all, linelist_data, data, float(vmic_cm_s)
+        )
+        _amp_np_w = np.asarray(_amp_w)
+        _sig_np_w = np.asarray(_sig_w)
+        _gam_np_w = np.asarray(_gam_w)
+        _wls_np_w = (linelist_data.wls_np_cached if linelist_data.wls_np_cached is not None
+                     else np.asarray(linelist_data.wl))
+        _wl_np_w = (linelist_data.wl_np_cached if linelist_data.wl_np_cached is not None
+                    else np.asarray(wavelengths_cm))
+        _wl_sp_w = (linelist_data.wl_spacing_cached if linelist_data.wl_spacing_cached is not None
+                    else float(np.median(np.diff(_wl_np_w))))
+        _n_wl_w = _wl_np_w.shape[0]
+        _cntm_np_w = np.asarray(alpha_cntm_coarse)
+        _cntm_ctr_w = np.array([
+            np.interp(_wls_np_w, cntm_wl_np_cached, _cntm_np_w[i]) for i in range(n_layers)
+        ]).T  # (n_lines, n_layers)
+        _rho_w = 3e-4 * _cntm_ctr_w / np.maximum(np.abs(_amp_np_w), 1e-300)
+        _lg_w = np.sqrt(2.0 * np.pi) * _sig_np_w * _rho_w
+        with np.errstate(invalid='ignore', divide='ignore'):
+            _wG_w = np.where(_lg_w >= 1.0, 0.0,
+                             _sig_np_w * np.sqrt(-2.0 * np.log(np.maximum(_lg_w, 1e-300))))
+            _wLa_w = _gam_np_w / (np.pi * _rho_w)
+            _wL_w = np.where(_wLa_w <= _gam_np_w**2, 0.0,
+                             np.sqrt(np.maximum(_wLa_w - _gam_np_w**2, 0.0)))
+        _mw_w = np.sqrt(np.max(_wG_w, axis=1)**2 + np.max(_wL_w, axis=1)**2)
+        _mwpx_w = np.clip(np.ceil(2.0 * _mw_w / _wl_sp_w + 2).astype(int), 0, _n_wl_w)
+        # Build BucketGeometry for each non-empty bucket
+        _BUCKET_WIDTHS = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, _n_wl_w]
+        _buckets = []
+        _prev = 0
+        for _W_MAX in _BUCKET_WIDTHS:
+            _W = min(_W_MAX, _n_wl_w)
+            _in_b = (_mwpx_w > _prev) & (_mwpx_w <= _W_MAX)
+            _n_b = int(_in_b.sum())
+            if _n_b == 0:
+                _prev = _W_MAX
+                continue
+            _idx_b = np.where(_in_b)[0].astype(np.int32)
+            _wls_b = _wls_np_w[_idx_b]
+            _mw_b = _mw_w[_idx_b]
+            # Centered window i_lo
+            _ctr_px = np.searchsorted(_wl_np_w, _wls_b).astype(int)
+            _i_lo_b = np.clip(_ctr_px - _W // 2, 0, _n_wl_w - _W).astype(np.int32)
+            _buckets.append(BucketGeometry(
+                W=_W,
+                n_b=_n_b,
+                amp_idx=_idx_b,
+                i_lo=jnp.array(_i_lo_b),
+                max_wins=jnp.array(_mw_b),
+                wls=jnp.array(_wls_b),
+            ))
+            _prev = _W_MAX
+        _bucket_geometry = tuple(_buckets)
+        W_line = _buckets[-1].W if _buckets else 0
+        _wl_jax_cached = jnp.array(_wl_np_w)
+    else:
+        W_line = 0
+        _wl_jax_cached = None
+
+    # Cache numpy conversions of atmospheric arrays (avoid repeated device→host copies)
+    _T_np_cached     = np.asarray(T_layers)
+    _ne_np_cached    = np.asarray(ne_all)
+    _nH_I_np_cached  = np.asarray(nH_I_all)
+    _nHe_I_np_cached = np.asarray(nHe_I_all)
+    _U_H_I_np_cached = np.asarray(U_H_I_all)
+    _wl_cm_np_cached = np.asarray(wavelengths_cm)
+
     return PrecomputedAtmosphereData(
         T_layers=T_layers,
         ne_all=ne_all,
@@ -1280,6 +1393,16 @@ def precompute_atmosphere(
         alpha_cntm_coarse=alpha_cntm_coarse,
         cntm_wl_np=cntm_wl_np_cached,
         S_all=S_all,
+        ws_all_h=_ws_all_h_pre,
+        W_line=W_line,
+        bucket_geometry=_bucket_geometry,
+        wl_jax=_wl_jax_cached,
+        T_np=_T_np_cached,
+        ne_np=_ne_np_cached,
+        nH_I_np=_nH_I_np_cached,
+        nHe_I_np=_nHe_I_np_cached,
+        U_H_I_np=_U_H_I_np_cached,
+        wl_cm_np=_wl_cm_np_cached,
     )
 
 
@@ -2019,6 +2142,89 @@ def _compute_line_params_jit(
 _voigt_profile_jax_jit = jax.jit(_voigt_profile_jax)
 
 
+@functools.partial(jax.jit, static_argnames=('W', 'n_wl_s', 'n_layers_s'))
+def _voigt_bucket_jit(
+    amp, sigma_D, gamma_L,
+    i_lo_jax, max_wins_jax, wls_jax, wl_jax,
+    *,
+    W: int, n_wl_s: int, n_layers_s: int,
+):
+    """JIT Voigt + scatter for one bucket of lines.
+
+    Parameters already sliced to this bucket; window geometry (i_lo, max_wins)
+    is precomputed at precompute_atmosphere time and passed as JAX arrays.
+
+    amp, sigma_D, gamma_L : (n_b, n_layers)
+    i_lo_jax              : (n_b,) int32  — centered window start pixels
+    max_wins_jax          : (n_b,) float  — half-width in cm per line
+    wls_jax               : (n_b,) float  — line centers [cm]
+    wl_jax                : (n_wl,) float — synthesis wavelength grid [cm]
+    """
+    pix_idx  = i_lo_jax[:, None] + jnp.arange(W)[None, :]          # (n_b, W)
+    delta    = wl_jax[pix_idx] - wls_jax[:, None]                   # (n_b, W)
+    mask     = jnp.abs(delta) <= max_wins_jax[:, None]              # (n_b, W)
+    profiles = _voigt_profile_jax(
+        delta[:, None, :], sigma_D[:, :, None], gamma_L[:, :, None]
+    )  # (n_b, n_layers, W)
+    contrib      = mask[:, None, :] * amp[:, :, None] * profiles    # (n_b, n_layers, W)
+    flat_pix     = pix_idx.ravel()                                    # (n_b * W,)
+    flat_contrib = contrib.transpose(1, 0, 2).reshape(n_layers_s, -1)  # (n_layers, n_b*W)
+    return jax.vmap(lambda c: jnp.zeros(n_wl_s).at[flat_pix].add(c))(flat_contrib)
+
+
+@functools.partial(jax.jit, static_argnames=('bucket_Ws', 'bucket_n_bs', 'n_wl_s', 'n_layers_s'))
+def _all_buckets_jit(
+    amp_all, sigma_all, gamma_all,
+    all_amp_idxs, all_i_los, all_max_wins, all_wls,
+    wl_jax,
+    *, bucket_Ws, bucket_n_bs, n_wl_s, n_layers_s,
+):
+    """Fused JIT: all buckets in one XLA program, one dispatch overhead total.
+
+    Gather + Voigt + scatter for every bucket is unrolled at trace time.
+    amp_all, sigma_all, gamma_all : (n_lines, n_layers)
+    all_amp_idxs : tuple of (n_b,) int32 arrays, one per bucket
+    all_i_los    : tuple of (n_b,) int32 arrays
+    all_max_wins : tuple of (n_b,) float arrays
+    all_wls      : tuple of (n_b,) float arrays
+    bucket_Ws    : tuple of ints (static, controls unrolling)
+    bucket_n_bs  : tuple of ints (static, shapes)
+    """
+    result = jnp.zeros((n_layers_s, n_wl_s))
+    for W, amp_idx, i_lo, max_wins, wls in zip(
+        bucket_Ws, all_amp_idxs, all_i_los, all_max_wins, all_wls
+    ):
+        amp    = amp_all[amp_idx]                                    # (n_b, n_layers)
+        sigma  = sigma_all[amp_idx]
+        gamma  = gamma_all[amp_idx]
+        pix    = i_lo[:, None] + jnp.arange(W)[None, :]            # (n_b, W)
+        # Compute delta precisely in float64, then cast to float32 for Voigt.
+        # The wavelength differences are O(10^-8 cm) which float32 represents safely;
+        # the cast introduces only ~3e-11 absolute error in line_alpha (within 1e-6 budget).
+        delta_f64 = wl_jax[pix] - wls[:, None]                      # (n_b, W) float64
+        mask   = jnp.abs(delta_f64) <= max_wins[:, None]             # (n_b, W) bool
+        delta  = delta_f64.astype(jnp.float32)                       # (n_b, W) float32
+        prof   = _voigt_profile_jax(
+            delta[:, None, :],
+            sigma[:, :, None].astype(jnp.float32),
+            gamma[:, :, None].astype(jnp.float32),
+        ).astype(jnp.float64)                                         # back to f64
+        cont   = mask[:, None, :] * amp[:, :, None] * prof
+        flat_p = pix.ravel()
+        flat_c = cont.transpose(1, 0, 2).reshape(n_layers_s, -1)
+        result = result + jax.vmap(lambda c: jnp.zeros(n_wl_s).at[flat_p].add(c))(flat_c)
+    return result
+
+
+@jax.jit
+def _rt_both_jit(alpha_total_T, alpha_cntm_T, S_T, z, log_tau, alpha_ref):
+    """Fused radiative transfer for both full and continuum-only in one XLA dispatch."""
+    from .radiative_transfer import radiative_transfer_jit as _rt
+    flux, _ = _rt(alpha_total_T, S_T, z, log_tau, alpha_ref)
+    flux_cntm, _ = _rt(alpha_cntm_T, S_T, z, log_tau, alpha_ref)
+    return flux, flux_cntm
+
+
 def synthesize_jit(
     wavelengths_cm: jnp.ndarray,
     T_layers: jnp.ndarray,
@@ -2240,42 +2446,93 @@ def synthesize_jit(
         S_all = jax.vmap(lambda T_i: blackbody(T_i, wavelengths_cm))(T_layers)  # (n_layers, n_wl)
 
     # ── Phase 4: Line absorption with exact bucketing (matches _line_absorption_fast) ──
-    # Strategy: compute amplitude/sigma_D/gamma_L per (line, layer) via JIT, then
-    # compute max_wins at Python level, bucket by window size, call the Voigt JIT
-    # once per bucket.  This avoids allocating a single (n_lines, n_layers, W_MAX=512)
-    # tensor for ALL lines and instead uses the actual required window per line.
+    # Pre-compute H-line membership before Phase 4 so we can overlap H-line numpy work
+    # with JAX device computation in the precomputed-atmosphere path.
+    _RYDBERG_CM_P4 = 1.0973731568539e5
+    _H_WIN_CM_P4   = 150.0 * 1e-8
+    _wl_min_cm_p4  = float(wavelengths_cm[0])
+    _wl_max_cm_p4  = float(wavelengths_cm[-1])
+    nearby_stark_p4 = {
+        k: v for k, v in hline_stark_profiles.items()
+        if (_wl_min_cm_p4 - _H_WIN_CM_P4
+            <= 1.0 / (_RYDBERG_CM_P4 * (1.0 / v.lower**2 - 1.0 / v.upper**2))
+            <= _wl_max_cm_p4 + _H_WIN_CM_P4)
+    }
+    brackett_in_range_p4 = any(
+        _wl_min_cm_p4 - _H_WIN_CM_P4
+        <= 1.0 / (_RYDBERG_CM_P4 * (1.0 / 16.0 - 1.0 / m**2))
+        <= _wl_max_cm_p4 + _H_WIN_CM_P4
+        for m in range(5, 31)
+    )
+
     n_lines = linelist_data.wl.shape[0]
+    h_alpha = None  # set here in precomputed path; set in Phase 4.5 otherwise
 
     if n_lines == 0:
         line_alpha = jnp.zeros((n_layers, n_wl))
+    elif precomputed_atm is not None and precomputed_atm.bucket_geometry:
+        # ── Fused bucket-JIT path ──
+        # Step 1: submit line params to XLA (async, returns immediately)
+        amp_jax, sigma_D_jax, gamma_L_jax = _compute_line_params_jit(
+            T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
+            mol_densities_all, linelist_data, data, vmic_cm_s
+        )
+
+        # Step 2: submit Voigt immediately (XLA chains it after line params)
+        # — this lets XLA run both while Python handles H-lines below
+        _bgs = precomputed_atm.bucket_geometry
+        line_alpha = _all_buckets_jit(
+            amp_jax, sigma_D_jax, gamma_L_jax,
+            tuple(_bg.amp_idx  for _bg in _bgs),
+            tuple(_bg.i_lo     for _bg in _bgs),
+            tuple(_bg.max_wins for _bg in _bgs),
+            tuple(_bg.wls      for _bg in _bgs),
+            precomputed_atm.wl_jax,
+            bucket_Ws=tuple(_bg.W   for _bg in _bgs),
+            bucket_n_bs=tuple(_bg.n_b for _bg in _bgs),
+            n_wl_s=n_wl, n_layers_s=n_layers,
+        )
+
+        # Step 3: run H-lines (numpy) while XLA executes line_params → Voigt chain
+        _T_np     = precomputed_atm.T_np
+        _ne_np    = precomputed_atm.ne_np
+        _nH_I_np  = precomputed_atm.nH_I_np
+        _nHe_I_np = precomputed_atm.nHe_I_np
+        _U_H_I_np = precomputed_atm.U_H_I_np
+        _wl_cm_np = precomputed_atm.wl_cm_np
+        _ws_all_h = precomputed_atm.ws_all_h
+        h_alpha = np.zeros((n_layers, n_wl))
+        if nearby_stark_p4:
+            h_alpha += hydrogen_line_absorption_stark_batched(
+                _wl_cm_np, _T_np, _ne_np, _nH_I_np, _U_H_I_np,
+                _H_WIN_CM_P4, float(vmic_cm_s), _ws_all_h, nearby_stark_p4
+            )
+        if brackett_in_range_p4:
+            for _i in range(n_layers):
+                h_alpha[_i] += hydrogen_line_absorption(
+                    _wl_cm_np, _T_np[_i], _ne_np[_i], _nH_I_np[_i], _nHe_I_np[_i],
+                    float(_U_H_I_np[_i]), float(vmic_cm_s),
+                    _H_WIN_CM_P4, use_MHD=True, ws=_ws_all_h[_i],
+                    stark_profiles={}
+                )
     else:
-        # Step 4a: params pass (no Voigt) — JIT-compiled, fast
+        # ── Standard bucketed path (used when no precomputed atmosphere) ──
+        # Step 4a: params — stays on device as JAX arrays
         amp_jax, sigma_D_jax, gamma_L_jax = _compute_line_params_jit(
             T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
             mol_densities_all, linelist_data, data, vmic_cm_s
         )  # each (n_lines, n_layers)
 
-        # Step 4b: sync to numpy, compute max_wins per line
-        amp_np     = np.asarray(amp_jax)      # (n_lines, n_layers) — sync point
-        sigma_np   = np.asarray(sigma_D_jax)
-        gamma_np   = np.asarray(gamma_L_jax)
-        # Use cached numpy arrays from linelist_data when available (avoids repeated
-        # array allocation + median computation on every synthesize_jit call).
-        if linelist_data.wl_np_cached is not None:
-            wl_np = linelist_data.wl_np_cached
-        else:
-            wl_np = np.asarray(wavelengths_cm)
-        if linelist_data.wls_np_cached is not None:
-            wls_np = linelist_data.wls_np_cached
-        else:
-            wls_np = np.asarray(linelist_data.wl)
-        if linelist_data.wl_spacing_cached is not None:
-            wl_spacing = linelist_data.wl_spacing_cached
-        else:
-            wl_spacing = float(np.median(np.diff(wl_np))) if n_wl > 1 else 5e-9
+        # Cached numpy arrays for indexing (no JAX dependency)
+        wl_np = linelist_data.wl_np_cached if linelist_data.wl_np_cached is not None else np.asarray(wavelengths_cm)
+        wls_np = linelist_data.wls_np_cached if linelist_data.wls_np_cached is not None else np.asarray(linelist_data.wl)
+        wl_spacing = linelist_data.wl_spacing_cached if linelist_data.wl_spacing_cached is not None else (float(np.median(np.diff(wl_np))) if n_wl > 1 else 5e-9)
 
-        # Interpolate continuum at line centers from the coarse grid (one interp step,
-        # matching synthesize's alpha_cntm_interp(wl_centers) exactly)
+        # Step 4b: sync to numpy, compute max_wins per line
+        amp_np   = np.asarray(amp_jax)
+        sigma_np = np.asarray(sigma_D_jax)
+        gamma_np = np.asarray(gamma_L_jax)
+
         cntm_coarse_np = np.asarray(alpha_cntm_coarse)
         cntm_at_center = np.array(
             [np.interp(wls_np, cntm_wl_np_cached, cntm_coarse_np[i]) for i in range(n_layers)]
@@ -2291,12 +2548,8 @@ def synthesize_jit(
             win_L_arg = gamma_np / (np.pi * rho_crit)
             win_L = np.where(win_L_arg <= gamma_np**2, 0.0,
                              np.sqrt(np.maximum(win_L_arg - gamma_np**2, 0.0)))
-        # Match Julia: max of Gaussian window and max of Lorentzian window are taken
-        # separately before combining, giving a larger (more conservative) window.
-        max_wins = np.sqrt(np.max(win_G, axis=1)**2 + np.max(win_L, axis=1)**2)  # (n_lines,)
-        max_wins_px = np.clip(
-            np.ceil(2.0 * max_wins / wl_spacing + 2).astype(int), 0, n_wl
-        )
+        max_wins = np.sqrt(np.max(win_G, axis=1)**2 + np.max(win_L, axis=1)**2)
+        max_wins_px = np.clip(np.ceil(2.0 * max_wins / wl_spacing + 2).astype(int), 0, n_wl)
 
         # Step 4c: bucketed Voigt — exactly as in _line_absorption_fast
         alpha_lines = np.zeros((n_layers, n_wl))
@@ -2313,7 +2566,6 @@ def synthesize_jit(
             idx_b = np.where(in_bucket)[0]
             wls_b = wls_np[idx_b]
 
-            # Window start: left edge placed at line_center - max_win (matches _line_absorption_fast)
             i_lo_b = np.searchsorted(wl_np, wls_b - max_wins[idx_b]).astype(int)
             i_lo_b = np.clip(i_lo_b, 0, n_wl - W)
 
@@ -2322,15 +2574,14 @@ def synthesize_jit(
             delta_b = wl_win - wls_b[:, None]                               # (n_b, W)
             mask_b  = np.abs(delta_b) <= max_wins[idx_b, None]              # (n_b, W)
 
-            # JAX Voigt — compiled once per unique (n_b, n_layers, W) shape
-            delta_j = jnp.asarray(delta_b[:, None, :])             # (n_b, 1, W)
-            sigma_j = jnp.asarray(sigma_np[idx_b, :, None])        # (n_b, n_layers, 1)
-            gamma_j = jnp.asarray(gamma_np[idx_b, :, None])        # (n_b, n_layers, 1)
+            delta_j = jnp.asarray(delta_b[:, None, :])
+            sigma_j = jnp.asarray(sigma_np[idx_b, :, None])
+            gamma_j = jnp.asarray(gamma_np[idx_b, :, None])
             profiles = np.asarray(
                 _voigt_profile_jax_jit(delta_j, sigma_j, gamma_j)
             )  # (n_b, n_layers, W)
 
-            contrib = mask_b[:, None, :] * amp_np[idx_b, :, None] * profiles  # (n_b, n_layers, W)
+            contrib = mask_b[:, None, :] * amp_np[idx_b, :, None] * profiles
 
             for il, i_lo in enumerate(i_lo_b):
                 alpha_lines[:, i_lo:i_lo + W] += contrib[il]
@@ -2339,69 +2590,71 @@ def synthesize_jit(
 
         line_alpha = jnp.asarray(alpha_lines)
 
-    # ── Phase 4.5: Hydrogen line absorption (matches synthesize hydrogen_lines=True) ──
-    _RYDBERG_CM = 1.0973731568539e5
-    _H_LINE_WINDOW_CM = 150.0 * 1e-8   # synthesize's hydrogen_line_window_size default
-    wl_min_cm = float(wavelengths_cm[0])
-    wl_max_cm = float(wavelengths_cm[-1])
-    nearby_stark = {
-        k: v for k, v in hline_stark_profiles.items()
-        if (wl_min_cm - _H_LINE_WINDOW_CM
-            <= 1.0 / (_RYDBERG_CM * (1.0 / v.lower**2 - 1.0 / v.upper**2))
-            <= wl_max_cm + _H_LINE_WINDOW_CM)
-    }
+    # ── Phase 4.5: Hydrogen line absorption ──────────────────────────────────────
+    # Skipped when precomputed_atm is used (h_alpha computed in Phase 4 above,
+    # overlapping with XLA line params computation).
+    if h_alpha is None:
+        _RYDBERG_CM = 1.0973731568539e5
+        _H_LINE_WINDOW_CM = 150.0 * 1e-8
+        wl_min_cm = float(wavelengths_cm[0])
+        wl_max_cm = float(wavelengths_cm[-1])
+        nearby_stark = {
+            k: v for k, v in hline_stark_profiles.items()
+            if (wl_min_cm - _H_LINE_WINDOW_CM
+                <= 1.0 / (_RYDBERG_CM * (1.0 / v.lower**2 - 1.0 / v.upper**2))
+                <= wl_max_cm + _H_LINE_WINDOW_CM)
+        }
 
-    T_np     = np.asarray(T_layers)
-    ne_np    = np.asarray(ne_all)
-    nH_I_np  = np.asarray(nH_I_all)
-    nHe_I_np = np.asarray(nHe_I_all)
-    U_H_I_np = np.asarray(U_H_I_all)
-    wl_cm_np = np.asarray(wavelengths_cm)
+        T_np     = np.asarray(T_layers)
+        ne_np    = np.asarray(ne_all)
+        nH_I_np  = np.asarray(nH_I_all)
+        nHe_I_np = np.asarray(nHe_I_all)
+        U_H_I_np = np.asarray(U_H_I_all)
+        wl_cm_np = np.asarray(wavelengths_cm)
 
-    ws_all_h = precompute_hummer_ws(T_np, nH_I_np, nHe_I_np, ne_np)
+        if precomputed_atm is not None and precomputed_atm.ws_all_h is not None:
+            ws_all_h = precomputed_atm.ws_all_h
+        else:
+            ws_all_h = precompute_hummer_ws(T_np, nH_I_np, nHe_I_np, ne_np)
 
-    h_alpha = np.zeros((n_layers, n_wl))
-    if nearby_stark:
-        h_alpha += hydrogen_line_absorption_stark_batched(
-            wl_cm_np, T_np, ne_np, nH_I_np, U_H_I_np,
-            _H_LINE_WINDOW_CM, float(vmic_cm_s), ws_all_h, nearby_stark
-        )
-
-    brackett_in_range = any(
-        wl_min_cm - _H_LINE_WINDOW_CM
-        <= 1.0 / (_RYDBERG_CM * (1.0 / 16.0 - 1.0 / m**2))
-        <= wl_max_cm + _H_LINE_WINDOW_CM
-        for m in range(5, 31)
-    )
-    if brackett_in_range:
-        for i in range(n_layers):
-            h_alpha[i] += hydrogen_line_absorption(
-                wl_cm_np, T_np[i], ne_np[i], nH_I_np[i], nHe_I_np[i],
-                float(U_H_I_np[i]), float(vmic_cm_s),
-                _H_LINE_WINDOW_CM, use_MHD=True, ws=ws_all_h[i],
-                stark_profiles={}
+        h_alpha = np.zeros((n_layers, n_wl))
+        if nearby_stark:
+            h_alpha += hydrogen_line_absorption_stark_batched(
+                wl_cm_np, T_np, ne_np, nH_I_np, U_H_I_np,
+                _H_LINE_WINDOW_CM, float(vmic_cm_s), ws_all_h, nearby_stark
             )
+
+        brackett_in_range = any(
+            wl_min_cm - _H_LINE_WINDOW_CM
+            <= 1.0 / (_RYDBERG_CM * (1.0 / 16.0 - 1.0 / m**2))
+            <= wl_max_cm + _H_LINE_WINDOW_CM
+            for m in range(5, 31)
+        )
+        if brackett_in_range:
+            for i in range(n_layers):
+                h_alpha[i] += hydrogen_line_absorption(
+                    wl_cm_np, T_np[i], ne_np[i], nH_I_np[i], nHe_I_np[i],
+                    float(U_H_I_np[i]), float(vmic_cm_s),
+                    _H_LINE_WINDOW_CM, use_MHD=True, ws=ws_all_h[i],
+                    stark_profiles={}
+                )
 
     alpha_total = alpha_cntm_all + line_alpha + jnp.asarray(h_alpha)
 
     # ── Phase 5: Radiative transfer ───────────────────────────────────────────
-    from .radiative_transfer import radiative_transfer_jit
-
-    flux, _ = radiative_transfer_jit(
-        alpha_total.T,
-        S_all.T,
-        z_layers,
-        log_tau_ref,
-        alpha_ref_all
-    )
-
-    flux_cntm, _ = radiative_transfer_jit(
-        alpha_cntm_all.T,
-        S_all.T,
-        z_layers,
-        log_tau_ref,
-        alpha_ref_all
-    )
+    # Fused: both RT passes in one XLA dispatch (saves one dispatch + shared S/z/tau reads)
+    if precomputed_atm is not None:
+        flux, flux_cntm = _rt_both_jit(
+            alpha_total.T, alpha_cntm_all.T, S_all.T, z_layers, log_tau_ref, alpha_ref_all
+        )
+    else:
+        from .radiative_transfer import radiative_transfer_jit
+        flux, _ = radiative_transfer_jit(
+            alpha_total.T, S_all.T, z_layers, log_tau_ref, alpha_ref_all
+        )
+        flux_cntm, _ = radiative_transfer_jit(
+            alpha_cntm_all.T, S_all.T, z_layers, log_tau_ref, alpha_ref_all
+        )
 
     # Convert cm⁻¹ → Å⁻¹ (1 cm = 1e8 Å)
     return flux * 1e-8, flux_cntm * 1e-8
