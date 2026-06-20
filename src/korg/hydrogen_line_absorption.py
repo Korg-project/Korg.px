@@ -1271,3 +1271,78 @@ def hydrogen_line_absorption_stark_batched(
         alpha[:, wl_lo:wl_hi] += np.asarray(contribs_slice)
 
     return alpha
+
+
+import functools as _functools
+
+
+@_functools.partial(jax.jit, static_argnames=('lower', 'upper'))
+def _h_alpha_from_precomp_jit(
+    wavelengths_win,       # (n_win,) synthesis wavelengths in window [cm]
+    T_arr,                 # (n_layers,)
+    nH_I_arr,              # (n_layers,)
+    UH_I_arr,              # (n_layers,)
+    ws_all,                # (n_layers, N_MAX_HUMMER)
+    valid_mask,            # (n_layers,) bool — False for out-of-grid layers
+    profiles_1d,           # (n_layers, n_delta) precomputed bilinear-reduced Stark profile
+    lambda0_arr,           # (n_layers,) precomputed line centre [cm]
+    lambda0_stehle_arr,    # (n_layers,) Stark centre (= ABO centre for lower Balmer)
+    F0_arr,                # (n_layers,) = 1.25e-9 * ne^(2/3) precomputed
+    log_delta_nu_grid,     # (n_delta,)
+    window_cm,             # scalar [cm]
+    log_gf,                # scalar
+    sigma_abo,             # scalar [cm^2]
+    alpha_abo,             # scalar
+    abo_active,            # 0.0 or 1.0
+    xi,                    # microturbulence [cm/s]
+    lower,                 # static int — lower quantum number
+    upper,                 # static int — upper quantum number
+):
+    """Fast H-line Stark + ABO absorption using precomputed per-layer 1D profiles.
+
+    Returns contributions only at *window* pixels: shape (n_layers, n_win).
+    Caller scatters these into the full (n_layers, n_wl) opacity array.
+
+    The 3D Stark-table interpolation in (T, ne, log_delta_nu) has been split:
+    the (T, ne) bilinear part is precomputed per layer in ``profiles_1d``;
+    only the cheap 1D interpolation in log_delta_nu runs per synthesis call.
+    """
+    nus_win = c_cgs / wavelengths_win
+    n_delta = log_delta_nu_grid.shape[0]
+    Hmass = atomic_masses[0]
+
+    def per_layer(T_i, nH_I_i, UH_I_i, ws_i, valid_i,
+                  prof_1d_i, lam0_i, lam0_stehle_i, F0_i):
+        beta = 1.0 / (kboltz_eV * T_i)
+        Elo = RydbergH_eV * (1.0 - 1.0 / lower**2)
+        Eup = RydbergH_eV * (1.0 - 1.0 / upper**2)
+        levels_factor = ws_i[upper - 1] * (jnp.exp(-beta * Elo) - jnp.exp(-beta * Eup)) / UH_I_i
+        amplitude = 10.0**log_gf * nH_I_i * sigma_line(lam0_i) * levels_factor
+
+        nu0 = c_cgs / lam0_stehle_i
+        delta_nu = jnp.maximum(jnp.abs(nus_win - nu0) / F0_i, jnp.finfo(jnp.float64).tiny)
+        log_sdn = jnp.log(delta_nu)
+
+        def interp_1d(ls):
+            i = jnp.searchsorted(log_delta_nu_grid, ls, side='right') - 1
+            i = jnp.clip(i, 0, n_delta - 2)
+            t = (ls - log_delta_nu_grid[i]) / (log_delta_nu_grid[i + 1] - log_delta_nu_grid[i])
+            return prof_1d_i[i] * (1.0 - t) + prof_1d_i[i + 1] * t
+
+        log_profile = jax.vmap(interp_1d)(log_sdn)
+        dnu_dlam = c_cgs / wavelengths_win**2
+        in_win = jnp.abs(wavelengths_win - lam0_i) < window_cm
+        stehle = jnp.where(in_win, jnp.exp(log_profile) * dnu_dlam * amplitude, 0.0)
+
+        Gamma = scaled_vdW((sigma_abo, alpha_abo), Hmass, T_i) * nH_I_i
+        gamma_abo_val = Gamma * lam0_stehle_i**2 / (c_cgs * 4.0 * jnp.pi)
+        sigma_dop = doppler_width(lam0_stehle_i, T_i, Hmass, xi)
+        abo_win = line_profile(lam0_stehle_i, sigma_dop, gamma_abo_val, amplitude, wavelengths_win)
+
+        contrib = stehle + abo_win * abo_active
+        return jnp.where(valid_i, contrib, jnp.zeros_like(contrib))
+
+    return jax.vmap(per_layer)(
+        T_arr, nH_I_arr, UH_I_arr, ws_all, valid_mask,
+        profiles_1d, lambda0_arr, lambda0_stehle_arr, F0_arr
+    )
