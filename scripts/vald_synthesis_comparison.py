@@ -30,9 +30,9 @@ ATMOSPHERE_PATH = os.path.join(os.path.dirname(__file__), '..', 'sun.mod')
 OUTPUT_H5 = '/tmp/julia_vald_synthesis.h5'
 OUTPUT_PNG = os.path.join(os.path.dirname(__file__), '..', 'vald_synthesis_comparison.png')
 
-WL_MIN = 5100.0  # Å
+WL_MIN = 5000.0  # Å
 WL_MAX = 5200.0  # Å
-N_WL = 2_000
+N_WL = 4_000
 
 
 def run_python_synthesis_jit():
