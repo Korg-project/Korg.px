@@ -5,19 +5,22 @@ Synthesizes wl = linspace(5000, 5100, 2000) with the solar VALD linelist
 using both Python (JIT and non-JIT) and Julia, then creates a six-panel
 comparison plot.
 """
+import os
+import sys
+# Force JAX to CPU only — must be set before any JAX import
+os.environ['JAX_PLATFORMS'] = 'cpu'
+
 import numpy as np
 import matplotlib.pyplot as plt
 import subprocess
 import tempfile
 import time
-import os
-import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import jax.numpy as jnp
 import korg
 from korg.linelist import read_vald_linelist
-from korg.abundances import A_X_to_absolute, format_A_X
+from korg.abundances import A_X_to_absolute, format_A_X, get_solar_abundances
 from korg.synthesis import (precompute_synthesis_data, preprocess_linelist,
                              synthesize_jit, synthesize,
                              precompute_atmosphere, PrecomputedAtmosphereData)
@@ -41,7 +44,8 @@ def run_python_synthesis_jit():
     print(f"  Loaded {len(linelist)} lines from VALD")
 
     atm = korg.read_model_atmosphere(ATMOSPHERE_PATH)
-    A_X = korg.format_A_X()
+    # Use Asplund 2020 solar abundances to match Julia's Korg.format_A_X() default
+    A_X = korg.format_A_X(solar_abundances=get_solar_abundances('asplund_2020'))
     wavelengths = np.linspace(WL_MIN, WL_MAX, N_WL)
     wavelengths_cm = jnp.array(wavelengths * 1e-8)
 
@@ -119,7 +123,8 @@ def run_python_synthesis_nonjit():
     print(f"  Loaded {len(linelist)} lines from VALD")
 
     atm = korg.read_model_atmosphere(ATMOSPHERE_PATH)
-    A_X = korg.format_A_X()
+    # Use Asplund 2020 solar abundances to match Julia's Korg.format_A_X() default
+    A_X = korg.format_A_X(solar_abundances=get_solar_abundances('asplund_2020'))
     wavelengths = np.linspace(WL_MIN, WL_MAX, N_WL)
     abundances = np.array(A_X_to_absolute(A_X))
 

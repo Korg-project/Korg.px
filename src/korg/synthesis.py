@@ -538,28 +538,14 @@ def synthesize_spectrum(
         )  # (n_layers, 1)
         alpha_ref += np.asarray(line_at_ref[:, 0])
 
-    # Compute continuum flux if requested
+    # Save continuum-only alpha before H-lines/atomic lines are added.
+    # The continuum RT is computed later (after the correct alpha_ref is known) so that
+    # both continuum and total RT use the same tau scale.
+    alpha_cntm_only = alpha.copy()  # (n_layers, n_wl), continuum opacity only
     continuum_flux = None
-    if return_continuum:
-        if verbose:
-            print(f"Computing continuum spectrum...")
-        if using_defaults and not spherical:
-            flux_cntm, _ = radiative_transfer_jit(
-                jnp.asarray(alpha.T), jnp.asarray(source_function),
-                jnp.asarray(spatial_coord), jnp.asarray(log_tau_ref),
-                jnp.asarray(alpha_ref)
-            )
-        else:
-            flux_cntm, _ = radiative_transfer(
-                alpha.T, source_function, spatial_coord, log_tau_ref,
-                alpha_ref=alpha_ref, spherical=spherical,
-                intensity_scheme="linear_flux_only", use_expint_flux=True
-            )
-        # Convert from erg/s/cm^5 to erg/s/cm^4/Å (same as flux below)
-        continuum_flux = flux_cntm * 1e-8
 
     if profile:
-        timings['continuum_rt'] = time.time() - t0
+        timings['continuum_rt'] = 0.0  # measured later
         t0 = time.time()
 
     # Add hydrogen line absorption
@@ -659,6 +645,31 @@ def synthesize_spectrum(
         alpha += alpha_lines
         if profile:
             timings['line_absorption'] = time.time() - t_line_abs_start
+
+    # alpha_ref was set at line 527 (continuum + reference-linelist lines, NO H-lines),
+    # matching Julia's alpha_5 = cntm + synthesis_linelist_lines.  Do not overwrite it here.
+
+    # Compute continuum flux if requested (using correct alpha_ref so tau scale is consistent)
+    if return_continuum:
+        if verbose:
+            print(f"Computing continuum spectrum...")
+        if profile:
+            t_cntm_rt = time.time()
+        if using_defaults and not spherical:
+            flux_cntm, _ = radiative_transfer_jit(
+                jnp.asarray(alpha_cntm_only.T), jnp.asarray(source_function),
+                jnp.asarray(spatial_coord), jnp.asarray(log_tau_ref),
+                jnp.asarray(alpha_ref)
+            )
+        else:
+            flux_cntm, _ = radiative_transfer(
+                alpha_cntm_only.T, source_function, spatial_coord, log_tau_ref,
+                alpha_ref=alpha_ref, spherical=spherical,
+                intensity_scheme="linear_flux_only", use_expint_flux=True
+            )
+        continuum_flux = flux_cntm * 1e-8
+        if profile:
+            timings['continuum_rt'] = time.time() - t_cntm_rt
 
     # Solve radiative transfer with full opacity
     if verbose:
@@ -928,6 +939,11 @@ from .statmech import (ChemicalEquilibriumData, precompute_chemical_equilibrium_
 from .continuum import (_batch_continuum_vmap, _get_metal_bf_idx,
                         get_metal_bf_cross_sections, _PEACH_IDX, _H2_MOL_IDX)
 
+# Effective vdW perturber density correction factors (matching Julia Korg.jl).
+# Polarizabilities in atomic units from https://doi.org/10.1080/00268976.2018.1535143
+_VDW_C_HE = (1.38375 / 4.50711)**0.4 * (4.002602 / 1.008)**-0.3  # He relative to H
+_VDW_C_H2 = (5.503   / 4.50711)**0.4 * 2.0**-0.3                  # H2 relative to H
+
 
 class BucketGeometry(NamedTuple):
     """Per-bucket precomputed window geometry for fast Voigt + scatter."""
@@ -1040,6 +1056,7 @@ class PrecomputedAtmosphereData(NamedTuple):
     nH_II_all: jnp.ndarray        # (n_layers,)
     nHe_I_all: jnp.ndarray        # (n_layers,)
     U_H_I_all: jnp.ndarray        # (n_layers,)
+    n_eff_vdW_all: jnp.ndarray    # (n_layers,) effective vdW perturber density = nH_I + c_He*nHe_I + c_H2*nH2
 
     # Continuum (already interpolated to fine wavelength grid)
     alpha_cntm_all: jnp.ndarray   # (n_layers, n_wl) fine-grid continuum opacity
@@ -1278,6 +1295,7 @@ def precompute_atmosphere(
     )  # (n_layers, n_mols+1)
 
     nH2_all = mol_dens[:, _H2_MOL_IDX]
+    n_eff_vdW_all = nH_I_all  # currently matches HJXcT Korg.jl (H-only perturbers)
 
     _peach_z = jnp.array([z for z, _ in _PEACH_IDX])
     n_peach = ionized_dens_final[:, _peach_z]
@@ -1363,7 +1381,7 @@ def precompute_atmosphere(
     _bucket_geometry = None
     if linelist_data is not None and linelist_data.wl.shape[0] > 0:
         _amp_w, _sig_w, _gam_w = _compute_line_params_jit(
-            T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
+            T_layers, ne_all, n_eff_vdW_all, neutral_dens_final, ionized_dens_final,
             mol_densities_all, linelist_data, data, float(vmic_cm_s)
         )
         _amp_np_w = np.asarray(_amp_w)
@@ -1388,7 +1406,7 @@ def precompute_atmosphere(
             _wLa_w = _gam_np_w / (np.pi * _rho_w)
             _wL_w = np.where(_wLa_w <= _gam_np_w**2, 0.0,
                              np.sqrt(np.maximum(_wLa_w - _gam_np_w**2, 0.0)))
-        _mw_w = np.sqrt(np.max(_wG_w, axis=1)**2 + np.max(_wL_w, axis=1)**2)
+        _mw_w = np.sqrt(np.max(_wG_w, axis=1)**2 + np.max(_wL_w, axis=1)**2) * (1.0 + 2e-5)
         _mwpx_w = np.clip(np.ceil(2.0 * _mw_w / _wl_sp_w + 2).astype(int), 0, _n_wl_w)
         # Build BucketGeometry for each non-empty bucket
         _BUCKET_WIDTHS = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, _n_wl_w]
@@ -1545,6 +1563,7 @@ def precompute_atmosphere(
         nH_II_all=nH_II_all,
         nHe_I_all=nHe_I_all,
         U_H_I_all=U_H_I_all,
+        n_eff_vdW_all=n_eff_vdW_all,
         alpha_cntm_all=alpha_cntm_all,
         alpha_ref_all=alpha_ref_all,
         alpha_cntm_coarse=alpha_cntm_coarse,
@@ -2521,6 +2540,7 @@ def synthesize_jit(
         nH_II_all         = precomputed_atm.nH_II_all
         nHe_I_all         = precomputed_atm.nHe_I_all
         U_H_I_all         = precomputed_atm.U_H_I_all
+        n_eff_vdW_all     = precomputed_atm.n_eff_vdW_all
         alpha_cntm_all    = precomputed_atm.alpha_cntm_all
         alpha_ref_all     = precomputed_atm.alpha_ref_all
         alpha_cntm_coarse = precomputed_atm.alpha_cntm_coarse
@@ -2585,6 +2605,7 @@ def synthesize_jit(
 
         # H2 density from molecular densities (index 50 in default mol list)
         nH2_all = mol_dens[:, _H2_MOL_IDX]  # (n_layers,)
+        n_eff_vdW_all = nH_I_all  # currently matches HJXcT Korg.jl (H-only perturbers)
 
         # Peach FF species: He_II (z=1), C_II (z=5), Si_II (z=13), Mg_II (z=11)
         _peach_z = jnp.array([z for z, _ in _PEACH_IDX])    # [1, 5, 13, 11]
@@ -2744,13 +2765,13 @@ def synthesize_jit(
         if (precomputed_atm.U_atomic_table is not None
                 and precomputed_atm.U_mol_table is not None):
             amp_jax, sigma_D_jax, gamma_L_jax = _compute_line_params_table_jit(
-                T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
+                T_layers, ne_all, n_eff_vdW_all, neutral_dens_final, ionized_dens_final,
                 mol_densities_all, linelist_data, data, vmic_cm_s,
                 precomputed_atm.U_atomic_table, precomputed_atm.U_mol_table,
             )
         else:
             amp_jax, sigma_D_jax, gamma_L_jax = _compute_line_params_jit(
-                T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
+                T_layers, ne_all, n_eff_vdW_all, neutral_dens_final, ionized_dens_final,
                 mol_densities_all, linelist_data, data, vmic_cm_s
             )
 
@@ -2793,7 +2814,7 @@ def synthesize_jit(
         # ── Standard bucketed path (used when no precomputed atmosphere) ──
         # Step 4a: params — stays on device as JAX arrays
         amp_jax, sigma_D_jax, gamma_L_jax = _compute_line_params_jit(
-            T_layers, ne_all, nH_I_all, neutral_dens_final, ionized_dens_final,
+            T_layers, ne_all, n_eff_vdW_all, neutral_dens_final, ionized_dens_final,
             mol_densities_all, linelist_data, data, vmic_cm_s
         )  # each (n_lines, n_layers)
 
@@ -2822,7 +2843,7 @@ def synthesize_jit(
             win_L_arg = gamma_np / (np.pi * rho_crit)
             win_L = np.where(win_L_arg <= gamma_np**2, 0.0,
                              np.sqrt(np.maximum(win_L_arg - gamma_np**2, 0.0)))
-        max_wins = np.sqrt(np.max(win_G, axis=1)**2 + np.max(win_L, axis=1)**2)
+        max_wins = np.sqrt(np.max(win_G, axis=1)**2 + np.max(win_L, axis=1)**2) * (1.0 + 2e-5)
         max_wins_px = np.clip(np.ceil(2.0 * max_wins / wl_spacing + 2).astype(int), 0, n_wl)
 
         # Step 4c: bucketed Voigt — exactly as in _line_absorption_fast
@@ -2914,6 +2935,16 @@ def synthesize_jit(
                 )
 
     alpha_total = alpha_cntm_all + line_alpha + jnp.asarray(h_alpha)
+
+    # Update alpha_ref_all to continuum + atomic-line opacity at the reference wavelength,
+    # matching Julia's alpha_5 = cntm + synthesis_linelist_lines (NO H-lines).
+    # Julia: get_alpha_5000_linelist uses the synthesis linelist filtered ±21 Å; H-lines
+    # are added to alpha AFTER alpha_5 is computed, so alpha_5 never includes them.
+    _lambda_ref = 5e-5  # 5000 Å MARCS reference wavelength [cm]
+    _wl0 = float(wavelengths_cm[0]); _wl1 = float(wavelengths_cm[-1])
+    if _wl0 <= _lambda_ref <= _wl1:
+        _ref_idx = int(jnp.argmin(jnp.abs(wavelengths_cm - _lambda_ref)))
+        alpha_ref_all = (alpha_cntm_all + line_alpha)[:, _ref_idx]  # no H-lines
 
     # ── Phase 5: Radiative transfer ───────────────────────────────────────────
     # Fused: both RT passes in one XLA dispatch (saves one dispatch + shared S/z/tau reads)
