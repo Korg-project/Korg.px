@@ -173,8 +173,6 @@ def radiative_transfer_single_wavelength(
     if intensity_scheme == "linear_flux_only":
         if use_expint_flux:
             # Fastest: use exponential integral formula
-            # compute_F_flux_only_expint returns the value without the 2π factor
-            # Julia multiplies by 2π at the end (line 136 in RadiativeTransfer.jl)
             flux = 2.0 * jnp.pi * compute_F_flux_only_expint(tau, S)
         else:
             # Fast: compute intensity along vertical ray, then approximate flux
@@ -329,12 +327,44 @@ def _compute_tau_anchored_planar(alpha, log_tau_ref, alpha_ref):
     return jnp.concatenate([jnp.array([0.0]), jnp.cumsum(dtau)])
 
 
+# Precomputed 20-point GL nodes/weights on [0,1] — matches Julia's mu_values=20 default.
+_mu_gl_nodes, _mu_gl_weights = generate_mu_grid(20)
+_mu_gl_nodes = jnp.array(_mu_gl_nodes)
+_mu_gl_weights = jnp.array(_mu_gl_weights)
+
+
+def _compute_F_gl(tau, S):
+    """Flux via 20-pt Gauss-Legendre quadrature over mu (matches Julia linear_flux_only default).
+
+    For piecewise-linear S(tau), the exact intensity at angle mu contributes:
+      I_i(mu) = (S_i + m_i*mu) exp(-tau_i/mu) - (S_{i+1} + m_i*mu) exp(-tau_{i+1}/mu)
+    where m_i = (S_{i+1} - S_i) / (tau_{i+1} - tau_i).
+    F = 2pi * sum_j w_j * I(mu_j) * mu_j  (caller multiplies by 2pi).
+    """
+    tau_i = tau[:-1]
+    tau_ip1 = tau[1:]
+    S_i = S[:-1]
+    S_ip1 = S[1:]
+    delta_tau = tau_ip1 - tau_i
+    delta_tau_safe = jnp.where(delta_tau > 0, delta_tau, 1.0)
+    m = (S_ip1 - S_i) / delta_tau_safe
+
+    def I_at_mu(mu):
+        exp_i = jnp.exp(-tau_i / mu)
+        exp_ip1 = jnp.exp(-tau_ip1 / mu)
+        return jnp.sum((S_i + m * mu) * exp_i - (S_ip1 + m * mu) * exp_ip1)
+
+    I_mu = jax.vmap(I_at_mu)(_mu_gl_nodes)
+    return jnp.sum(_mu_gl_weights * I_mu * _mu_gl_nodes)
+
+
 @jit
 def radiative_transfer_single_wavelength_jit(alpha, S, log_tau_ref, alpha_ref):
     """
     JIT-compatible single wavelength radiative transfer.
 
-    Uses exponential integral flux method for maximum performance.
+    Uses 20-point Gauss-Legendre quadrature over mu, matching Julia's
+    default linear_flux_only + mu_values=20 scheme.
 
     Parameters
     ----------

@@ -46,11 +46,11 @@ def test_synthesis_basic():
         pytest.skip("Synthesis functions not available (missing data files)")
 
     # Check if MARCS atmosphere grid is available
-    import os
-    korg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    marcs_file = os.path.join(korg_dir, "src", "korg", "data", "SDSS_MARCS_atmospheres.h5")
-    if not os.path.exists(marcs_file):
-        pytest.skip("MARCS atmosphere grid not available (large file from Julia artifacts)")
+    from korg.marcs_interpolation import get_marcs_grid_path
+    try:
+        marcs_file = get_marcs_grid_path(auto_download=False)
+    except Exception:
+        pytest.skip("MARCS atmosphere grid not available (run: python -c \"from korg.marcs_interpolation import get_marcs_grid_path; get_marcs_grid_path(auto_download=True)\")")
 
     # Get solar abundances
     A_X = korg.format_A_X()
@@ -62,9 +62,13 @@ def test_synthesis_basic():
     linelist = korg.get_VALD_solar_linelist()
 
     # Synthesize a small wavelength range
-    wavelengths, flux, continuum = korg.synthesize(
-        atm, linelist, A_X, (5000.0, 5010.0)
+    wavelengths_ang = np.linspace(5000.0, 5010.0, 50)
+    result = korg.synthesize(
+        atm, linelist, wavelengths_ang, A_X, verbose=False
     )
+    wavelengths = result.wavelengths
+    flux = result.flux / result.continuum  # continuum-normalized
+    continuum = result.continuum
 
     # Check outputs
     assert len(wavelengths) > 0
