@@ -109,7 +109,7 @@ class TestCalculateEWs:
         flux = np.asarray(result.flux)
         cntm = np.asarray(result.continuum)
         depth = 1.0 - flux / cntm
-        ew_numerical = np.trapz(depth, wls) * 1e3  # Å → mÅ
+        ew_numerical = np.trapezoid(depth, wls) * 1e3  # Å → mÅ
 
         assert abs(ew_calc - ew_numerical) / ew_numerical < 0.10, \
             f"calculate_EWs ({ew_calc:.2f} mÅ) differs >10% from numerical " \

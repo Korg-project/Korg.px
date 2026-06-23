@@ -629,7 +629,7 @@ def calculate_EWs(atm, linelist, A_X, ew_window_size=2.0, wl_step=0.01,
         for k, li in enumerate(line_indices):
             b0 = boundaries[k]
             b1 = boundaries[k + 1] + 1
-            EWs[li] = np.trapz(absorption[b0:b1], wl_range[b0:b1]) * 1e3  # Å → mÅ
+            EWs[li] = np.trapezoid(absorption[b0:b1], wl_range[b0:b1]) * 1e3  # Å → mÅ
 
     return EWs
 
