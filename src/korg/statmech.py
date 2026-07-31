@@ -876,6 +876,21 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
                     pf_orig_z[Z-1, charge, :n_temps] = np.asarray(cs.z)
                     pf_orig_n[Z-1, charge]            = n_temps
 
+    # Some (element, charge) combinations have no partition function at all — H III is
+    # the only one, since hydrogen cannot be doubly ionized. A one-knot placeholder makes
+    # the spline evaluation degenerate and return NaN. The value is masked downstream, but
+    # a masked NaN still poisons reverse-mode gradients, so give those entries a real
+    # two-knot table that evaluates to a constant 1 with zero derivative.
+    for Z_idx in range(MAX_ATOMIC_NUMBER):
+        for charge in range(3):
+            if pf_orig_n[Z_idx, charge] >= 2:
+                continue
+            pf_orig_t[Z_idx, charge, :2] = [log_T_np[0], log_T_np[-1]]
+            pf_orig_u[Z_idx, charge, :2] = [1.0, 1.0]
+            pf_orig_h[Z_idx, charge, :2] = [0.0, log_T_np[-1] - log_T_np[0]]
+            pf_orig_z[Z_idx, charge, :2] = [0.0, 0.0]
+            pf_orig_n[Z_idx, charge] = 2
+
     # Process molecules
     molecules_all = list(log_equilibrium_constants.keys())
     mol_atoms_list = []
@@ -1052,6 +1067,27 @@ def _cubic_spline_eval_logK(log_T, data, mol_idx):
             + zi1 * (log_T_c - ti )**3 / (6.0 * hi1)
             + (ui1 / hi1 - zi1 * hi1 / 6.0) * (log_T_c - ti )
             + (ui  / hi1 - zi  * hi1 / 6.0) * (ti1 - log_T_c))
+
+
+def _mol_log_nK_all_jit(T, data):
+    """log₁₀ number-density equilibrium constants for every molecule at once.
+
+    Same cubic spline as :func:`_cubic_spline_eval_logK`, evaluated for all molecules in
+    one shot so the chemical equilibrium residual and Jacobian stay scan-free.
+    """
+    log_T = jnp.log(T)
+    t_grid = data.log_T_grid
+    log_T_c = jnp.clip(log_T, t_grid[0], t_grid[-1])
+    i = jnp.clip(jnp.searchsorted(t_grid, log_T_c, side='right') - 1, 0, t_grid.shape[0] - 2)
+    ti, ti1 = t_grid[i], t_grid[i + 1]
+    hi1 = data.log_T_h[i + 1]
+    u_i, u_i1 = data.mol_log_K_values[:, i], data.mol_log_K_values[:, i + 1]
+    z_i, z_i1 = data.mol_log_K_z[:, i], data.mol_log_K_z[:, i + 1]
+    log_K_p = (z_i * (ti1 - log_T_c) ** 3 / (6.0 * hi1)
+               + z_i1 * (log_T_c - ti) ** 3 / (6.0 * hi1)
+               + (u_i1 / hi1 - z_i1 * hi1 / 6.0) * (log_T_c - ti)
+               + (u_i / hi1 - z_i * hi1 / 6.0) * (ti1 - log_T_c))
+    return log_K_p - (data.mol_n_atoms - 1.0) * jnp.log10(kboltz_cgs * T)
 
 
 def _get_log_nK_jit(mol_idx, log_T, data):
@@ -1373,309 +1409,246 @@ _compute_saha_weights_batch_jit = jax.jit(
 )
 
 
-# ── Newton solver for chemical equilibrium (matches Julia's _solve_chemical_equilibrium) ──
+# ── Log-space chemical equilibrium for the batched/JIT path (Korg.jl v1.2) ────
+#
+# The system, unknowns and scaling are identical to statmech.chemical_equilibrium;
+# what differs is that the Jacobian is written out by hand rather than obtained from
+# jax.jacfwd, and the continuation schedule is fixed rather than adaptive so that the
+# whole solve is one jittable, vmappable, reverse-mode-differentiable kernel.
+#
+# Unknowns  y = [log10 n(X I) for Z = 1..92, log10 nₑ].
+# Writing L = ln 10 and using
+#     n_I[i]    = 10^(y_i)
+#     n_II[i]   = 10^(y_i + a_i - y_e)          a_i = log10 wII  at nₑ = 1
+#     n_III[i]  = 10^(y_i + b_i - 2 y_e)        b_i = log10 wIII at nₑ = 1
+#     n_mol[m]  = 10^(Σ_i C[m,i] y_i - logK[m] + logξ + s_m (a_f(m) - y_e))
+#     n_H⁻      = 10^(logK_H⁻ + y_0 + y_e + logξ)
+#     n_nuclei  = nₜ - nₑ + Σ_m (k_m - 1) n_mol[m]
+# with C[m,i] the number of atoms of element i in molecule m, k_m the total atom count,
+# s_m = 1 for the singly ionized diatomics and 0 otherwise, and f(m) the charged atom,
+# the unscaled residuals are
+#     G_i = Σ_m C[m,i] n_mol[m] + δ_i0 n_H⁻ + n_I[i] + n_II[i] + n_III[i] - A_i n_nuclei
+#     G_e = Σ_m q_m n_mol[m] - n_H⁻ + Σ_i (n_II[i] + 2 n_III[i]) - nₑ
+# and F_i = G_i / (A_i nₜ), F_e = G_e / nₜ.
+#
+# Every unknown appears only through 10^(linear combination), so each derivative is L
+# times the term itself with an integer coefficient. Because the residual scaling is a
+# constant, the Jacobian of F is just the Jacobian of G divided by the same constants —
+# no extra normalisation-derivative term is needed.
 
-def _chem_eq_residuals_newton(x, T, n_total, abundances, data):
+_LN10 = 2.302585092994046
+
+# Continuation schedule for the batched solve. Under vmap a data-dependent number of
+# annealing steps would have to be materialised for every layer anyway, so we walk a
+# fixed schedule for all layers: dense near logξ = 0, where molecules actually bite.
+_XI_SCHEDULE = (-50.0, -12.0, -8.0, -5.0, -3.5, -2.5, -1.75, -1.25,
+                -0.9, -0.6, -0.4, -0.25, -0.12, 0.0)
+_XI_INNER_ITERS = 8
+# Newton steps at logξ = 0 after the schedule, to polish to full convergence.
+_XI_FINAL_ITERS = 24
+
+
+def _chem_eq_log_terms(y, T, n_total, abundances, data, log_xi):
+    """Species densities and the nucleus budget at state ``y``.
+
+    Shared by the residual and Jacobian so the exponentials are formed once.
     """
-    93-dim chemical equilibrium residuals with explicit temperature.
-
-    State vector x: x[:92] = neutral_fractions, x[92] = ne/(n_total·1e-5).
-    Matches Julia's `setup_chemical_equilibrium_residuals` / `residuals!` exactly.
-    """
-    nf = jnp.abs(x[:MAX_ATOMIC_NUMBER])
-    ne = jnp.maximum(jnp.abs(x[MAX_ATOMIC_NUMBER]) * n_total * 1e-5, 1.0)
-
-    atom_dens = abundances * (n_total - ne)          # (92,)
-    neutral_dens = atom_dens * nf                    # (92,)
-
-    # Saha weights with ne factored out: wII = wII_ne1/ne, wIII = wIII_ne1/ne²
-    wII_ne1, wIII_ne1 = _compute_saha_weights_jit(T, 1.0, data)
-    wII = wII_ne1 / ne
-    wIII = wIII_ne1 / ne ** 2
-
-    # Element and electron conservation residuals (before molecules)
-    F_atom = atom_dens - (1.0 + wII + wIII) * neutral_dens   # (92,)
-    F_ne   = jnp.sum((wII + 2.0 * wIII) * neutral_dens) - ne
-
-    F = jnp.concatenate([F_atom, jnp.array([F_ne])])  # (93,)
-
-    # Molecular corrections via lax.scan (matches Julia's molecule loop)
-    log_T = jnp.log(T)
-    log_nd = jnp.log10(jnp.maximum(neutral_dens, 1e-300))
-
-    def process_mol(F, mol_idx):
-        atoms  = data.mol_atoms_array[mol_idx]       # (6,) 0-indexed Z, -1=padding
-        charge = data.mol_charges[mol_idx]
-        n_ats  = data.mol_n_atoms[mol_idx]
-        log_nK = _get_log_nK_jit(mol_idx, log_T, data)
-        valid  = jnp.isfinite(log_nK)
-
-        def neutral_mol(F):
-            log_sum = jnp.sum(jnp.where(jnp.arange(6) < n_ats, log_nd[atoms], 0.0))
-            n_mol   = jnp.power(10.0, jnp.clip(log_sum - log_nK, -300.0, 300.0))
-            upd = jnp.where(jnp.arange(6) < n_ats, -n_mol, 0.0)
-            F2 = F.at[atoms[0]].add(jnp.where(n_ats > 0, upd[0], 0.0))
-            F2 = F2.at[atoms[1]].add(jnp.where(n_ats > 1, upd[1], 0.0))
-            F2 = F2.at[atoms[2]].add(jnp.where(n_ats > 2, upd[2], 0.0))
-            F2 = F2.at[atoms[3]].add(jnp.where(n_ats > 3, upd[3], 0.0))
-            F2 = F2.at[atoms[4]].add(jnp.where(n_ats > 4, upd[4], 0.0))
-            F2 = F2.at[atoms[5]].add(jnp.where(n_ats > 5, upd[5], 0.0))
-            return F2
-
-        def ionic_mol(F):
-            # First atom is the ionized species (lower Z, same convention as Julia)
-            idx1, idx2 = atoms[0], atoms[1]
-            log_n_ion1 = log_nd[idx1] + jnp.log10(jnp.maximum(wII[idx1], 1e-300))
-            n_mol = jnp.power(10.0, jnp.clip(log_n_ion1 + log_nd[idx2] - log_nK, -300.0, 300.0))
-            F2 = F.at[idx1].add(-n_mol)
-            F2 = F2.at[idx2].add(-n_mol)
-            F2 = F2.at[-1].add(n_mol)   # ionic molecule contributes to electron balance
-            return F2
-
-        F_upd = jax.lax.cond(
-            valid,
-            lambda F: jax.lax.cond(charge == 0, neutral_mol, ionic_mol, F),
-            lambda F: F,
-            F,
-        )
-        return F_upd, None
-
-    n_mols = data.mol_charges.shape[0]
-    if n_mols > 0:
-        F, _ = jax.lax.scan(process_mol, F, jnp.arange(n_mols))
-
-    # Normalize: element residuals by total atom density, electron by ne·1e-5
-    F = F.at[:MAX_ATOMIC_NUMBER].set(
-        F[:MAX_ATOMIC_NUMBER] / jnp.maximum(atom_dens, 1e-300)
-    )
-    F = F.at[-1].set(F[-1] / jnp.maximum(ne * 1e-5, 1e-300))
-
-    return F
-
-
-def _chem_eq_analytical_jacobian(x, F_val, T, n_total, abundances, data):
-    """
-    Analytical 93x93 Jacobian for the normalised chemical equilibrium residuals.
-
-    Fully vectorized over molecules — no lax.scan — so it composes safely
-    with the outer lax.scan over atmosphere layers (task 6).
-    """
-    N = MAX_ATOMIC_NUMBER          # 92
-    ne_scale = n_total * 1e-5
-
-    nf = jnp.abs(x[:N])
-    ne_scaled_raw = jnp.abs(x[N])
-    ne = jnp.maximum(ne_scaled_raw * ne_scale, 1.0)
-
-    atom_dens    = abundances * (n_total - ne)        # (N,)
-    neutral_dens = atom_dens * nf                     # (N,)
+    log_ne = y[MAX_ATOMIC_NUMBER]
+    log_n_I = y[:MAX_ATOMIC_NUMBER]
 
     wII_ne1, wIII_ne1 = _compute_saha_weights_jit(T, 1.0, data)
-    wII  = wII_ne1  / ne
-    wIII = wIII_ne1 / ne ** 2
-    W    = 1.0 + wII + wIII
+    log_wII = jnp.log10(jnp.maximum(wII_ne1, 1e-320))
+    log_wIII = jnp.log10(jnp.maximum(wIII_ne1, 1e-320))
 
-    log_T = jnp.log(T)
-    log_nd = jnp.log10(jnp.maximum(neutral_dens, 1e-300))  # (N,)
+    n_I = _pow10(log_n_I)
+    n_II = _pow10(log_n_I + log_wII - log_ne)
+    n_III = _pow10(log_n_I + log_wIII - 2.0 * log_ne)
+    ne = _pow10(log_ne)
 
-    inv_n_minus_ne = 1.0 / jnp.maximum(n_total - ne, 1e-300)
-    safe_nf = jnp.maximum(nf, 1e-300)
-    safe_ad = jnp.maximum(atom_dens, 1e-300)
+    # Molecules. mol_atom_consume is the C matrix: atoms of each element per molecule.
+    C = data.mol_atom_consume
+    log_nK = _mol_log_nK_all_jit(T, data)
+    is_charged = (data.mol_charges != 0).astype(jnp.float64)
+    first_atom = jnp.maximum(data.mol_atoms_array[:, 0], 0)
 
-    n_mols = data.mol_charges.shape[0]
+    log_n_mol = (C @ log_n_I - log_nK + log_xi
+                 + is_charged * (log_wII[first_atom] - log_ne))
+    # Molecules whose equilibrium constant is undefined at this T contribute nothing.
+    n_mol = jnp.where(jnp.isfinite(log_nK), _pow10(log_n_mol), 0.0)
 
-    # -------------------------------------------------------------------------
-    # Vectorized log_nK for all molecules at once (replaces per-molecule calls)
-    # -------------------------------------------------------------------------
-    log_T_c = jnp.clip(log_T, data.log_T_grid[0], data.log_T_grid[-1])
-    i_seg = jnp.clip(
-        jnp.searchsorted(data.log_T_grid, log_T_c, side='right') - 1,
-        0, data.log_T_grid.shape[0] - 2
-    )
-    ti   = data.log_T_grid[i_seg]
-    ti1  = data.log_T_grid[i_seg + 1]
-    hi1  = data.log_T_h[i_seg + 1]
-    u_i  = data.mol_log_K_values[:, i_seg]    # (n_mols,)
-    u_i1 = data.mol_log_K_values[:, i_seg + 1]
-    z_i  = data.mol_log_K_z[:, i_seg]
-    z_i1 = data.mol_log_K_z[:, i_seg + 1]
-    log_K_p = (z_i   * (ti1 - log_T_c) ** 3 / (6.0 * hi1)
-               + z_i1 * (log_T_c - ti ) ** 3 / (6.0 * hi1)
-               + (u_i1 / hi1 - z_i1 * hi1 / 6.0) * (log_T_c - ti )
-               + (u_i  / hi1 - z_i  * hi1 / 6.0) * (ti1 - log_T_c))
-    log_nK = log_K_p - (data.mol_n_atoms - 1) * jnp.log10(kboltz_cgs * T)
-    valid  = jnp.isfinite(log_nK)  # (n_mols,)
+    n_Hminus = _pow10(jnp.log10(Hminus_nK(T)) + log_n_I[0] + log_ne + log_xi)
 
-    neutral_mask = (data.mol_charges == 0)  # (n_mols,)
-    ionic_mask   = ~neutral_mask             # (n_mols,)
+    n_nuclei = n_total - ne + jnp.sum((data.mol_n_atoms - 1.0) * n_mol)
 
-    # Replace -1 padding with 0 so we can use as gather indices safely
-    safe_mol_atoms = jnp.maximum(data.mol_atoms_array, 0)  # (n_mols, 6)
+    return (n_I, n_II, n_III, ne, n_mol, n_Hminus, n_nuclei,
+            C, is_charged, log_wII)
 
-    # -------------------------------------------------------------------------
-    # Neutral molecules — vectorized over all n_mols simultaneously
-    # -------------------------------------------------------------------------
-    # slot_valid[m, k] = True when slot k holds a real atom for molecule m
-    slot_valid = jnp.arange(6)[None, :] < data.mol_n_atoms[:, None]  # (n_mols, 6)
 
-    # cnt_matrix[m, Z] = number of times element Z appears in molecule m
-    # Shape: (n_mols, 6, N) one-hot, summed over slots → (n_mols, N)
-    cnt_matrix = jnp.sum(
-        jnp.where(
-            slot_valid[:, :, None],
-            (safe_mol_atoms[:, :, None] == jnp.arange(N)[None, None, :]),
-            False,
-        ).astype(jnp.float32),
-        axis=1,
-    )  # (n_mols, N)
+def _chem_eq_log_residuals(y, T, n_total, abundances, data, log_xi=0.0):
+    """Scaled residuals of the v1.2 chemical equilibrium system in log₁₀ space."""
+    (n_I, n_II, n_III, ne, n_mol, n_Hminus, n_nuclei,
+     C, is_charged, _) = _chem_eq_log_terms(y, T, n_total, abundances, data, log_xi)
 
-    # log-sum of neutral densities over atoms (with slot masking)
-    log_nd_atoms = log_nd[safe_mol_atoms]   # (n_mols, 6)
-    log_sum = jnp.sum(jnp.where(slot_valid, log_nd_atoms, 0.0), axis=1)  # (n_mols,)
+    G_atom = C.T @ n_mol + n_I + n_II + n_III - abundances * n_nuclei
+    G_atom = G_atom.at[0].add(n_Hminus)
 
-    n_mol_neutral = jnp.where(
-        neutral_mask & valid,
-        jnp.power(10.0, jnp.clip(log_sum - log_nK, -300.0, 300.0)),
-        0.0,
-    )  # (n_mols,)
+    G_e = (jnp.sum(data.mol_charges * n_mol) - n_Hminus
+           + jnp.sum(n_II + 2.0 * n_III) - ne)
 
-    # dJnfnf neutral:  -sum_m n_mol[m] * outer(cnt[m]/ad, cnt[m]/nf)
-    col_fac = cnt_matrix / safe_ad[None, :]   # (n_mols, N)
-    row_fac = cnt_matrix / safe_nf[None, :]   # (n_mols, N)
-    dJnfnf_neutral = -jnp.einsum('m,mi,mj->ij', n_mol_neutral, col_fac, row_fac)  # (N, N)
+    F_atom = G_atom / (abundances * n_total)
+    F_e = G_e / n_total
+    return jnp.concatenate([F_atom, jnp.reshape(F_e, (1,))])
 
-    # dJne_col neutral: sum_m n_mol[m]*n_ats[m]*ne_scale*inv_n_minus_ne * cnt[m]/ad
-    dJne_col_neutral = jnp.einsum(
-        'm,mi->i',
-        n_mol_neutral * data.mol_n_atoms * ne_scale * inv_n_minus_ne,
-        col_fac,
-    )  # (N,)
 
-    # -------------------------------------------------------------------------
-    # Ionic molecules — scatter 4 entries per molecule into (N, N)
-    # -------------------------------------------------------------------------
-    idx1 = safe_mol_atoms[:, 0]   # (n_mols,)
-    idx2 = safe_mol_atoms[:, 1]   # (n_mols,)
+def _chem_eq_log_jacobian(y, T, n_total, abundances, data, log_xi=0.0):
+    """
+    Analytic 93x93 Jacobian of :func:`_chem_eq_log_residuals`.
 
-    log_n_ion1 = log_nd[idx1] + jnp.log10(jnp.maximum(wII[idx1], 1e-300))
-    n_mol_ionic = jnp.where(
-        ionic_mask & valid,
-        jnp.power(10.0, jnp.clip(log_n_ion1 + log_nd[idx2] - log_nK, -300.0, 300.0)),
-        0.0,
-    )  # (n_mols,)
+    Fully vectorised over molecules — no scan or cond — so it composes with an outer
+    vmap over atmosphere layers and stays reverse-mode differentiable.
+    """
+    N = MAX_ATOMIC_NUMBER
+    (n_I, n_II, n_III, ne, n_mol, n_Hminus, _,
+     C, is_charged, _) = _chem_eq_log_terms(y, T, n_total, abundances, data, log_xi)
 
-    # Four (row, col) pairs per molecule: {idx1,idx2} × {idx1,idx2}
-    ion_rows = jnp.stack([idx1, idx1, idx2, idx2], axis=1)   # (n_mols, 4)
-    ion_cols = jnp.stack([idx1, idx2, idx1, idx2], axis=1)   # (n_mols, 4)
-    ion_jac_vals = (-n_mol_ionic[:, None]
-                    / (safe_nf[ion_cols] * safe_ad[ion_rows]))
-    ion_jac_vals = jnp.where(ionic_mask[:, None], ion_jac_vals, 0.0)
-    lin_idx = ion_rows * N + ion_cols                          # (n_mols, 4)
-    dJnfnf_ionic = (jnp.zeros(N * N)
-                    .at[lin_idx.reshape(-1)].add(ion_jac_vals.reshape(-1))
-                    .reshape(N, N))
+    extra_nuclei = data.mol_n_atoms - 1.0     # (n_mol,) nuclei locked up per molecule
+    q = data.mol_charges                       # (n_mol,)
 
-    # mol_dne_row (ionic only): +n_mol/nf at {idx1, idx2}
-    dne_row_idxs = jnp.stack([idx1, idx2], axis=1)           # (n_mols, 2)
-    dne_row_vals = jnp.stack([n_mol_ionic / safe_nf[idx1],
-                               n_mol_ionic / safe_nf[idx2]], axis=1)
-    dne_row_vals = jnp.where(ionic_mask[:, None], dne_row_vals, 0.0)
-    mol_dne_row = (jnp.zeros(N)
-                   .at[dne_row_idxs.reshape(-1)].add(dne_row_vals.reshape(-1)))
+    # ∂G_i/∂y_j -----------------------------------------------------------------
+    #   molecules:  Σ_m C[m,i] n_mol[m] C[m,j]
+    #   H⁻:         δ_i0 δ_j0 n_H⁻
+    #   atoms:      δ_ij (n_I + n_II + n_III)_i
+    #   nuclei:     -A_i Σ_m (k_m - 1) n_mol[m] C[m,j]
+    mol_block = (C * n_mol[:, None]).T @ C                     # (N, N)
+    nuclei_row = (extra_nuclei * n_mol) @ C                    # (N,)
+    J_aa = mol_block - jnp.outer(abundances, nuclei_row)
+    J_aa = J_aa + jnp.diag(n_I + n_II + n_III)
+    J_aa = J_aa.at[0, 0].add(n_Hminus)
 
-    # mol_dne_col (ionic): -dn_mol_dne/ad at {idx1, idx2}
-    dn_mol_dne_ion = n_mol_ionic * (-ne_scale / ne - 2.0 * ne_scale * inv_n_minus_ne)
-    dne_col_idxs = jnp.stack([idx1, idx2], axis=1)
-    dne_col_vals = jnp.stack([-dn_mol_dne_ion / safe_ad[idx1],
-                               -dn_mol_dne_ion / safe_ad[idx2]], axis=1)
-    dne_col_vals = jnp.where(ionic_mask[:, None], dne_col_vals, 0.0)
-    mol_dne_col_ionic = (jnp.zeros(N)
-                         .at[dne_col_idxs.reshape(-1)].add(dne_col_vals.reshape(-1)))
+    # ∂G_i/∂y_e -----------------------------------------------------------------
+    #   molecules lose a factor of nₑ only through the ionized constituent (s_m)
+    mol_charged = n_mol * is_charged
+    d_nuclei_d_ye = -ne - jnp.sum(extra_nuclei * mol_charged)
+    J_ae = (-(C.T @ mol_charged)
+            - n_II - 2.0 * n_III
+            - abundances * d_nuclei_d_ye)
+    J_ae = J_ae.at[0].add(n_Hminus)
 
-    # dG92_mol_dne scalar (ionic only, replaces second lax.scan)
-    dG92_mol_dne = jnp.sum(
-        jnp.where(ionic_mask & valid,
-                  -n_mol_ionic * ne_scale * (1.0 / ne + 2.0 * inv_n_minus_ne),
-                  0.0)
-    )
+    # ∂G_e/∂y_j -----------------------------------------------------------------
+    J_ea = (q * n_mol) @ C + n_II + 2.0 * n_III
+    J_ea = J_ea.at[0].add(-n_Hminus)
 
-    mol_Jnfnf   = dJnfnf_neutral + dJnfnf_ionic
-    mol_dne_col = dJne_col_neutral + mol_dne_col_ionic
+    # ∂G_e/∂y_e -----------------------------------------------------------------
+    J_ee = (-jnp.sum(q * mol_charged) - n_Hminus
+            - jnp.sum(n_II + 4.0 * n_III) - ne)
 
-    # -------------------------------------------------------------------------
-    # Assemble the four Jacobian blocks
-    # -------------------------------------------------------------------------
-    J_nf_nf = -jnp.diag(W) + mol_Jnfnf
-
-    G_atom_norm = 1.0 - W * nf
-    dFatom_dne  = ne_scale * (-G_atom_norm * inv_n_minus_ne + (wII + 2.0 * wIII) * nf / ne)
-    norm_corr   = F_val[:N] * ne_scale * inv_n_minus_ne
-    J_ne_col    = dFatom_dne + mol_dne_col + norm_corr
-
-    ne_norm  = jnp.maximum(ne * 1e-5, 1e-300)
-    J_ne_row = ((wII + 2.0 * wIII) * atom_dens + mol_dne_row) / ne_norm
-
-    dG92_atomic_dne = (
-        -ne_scale * jnp.sum(
-            (wII * (1.0 / ne + inv_n_minus_ne)
-             + 2.0 * wIII * (2.0 / ne + inv_n_minus_ne)) * neutral_dens
-        ) - ne_scale
-    )
-    J_ne_ne = ((dG92_atomic_dne + dG92_mol_dne) / ne_norm
-               - F_val[N] * ne_scale * 1e-5 / ne_norm)
-
+    # Assemble, apply the ln(10) from d(10^u)/du, then the constant residual scaling.
     J = jnp.zeros((N + 1, N + 1))
-    J = J.at[:N, :N].set(J_nf_nf)
-    J = J.at[:N,  N].set(J_ne_col)
-    J = J.at[N,  :N].set(J_ne_row)
-    J = J.at[N,   N].set(J_ne_ne)
+    J = J.at[:N, :N].set(J_aa)
+    J = J.at[:N, N].set(J_ae)
+    J = J.at[N, :N].set(J_ea)
+    J = J.at[N, N].set(J_ee)
+    J = J * _LN10
 
-    sign_x = jnp.sign(x)
-    sign_x = jnp.where(sign_x == 0, 1.0, sign_x)
-    J = J * sign_x[jnp.newaxis, :]
+    scale = jnp.concatenate([abundances * n_total,
+                             jnp.reshape(jnp.asarray(n_total, dtype=J.dtype), (1,))])
+    return J / scale[:, None]
 
-    return J
+
+@jax.custom_jvp
+def _chem_eq_solve_log(T, n_total, abundances, data, y0):
+    """
+    Run the annealed, step-clipped Newton solve and return the solution in log₁₀ space.
+
+    The iteration itself is not differentiated. At the solution F(y*, θ) = 0, so the
+    implicit function theorem gives dy*/dθ = -J⁻¹ ∂F/∂θ exactly, using the analytic
+    Jacobian we already form each step. That is both cheaper and better conditioned than
+    unrolling the annealing schedule, and it avoids propagating cotangents through the
+    guarded steps below, whose ``where``s are there to survive divergence in the forward
+    pass and would otherwise poison the gradient with NaN.
+    """
+    def newton_step(y, log_xi):
+        F = _chem_eq_log_residuals(y, T, n_total, abundances, data, log_xi)
+        J = _chem_eq_log_jacobian(y, T, n_total, abundances, data, log_xi)
+        step = jnp.linalg.solve(J, -F)
+        step = jnp.where(jnp.isfinite(step), step, 0.0)
+        # Clip so no component moves more than one decade, as Korg's clipped_newton does.
+        smax = jnp.max(jnp.abs(step))
+        alpha = jnp.where(smax > 1.0, 1.0 / smax, 1.0)
+        y_new = y + alpha * step
+        # A diverged step leaves y unchanged rather than poisoning the rest of the walk.
+        return jnp.where(jnp.all(jnp.isfinite(y_new)), y_new, y)
+
+    y = y0
+    for log_xi in _XI_SCHEDULE:
+        y = jax.lax.fori_loop(0, _XI_INNER_ITERS,
+                              lambda _, yy, lx=log_xi: newton_step(yy, lx), y)
+    return jax.lax.fori_loop(0, _XI_FINAL_ITERS, lambda _, yy: newton_step(yy, 0.0), y)
+
+
+@_chem_eq_solve_log.defjvp
+def _chem_eq_solve_log_jvp(primals, tangents):
+    T, n_total, abundances, data, y0 = primals
+    dT, dn_total, dabundances = tangents[0], tangents[1], tangents[2]
+
+    y = _chem_eq_solve_log(T, n_total, abundances, data, y0)
+
+    # ∂F/∂θ · dθ holding the solution fixed, for θ = (T, n_total, abundances). Two inputs
+    # carry no tangent by construction: the initial guess does not appear in
+    # F(y*, θ) = 0 and so cannot move the solution, and `data` is a static table of
+    # precomputed partition functions and equilibrium constants (it is closed over here
+    # rather than passed through jvp, which also keeps its integer fields out of the
+    # tangent space).
+    _, dF = jax.jvp(
+        lambda T_, n_, ab_: _chem_eq_log_residuals(y, T_, n_, ab_, data, 0.0),
+        (T, n_total, abundances),
+        (dT, dn_total, dabundances),
+    )
+    J = _chem_eq_log_jacobian(y, T, n_total, abundances, data, 0.0)
+    return y, -jnp.linalg.solve(J, dF)
 
 
 def _chem_eq_newton_layer_jit(T, n_total, ne_guess, nf_guess, abundances, data):
     """
-    Single-layer Newton solver for chemical equilibrium.
+    Single-layer chemical equilibrium solve, log-space, jittable and differentiable.
 
-    Matches Julia's `_solve_chemical_equilibrium`:
-    - Method: Newton (analytical Jacobian -- no jacfwd)
-    - Convergence: inf-norm < 1e-8
-    - Max iterations: 1000
-    - Linear solve: LU (jnp.linalg.solve)
-    - Line search: static (full step, alpha=1)
-    - Regularisation: 1e-12*I to handle exact singularity from zero-abundance elements
+    Implements the Korg.jl v1.2 algorithm: a step-clipped Newton iteration (no component
+    of the state may move more than one decade per step) driven by the analytic Jacobian
+    above, wrapped in a continuation that switches molecules and H⁻ off and anneals them
+    back on. Unlike Korg's adaptive bisection the schedule is fixed, so the solve is a
+    single traceable kernel that vmaps over layers, and derivatives come from the
+    implicit function theorem rather than from unrolling the iteration.
+
+    Parameters
+    ----------
+    T, n_total : float
+        Layer temperature (K) and total number density (cm⁻³)
+    ne_guess : float
+        Initial electron density, e.g. from the Picard pass
+    nf_guess : array, shape (92,)
+        Initial neutral fractions
+    abundances : array, shape (92,)
+        Absolute abundances N(X)/N_total
+    data : ChemicalEquilibriumData
+
+    Returns
+    -------
+    tuple
+        ``(ne, neutral_fractions)`` where the neutral fractions are defined against
+        ``abundances * (n_total - ne)``, so multiplying gives the solved neutral
+        densities exactly.
     """
-    x0 = jnp.concatenate([
-        jnp.clip(nf_guess, 1e-20, 1.0),
-        jnp.array([jnp.maximum(ne_guess, 1.0) / (n_total * 1e-5)]),
-    ])
+    ne0 = jnp.maximum(ne_guess, 1.0)
+    n_neutral0 = jnp.maximum(abundances * (n_total - ne0) * jnp.clip(nf_guess, 1e-30, 1.0),
+                             1e-300)
+    y0 = jnp.concatenate([jnp.log10(n_neutral0),
+                          jnp.reshape(jnp.log10(ne0), (1,))])
 
-    def F(x):
-        return _chem_eq_residuals_newton(x, T, n_total, abundances, data)
+    y = _chem_eq_solve_log(T, n_total, abundances, data, jax.lax.stop_gradient(y0))
 
-    def cond(state):
-        x, norm, step = state
-        return (norm > 1e-8) & (step < 1000) & jnp.all(jnp.isfinite(x))
-
-    def body(state):
-        x, _, step = state
-        F_val = F(x)
-        norm  = jnp.max(jnp.abs(F_val))
-        J     = _chem_eq_analytical_jacobian(x, F_val, T, n_total, abundances, data)
-        dx    = jnp.linalg.solve(J + 1e-12 * jnp.eye(MAX_ATOMIC_NUMBER + 1), -F_val)
-        dx    = jnp.where(jnp.isfinite(dx), dx, 0.0)
-        return x + dx, norm, step + 1
-
-    F0    = F(x0)
-    norm0 = jnp.max(jnp.abs(F0))
-    x_sol, _, _ = jax.lax.while_loop(cond, body, (x0, norm0, jnp.array(0)))
-
-    ne_sol = jnp.maximum(jnp.abs(x_sol[MAX_ATOMIC_NUMBER]) * n_total * 1e-5, 1.0)
-    nf_sol = jnp.abs(x_sol[:MAX_ATOMIC_NUMBER])
+    ne_sol = _pow10(y[MAX_ATOMIC_NUMBER])
+    n_neutral = _pow10(y[:MAX_ATOMIC_NUMBER])
+    nf_sol = n_neutral / jnp.maximum(abundances * (n_total - ne_sol), 1e-300)
     return ne_sol, nf_sol
 
 

@@ -706,10 +706,15 @@ def calculate_polyatomic_equilibrium_constants(partition_funcs):
                     def logK(logT):
                         T = np.exp(logT)
 
-                        # Partition function ratio: Π U_atoms / U_molecule
-                        log_Us_ratio = np.sum([np.log10(pfuncs[Species(Formula(int(Z)), 0)](logT))
-                                               for Z in Zs])
-                        log_Us_ratio -= np.log10(pfuncs[spec](logT))
+                        # Partition function ratio: Π U_atoms / U_molecule.
+                        # axis=0 sums across constituent atoms only — without it a vector
+                        # logT would also be summed over, collapsing the whole grid into
+                        # one scalar.
+                        log_Us_ratio = np.sum(
+                            [np.log10(pfuncs[Species(Formula(int(Z)), 0)](logT)) for Z in Zs],
+                            axis=0,
+                        )
+                        log_Us_ratio = log_Us_ratio - np.log10(pfuncs[spec](logT))
 
                         # Mass ratio: Π m_atoms / m_molecule.
                         # atomic_masses is 0-indexed, so element Z is at index Z-1.
