@@ -15,7 +15,7 @@ from .linelist import Line, approximate_radiative_gamma
 from .species import Species
 from .atomic_data import atomic_numbers, atomic_symbols
 from .isotopic_data import isotopic_abundances
-from .wavelengths import air_to_vacuum
+from .utils import air_to_vacuum
 
 
 def ten_to_the_or_missing(x: float) -> Optional[float]:

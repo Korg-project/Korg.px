@@ -66,43 +66,43 @@ class TestConstantsReference:
         """Speed of light should match."""
         from korg.constants import c_cgs
         julia_val = reference_data["constants"]["c_cgs"]
-        assert np.isclose(c_cgs, julia_val, rtol=1e-10)
+        assert c_cgs == julia_val
 
     def test_hplanck_cgs(self, reference_data):
         """Planck constant should match."""
         from korg.constants import hplanck_cgs
         julia_val = reference_data["constants"]["hplanck_cgs"]
-        assert np.isclose(hplanck_cgs, julia_val, rtol=1e-10)
+        assert hplanck_cgs == julia_val
 
     def test_kboltz_cgs(self, reference_data):
         """Boltzmann constant should match."""
         from korg.constants import kboltz_cgs
         julia_val = reference_data["constants"]["kboltz_cgs"]
-        assert np.isclose(kboltz_cgs, julia_val, rtol=1e-10)
+        assert kboltz_cgs == julia_val
 
     def test_electron_mass_cgs(self, reference_data):
         """Electron mass should match."""
         from korg.constants import electron_mass_cgs
         julia_val = reference_data["constants"]["electron_mass_cgs"]
-        assert np.isclose(electron_mass_cgs, julia_val, rtol=1e-10)
+        assert electron_mass_cgs == julia_val
 
     def test_Rydberg_eV(self, reference_data):
         """Rydberg energy should match."""
         from korg.constants import Rydberg_eV
         julia_val = reference_data["constants"]["Rydberg_eV"]
-        assert np.isclose(Rydberg_eV, julia_val, rtol=1e-10)
+        assert Rydberg_eV == julia_val
 
     def test_kboltz_eV(self, reference_data):
         """Boltzmann constant in eV should match."""
         from korg.constants import kboltz_eV
         julia_val = reference_data["constants"]["kboltz_eV"]
-        assert np.isclose(kboltz_eV, julia_val, rtol=1e-10)
+        assert kboltz_eV == julia_val
 
     def test_hplanck_eV(self, reference_data):
         """Planck constant in eV should match."""
         from korg.constants import hplanck_eV
         julia_val = reference_data["constants"]["hplanck_eV"]
-        assert np.isclose(hplanck_eV, julia_val, rtol=1e-10)
+        assert hplanck_eV == julia_val
 
 
 class TestElectronScatteringReference:
@@ -292,7 +292,7 @@ class TestAtomicDataReference:
         julia_masses = reference_data["atomic_data"]["atomic_masses"]
         for i, julia_mass in enumerate(julia_masses):
             py_mass = atomic_masses[i]
-            assert np.isclose(py_mass, julia_mass, rtol=1e-6), \
+            assert py_mass == julia_mass, \
                 f"Mass mismatch for Z={i+1}: Python={py_mass}, Julia={julia_mass}"
 
     def test_ionization_energies(self, reference_data):
@@ -306,7 +306,7 @@ class TestAtomicDataReference:
             for i, (py_val, julia_val) in enumerate(zip(py_vals, julia_vals)):
                 # Both use -1 for unavailable
                 if julia_val > 0 and py_val > 0:
-                    assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                    assert py_val == julia_val, \
                         f"Ionization energy mismatch for Z={Z}, level {i+1}: Python={py_val}, Julia={julia_val}"
                 elif julia_val < 0 and py_val < 0:
                     pass  # Both unavailable, OK
@@ -324,7 +324,7 @@ class TestSolarAbundancesReference:
 
         julia_abund = reference_data["solar_abundances"]["grevesse_2007"]
         for i, (py_val, julia_val) in enumerate(zip(grevesse_2007_solar_abundances, julia_abund)):
-            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+            assert py_val == julia_val, \
                 f"Grevesse 2007 abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
 
     def test_asplund_2009(self, reference_data):
@@ -333,7 +333,7 @@ class TestSolarAbundancesReference:
 
         julia_abund = reference_data["solar_abundances"]["asplund_2009"]
         for i, (py_val, julia_val) in enumerate(zip(asplund_2009_solar_abundances, julia_abund)):
-            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+            assert py_val == julia_val, \
                 f"Asplund 2009 abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
 
     def test_asplund_2020(self, reference_data):
@@ -342,7 +342,7 @@ class TestSolarAbundancesReference:
 
         julia_abund = reference_data["solar_abundances"]["asplund_2020"]
         for i, (py_val, julia_val) in enumerate(zip(asplund_2020_solar_abundances, julia_abund)):
-            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+            assert py_val == julia_val, \
                 f"Asplund 2020 abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
 
     def test_bergemann_2025(self, reference_data):
@@ -351,7 +351,7 @@ class TestSolarAbundancesReference:
 
         julia_abund = reference_data["solar_abundances"]["bergemann_2025"]
         for i, (py_val, julia_val) in enumerate(zip(bergemann_2025_solar_abundances, julia_abund)):
-            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+            assert py_val == julia_val, \
                 f"Bergemann 2025 abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
 
     def test_default_abundances(self, reference_data):
@@ -360,7 +360,7 @@ class TestSolarAbundancesReference:
 
         julia_abund = reference_data["solar_abundances"]["default"]
         for i, (py_val, julia_val) in enumerate(zip(default_solar_abundances, julia_abund)):
-            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+            assert py_val == julia_val, \
                 f"Default abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
 
     def test_magg_2022(self, reference_data):
@@ -369,7 +369,7 @@ class TestSolarAbundancesReference:
 
         julia_abund = reference_data["solar_abundances"]["magg_2022"]
         for i, (py_val, julia_val) in enumerate(zip(magg_2022_solar_abundances, julia_abund)):
-            assert np.isclose(py_val, julia_val, rtol=1e-6), \
+            assert py_val == julia_val, \
                 f"Magg 2022 abundance mismatch for Z={i+1}: Python={py_val}, Julia={julia_val}"
 
 
@@ -391,7 +391,7 @@ class TestIsotopicDataReference:
                 assert A in py_isotopes, \
                     f"Isotope A={A} missing for Z={Z}"
                 py_val = py_isotopes[A]
-                assert np.isclose(py_val, julia_val, rtol=1e-6), \
+                assert py_val == julia_val, \
                     f"Isotopic abundance mismatch for Z={Z}, A={A}: Python={py_val}, Julia={julia_val}"
 
     def test_isotopic_nuclear_spin_degeneracies(self, reference_data):
@@ -2019,7 +2019,7 @@ class TestChemicalEquilibrium:
     def test_chemical_equilibrium_solar_conditions(self):
         """Chemical equilibrium at solar photospheric conditions."""
         try:
-            from korg.statmech import chemical_equilibrium
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -2045,7 +2045,7 @@ class TestChemicalEquilibrium:
         absolute_abundances = A_X_to_absolute(A_X)
 
         # Solve chemical equilibrium
-        ne, number_densities = chemical_equilibrium(
+        ne, number_densities = reference_chemical_equilibrium(
             T, n_total, ne_model, absolute_abundances,
             ionization_energies, partition_funcs,
             default_log_equilibrium_constants
@@ -2082,7 +2082,7 @@ class TestChemicalEquilibrium:
     def test_chemical_equilibrium_electron_density_reasonable(self):
         """Calculated electron density should be physically reasonable."""
         try:
-            from korg.statmech import chemical_equilibrium
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -2104,7 +2104,7 @@ class TestChemicalEquilibrium:
         A_X = format_A_X()
         absolute_abundances = A_X_to_absolute(A_X)
 
-        ne, _ = chemical_equilibrium(
+        ne, _ = reference_chemical_equilibrium(
             T, n_total, ne_model, absolute_abundances,
             ionization_energies, partition_funcs,
             default_log_equilibrium_constants
@@ -2118,7 +2118,7 @@ class TestChemicalEquilibrium:
     def test_chemical_equilibrium_hot_atmosphere(self):
         """Higher temperature should give higher ionization."""
         try:
-            from korg.statmech import chemical_equilibrium
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -2142,7 +2142,7 @@ class TestChemicalEquilibrium:
         A_X = format_A_X()
         absolute_abundances = A_X_to_absolute(A_X)
 
-        ne, number_densities = chemical_equilibrium(
+        ne, number_densities = reference_chemical_equilibrium(
             T_hot, n_total, ne_model, absolute_abundances,
             ionization_energies, partition_funcs,
             default_log_equilibrium_constants
@@ -2170,7 +2170,7 @@ class TestChemicalEquilibrium:
     def test_chemical_equilibrium_cool_atmosphere(self):
         """Lower temperature should give more neutral species."""
         try:
-            from korg.statmech import chemical_equilibrium
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -2194,7 +2194,7 @@ class TestChemicalEquilibrium:
         A_X = format_A_X()
         absolute_abundances = A_X_to_absolute(A_X)
 
-        ne, number_densities = chemical_equilibrium(
+        ne, number_densities = reference_chemical_equilibrium(
             T_cool, n_total, ne_model, absolute_abundances,
             ionization_energies, partition_funcs,
             default_log_equilibrium_constants
@@ -2216,7 +2216,7 @@ class TestChemicalEquilibrium:
     def test_chemical_equilibrium_temperature_trend(self):
         """Electron density should increase with temperature."""
         try:
-            from korg.statmech import chemical_equilibrium
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -2242,7 +2242,7 @@ class TestChemicalEquilibrium:
         electron_densities = []
 
         for T in temperatures:
-            ne, _ = chemical_equilibrium(
+            ne, _ = reference_chemical_equilibrium(
                 T, n_total, ne_model, absolute_abundances,
                 ionization_energies, partition_funcs,
                 default_log_equilibrium_constants
@@ -2258,7 +2258,7 @@ class TestChemicalEquilibrium:
     def test_chemical_equilibrium_returns_molecules(self):
         """Chemical equilibrium should return molecular species."""
         try:
-            from korg.statmech import chemical_equilibrium
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -2282,7 +2282,7 @@ class TestChemicalEquilibrium:
         A_X = format_A_X()
         absolute_abundances = A_X_to_absolute(A_X)
 
-        ne, number_densities = chemical_equilibrium(
+        ne, number_densities = reference_chemical_equilibrium(
             T, n_total, ne_model, absolute_abundances,
             ionization_energies, partition_funcs,
             default_log_equilibrium_constants
@@ -2302,7 +2302,7 @@ class TestChemicalEquilibrium:
     def test_chemical_equilibrium_number_density_conservation(self):
         """Total number of atoms should be roughly conserved."""
         try:
-            from korg.statmech import chemical_equilibrium
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -2325,7 +2325,7 @@ class TestChemicalEquilibrium:
         A_X = format_A_X()
         absolute_abundances = A_X_to_absolute(A_X)
 
-        ne, number_densities = chemical_equilibrium(
+        ne, number_densities = reference_chemical_equilibrium(
             T, n_total, ne_model, absolute_abundances,
             ionization_energies, partition_funcs,
             default_log_equilibrium_constants
@@ -2347,9 +2347,10 @@ class TestChemicalEquilibrium:
         """JIT version of chemical equilibrium should work and match regular version."""
         try:
             from korg.statmech import (
-                chemical_equilibrium, chemical_equilibrium_jit,
+                picard_chemical_equilibrium_guess,
                 precompute_chemical_equilibrium_data
             )
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -2374,7 +2375,7 @@ class TestChemicalEquilibrium:
         absolute_abundances_dict = A_X_to_absolute(A_X)
 
         # Test regular version
-        ne_regular, number_densities = chemical_equilibrium(
+        ne_regular, number_densities = reference_chemical_equilibrium(
             T, n_total, ne_model, absolute_abundances_dict,
             ionization_energies, partition_funcs,
             default_log_equilibrium_constants
@@ -2391,7 +2392,7 @@ class TestChemicalEquilibrium:
         absolute_abundances_array = jnp.asarray(absolute_abundances_dict)
 
         # Test JIT version
-        ne_jit, neutral_fractions = chemical_equilibrium_jit(
+        ne_jit, neutral_fractions = picard_chemical_equilibrium_guess(
             T, n_total, ne_model, absolute_abundances_array, data
         )
 
@@ -2404,10 +2405,10 @@ class TestChemicalEquilibrium:
             f"JIT ne={ne_jit:.3e} should match regular ne={ne_regular:.3e}"
 
     def test_chemical_equilibrium_jit_truly_jittable(self):
-        """Verify chemical_equilibrium_jit can actually be JIT-compiled."""
+        """Verify picard_chemical_equilibrium_guess can actually be JIT-compiled."""
         try:
             from korg.statmech import (
-                chemical_equilibrium_jit,
+                picard_chemical_equilibrium_guess,
                 precompute_chemical_equilibrium_data
             )
             from korg.data_loader import (
@@ -2442,12 +2443,12 @@ class TestChemicalEquilibrium:
         ne_model = 1e14
 
         # First call (triggers JIT compilation)
-        ne_1, neutral_fractions_1 = chemical_equilibrium_jit(
+        ne_1, neutral_fractions_1 = picard_chemical_equilibrium_guess(
             T, n_total, ne_model, absolute_abundances_array, data
         )
 
         # Second call (should use compiled version)
-        ne_2, neutral_fractions_2 = chemical_equilibrium_jit(
+        ne_2, neutral_fractions_2 = picard_chemical_equilibrium_guess(
             T, n_total, ne_model, absolute_abundances_array, data
         )
 
@@ -2460,7 +2461,7 @@ class TestChemicalEquilibrium:
         """JIT version should work correctly at different temperatures."""
         try:
             from korg.statmech import (
-                chemical_equilibrium_jit,
+                picard_chemical_equilibrium_guess,
                 precompute_chemical_equilibrium_data
             )
             from korg.data_loader import (
@@ -2497,7 +2498,7 @@ class TestChemicalEquilibrium:
         ne_values = []
 
         for T in temperatures:
-            ne, _ = chemical_equilibrium_jit(
+            ne, _ = picard_chemical_equilibrium_guess(
                 T, n_total, ne_model, absolute_abundances_array, data
             )
             ne_values.append(ne)
@@ -4860,7 +4861,7 @@ class TestLineExplicitBroadeningJuliaReference:
 # =============================================================================
 
 class TestChemicalEquilibriumReference:
-    """Test chemical_equilibrium against Julia reference data."""
+    """Test reference_chemical_equilibrium against Julia reference data."""
 
     def test_chemical_equilibrium_solar(self, reference_data):
         """Chemical equilibrium at solar conditions should match Julia."""
@@ -4868,7 +4869,7 @@ class TestChemicalEquilibriumReference:
             pytest.skip("Chemical equilibrium reference data not available")
 
         try:
-            from korg.statmech import chemical_equilibrium
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -4898,7 +4899,7 @@ class TestChemicalEquilibriumReference:
         A_X = format_A_X()
         absolute_abundances = A_X_to_absolute(A_X)
 
-        ne_result, number_densities = chemical_equilibrium(
+        ne_result, number_densities = reference_chemical_equilibrium(
             T, n_total, ne_model, absolute_abundances,
             ionization_energies, partition_funcs,
             default_log_equilibrium_constants
@@ -4930,7 +4931,7 @@ class TestChemicalEquilibriumReference:
             pytest.skip("Chemical equilibrium reference data not available")
 
         try:
-            from korg.statmech import chemical_equilibrium
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -4960,7 +4961,7 @@ class TestChemicalEquilibriumReference:
         A_X = format_A_X()
         absolute_abundances = A_X_to_absolute(A_X)
 
-        ne_result, number_densities = chemical_equilibrium(
+        ne_result, number_densities = reference_chemical_equilibrium(
             T, n_total, ne_model, absolute_abundances,
             ionization_energies, partition_funcs,
             default_log_equilibrium_constants
@@ -4976,7 +4977,8 @@ class TestChemicalEquilibriumReference:
             pytest.skip("Chemical equilibrium reference data not available")
 
         try:
-            from korg.statmech import chemical_equilibrium, Hminus_nK
+            from korg.statmech import Hminus_nK
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -5000,13 +5002,13 @@ class TestChemicalEquilibriumReference:
         T = solar_ref["T"]
         absolute_abundances = A_X_to_absolute(format_A_X())
 
-        ne, number_densities = chemical_equilibrium(
+        ne, number_densities = reference_chemical_equilibrium(
             T, solar_ref["n_total"], solar_ref["ne_model"], absolute_abundances,
             ionization_energies, partition_funcs, default_log_equilibrium_constants
         )
 
         H_minus = Species.from_string("H-")
-        assert H_minus in number_densities, "chemical_equilibrium must return H-"
+        assert H_minus in number_densities, "reference_chemical_equilibrium must return H-"
 
         # n(H-) = nK(T) * n(H I) * ne, the relation the solver imposes.
         expected = float(Hminus_nK(T)) * number_densities[Species.from_string("H I")] * ne
@@ -5024,7 +5026,7 @@ class TestChemicalEquilibriumReference:
         continuation added in Korg.jl v1.2.
         """
         try:
-            from korg.statmech import chemical_equilibrium
+            from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
             from korg.data_loader import (
                 load_ionization_energies, load_atomic_partition_functions,
                 default_log_equilibrium_constants
@@ -5042,7 +5044,7 @@ class TestChemicalEquilibriumReference:
 
         absolute_abundances = A_X_to_absolute(format_A_X())
 
-        ne, number_densities = chemical_equilibrium(
+        ne, number_densities = reference_chemical_equilibrium(
             2500.0, 1e17, 1e10, absolute_abundances,
             ionization_energies, partition_funcs, default_log_equilibrium_constants
         )

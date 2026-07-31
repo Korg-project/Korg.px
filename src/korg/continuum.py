@@ -1291,13 +1291,20 @@ def metal_bf_absorption(nu, T, number_densities):
     logT = jnp.log10(T)
 
     for species_name, ndens in number_densities.items():
+        # The cross-section tables are keyed 'Fe I' (with a space), but the rest of the
+        # package keys number densities 'Fe_I' (with an underscore) — see
+        # synthesis.compute_continuum_absorption. Accept either spelling; without this
+        # every metal bf contribution is silently dropped from total_continuum_absorption.
+        table_key = species_name
+        if table_key not in species_data:
+            table_key = species_name.replace('_', ' ')
         # Skip if no data for this species
-        if species_name not in species_data:
+        if table_key not in species_data:
             continue
 
         # Get cross-section table for this species
         # Shape: (n_logT, n_nu), values are ln(σ in Mb)
-        log_sigma_table = species_data[species_name]
+        log_sigma_table = species_data[table_key]
 
         # Bilinear interpolation in (nu, logT) space
         # Find indices for frequency
@@ -1572,7 +1579,8 @@ def prepare_continuum_batch(number_densities_list, partition_funcs, T_arr):
         for j, pk in enumerate(peach_keys):
             n_peach_arr[i, j] = nd_str.get(pk, 0.0)
         for j, ms in enumerate(metal_species_order):
-            metal_bf_dens_arr[i, j] = nd_str.get(ms, 0.0)
+            # metal_species_order is keyed 'Fe I'; nd_str is keyed 'Fe_I'.
+            metal_bf_dens_arr[i, j] = nd_str.get(ms.replace(' ', '_'), nd_str.get(ms, 0.0))
         # Z=1 FF (non-Peach) and Z=2 FF
         for key, val in nd_str.items():
             charge = _parse_species_charge(key)

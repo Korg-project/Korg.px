@@ -113,6 +113,16 @@ def synthesize_spectrum(julia_ref):
 
     abundances_fractional = 10**(abundances - 12)
     number_densities_dict = {}
+    # Composition handed to the continuum. The "everything is neutral" approximation
+    # below is harmless for the H⁻/H I opacity that dominates here, but it is not
+    # harmless for the metal bound-free tables: it puts 100% of the iron in Fe I when
+    # the photosphere is >90% Fe II, which inflates the continuum by ~50%. (Until the
+    # underscore/space key mismatch in korg.continuum.metal_bf_absorption was fixed,
+    # metal bf was silently dropped from total_continuum_absorption and this went
+    # unnoticed.) Restrict the continuum composition to the species this test actually
+    # models: H, He, and Julia's exact Na I from its full chemical equilibrium.
+    continuum_number_densities_dict = {}
+    continuum_symbols = {'H', 'He', 'Na'}
 
     for i, sym in enumerate(atomic_symbols):
         if i < len(abundances_fractional):
@@ -127,12 +137,14 @@ def synthesize_spectrum(julia_ref):
                 else:
                     # No ionized species (approximation, OK for continuum)
                     number_densities_dict[species_i] = np.zeros(n_layers)
+                if sym in continuum_symbols:
+                    continuum_number_densities_dict[species_i] = number_densities_dict[species_i]
 
     # Compute continuum opacity
     alpha_continuum = np.zeros((n_layers, n_wl))
     for i_layer in range(n_layers):
         number_densities_layer = {sp: dens[i_layer]
-                                   for sp, dens in number_densities_dict.items()}
+                                   for sp, dens in continuum_number_densities_dict.items()}
         alpha_continuum[i_layer, :] = compute_continuum_absorption(
             wavelengths_cm=wavelengths_cm,
             T=temperatures[i_layer],
@@ -177,7 +189,7 @@ def synthesize_spectrum(julia_ref):
     alpha_ref = np.zeros(n_layers)
     for i_layer in range(n_layers):
         number_densities_layer = {sp: dens[i_layer]
-                                   for sp, dens in number_densities_dict.items()}
+                                   for sp, dens in continuum_number_densities_dict.items()}
         alpha_ref[i_layer] = compute_continuum_absorption(
             wavelengths_cm=np.array([wl_ref]),
             T=temperatures[i_layer],

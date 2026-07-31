@@ -2,7 +2,7 @@
 Tests for the batched/JIT chemical equilibrium solver.
 
 The batched path solves the same Korg.jl v1.2 system as
-``statmech.chemical_equilibrium`` but with a hand-written analytic Jacobian, a fixed
+``tests.reference_chemical_equilibrium`` but with a hand-written analytic Jacobian, a fixed
 continuation schedule, and derivatives supplied by the implicit function theorem, so
 that the whole solve is one jittable, vmappable, differentiable kernel.
 
@@ -104,12 +104,12 @@ class TestBatchedSolution:
 
     @pytest.fixture(scope="class")
     def solved(self, setup):
-        from korg.statmech import _chem_eq_newton_batch_jit, _chemical_equilibrium_batch_jit
+        from korg.statmech import _chem_eq_newton_batch_jit, _picard_chemical_equilibrium_guess_batch
 
         T = jnp.array([r[0] for r in REGIMES])
         n_total = jnp.array([r[1] for r in REGIMES])
         ne_model = jnp.array([r[2] for r in REGIMES])
-        ne_init, nf_init = _chemical_equilibrium_batch_jit(
+        ne_init, nf_init = _picard_chemical_equilibrium_guess_batch(
             T, n_total, ne_model, setup["abundances"], setup["data"]
         )
         ne, nf = _chem_eq_newton_batch_jit(
@@ -119,14 +119,14 @@ class TestBatchedSolution:
 
     @pytest.mark.parametrize("idx", range(len(REGIMES)))
     def test_matches_reference_solver(self, setup, solved, idx):
-        from korg.statmech import chemical_equilibrium
+        from tests.reference_chemical_equilibrium import reference_chemical_equilibrium
         from korg.species import Species
 
         ne_arr, nf_arr = solved
         T, n_total, ne_model = REGIMES[idx]
         ab_np = setup["abundances_np"]
 
-        ne_ref, nd_ref = chemical_equilibrium(
+        ne_ref, nd_ref = reference_chemical_equilibrium(
             T, n_total, ne_model, ab_np, setup["ionization_energies"],
             setup["partition_funcs"], setup["log_equilibrium_constants"],
         )
@@ -159,10 +159,10 @@ class TestJitAndDifferentiability:
 
     @pytest.fixture(scope="class")
     def layer_solver(self, setup):
-        from korg.statmech import _chem_eq_newton_layer_jit, _chemical_equilibrium_batch_jit
+        from korg.statmech import _chem_eq_newton_layer_jit, _picard_chemical_equilibrium_guess_batch
 
         def make(T0, n_total, ne_model):
-            ne_init, nf_init = _chemical_equilibrium_batch_jit(
+            ne_init, nf_init = _picard_chemical_equilibrium_guess_batch(
                 jnp.array([T0]), jnp.array([n_total]), jnp.array([ne_model]),
                 setup["abundances"], setup["data"]
             )
@@ -189,10 +189,10 @@ class TestJitAndDifferentiability:
         assert np.isfinite(float(jax.jit(f)(jnp.float64(5778.0))))
 
     def test_grad_wrt_total_density(self, setup, layer_solver):
-        from korg.statmech import _chem_eq_newton_layer_jit, _chemical_equilibrium_batch_jit
+        from korg.statmech import _chem_eq_newton_layer_jit, _picard_chemical_equilibrium_guess_batch
 
         T0, n_total, ne_model = 5778.0, 1e17, 1e14
-        ne_init, nf_init = _chemical_equilibrium_batch_jit(
+        ne_init, nf_init = _picard_chemical_equilibrium_guess_batch(
             jnp.array([T0]), jnp.array([n_total]), jnp.array([ne_model]),
             setup["abundances"], setup["data"]
         )

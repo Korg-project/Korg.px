@@ -744,6 +744,137 @@ let
 end
 
 # =============================================================================
+# Shared (T, nₑ, composition) conditions for the continuum fixtures
+# =============================================================================
+# These three conditions are used both by the per-source continuum references and by the
+# total_continuum_absorption fixture, so that the sum is checked where different sources
+# dominate: H⁻ ff / metal bf matter most in the cool dense case, H⁻ bf in the solar case,
+# and H I bf / positive-ion ff / electron scattering in the hot case.
+#
+# Number densities are keyed by the same strings Korg.px uses internally ("Fe_I", "H2", …);
+# the Julia side converts them to `Korg.Species` below.
+continuum_conditions = [
+    ("cool_dense", 3500.0, 2.0e11,
+     Dict("H_I" => 1.0e17, "H_II" => 1.0e7, "He_I" => 8.5e15, "He_II" => 1.0e2,
+          "H2" => 1.0e13,
+          "C_I" => 3.0e13, "C_II" => 1.0e8,
+          "Na_I" => 2.0e11, "Na_II" => 1.0e9,
+          "Mg_I" => 3.0e12, "Mg_II" => 1.0e11,
+          "Al_I" => 2.0e11, "Al_II" => 1.0e9,
+          "Si_I" => 3.0e12, "Si_II" => 1.0e10,
+          "S_I" => 1.0e13, "S_II" => 1.0e7,
+          "Ca_I" => 2.0e11, "Ca_II" => 5.0e10,
+          "Fe_I" => 3.0e12, "Fe_II" => 1.0e11)),
+    ("solar", 5778.0, 1.5e14,
+     Dict("H_I" => 1.8e17, "H_II" => 1.0e11, "He_I" => 1.6e16, "He_II" => 1.0e9,
+          "H2" => 1.0e12,
+          "C_I" => 1.0e14, "C_II" => 1.0e10,
+          "Na_I" => 1.0e11, "Na_II" => 3.0e11,
+          "Mg_I" => 1.0e12, "Mg_II" => 6.0e12,
+          "Al_I" => 5.0e10, "Al_II" => 5.0e11,
+          "Si_I" => 1.0e12, "Si_II" => 6.0e12,
+          "S_I" => 5.0e12, "S_II" => 1.0e10,
+          "Ca_I" => 1.0e10, "Ca_II" => 4.0e11,
+          "Fe_I" => 5.0e11, "Fe_II" => 5.0e12)),
+    ("hot", 9000.0, 1.0e14,
+     Dict("H_I" => 1.0e16, "H_II" => 5.0e15, "He_I" => 1.0e15, "He_II" => 1.0e11,
+          "H2" => 1.0e6,
+          "C_I" => 1.0e10, "C_II" => 5.0e12,
+          "Na_I" => 1.0e8, "Na_II" => 2.0e10,
+          "Mg_I" => 1.0e9, "Mg_II" => 4.0e11,
+          "Al_I" => 1.0e8, "Al_II" => 3.0e10,
+          "Si_I" => 1.0e9, "Si_II" => 4.0e11,
+          "S_I" => 1.0e10, "S_II" => 2.0e11,
+          "Ca_I" => 1.0e7, "Ca_II" => 2.0e10,
+          "Fe_I" => 1.0e9, "Fe_II" => 3.0e11)),
+]
+
+continuum_wavelengths_A = [3000.0, 4000.0, 5000.0, 6000.0, 8000.0, 10000.0, 15000.0, 20000.0]
+
+# Convert a "Fe_I"-style key into a Korg.Species ("H2" stays "H2").
+continuum_species(k) = Korg.Species(replace(k, "_" => " "))
+
+# =============================================================================
+# Individual continuum sources
+# =============================================================================
+# Each of these is evaluated directly (not via total_continuum_absorption) so that a large
+# relative error in a sub-dominant source cannot hide inside the tolerance on the sum.
+println("  - continuum_sources...")
+let
+    src_data = Dict{String,Any}()
+
+    for (label, T, ne, nd_str) in continuum_conditions
+        nd = Dict(continuum_species(k) => v for (k, v) in nd_str)
+
+        U_H_I = Korg.default_partition_funcs[Korg.species"H I"](log(T))
+        U_He_I = Korg.default_partition_funcs[Korg.species"He I"](log(T))
+        nH_I_div_U = nd_str["H_I"] / U_H_I
+        nHe_I_div_U = nd_str["He_I"] / U_He_I
+
+        # --- H⁻ number density: a real API difference between Korg v1.1 and v1.2 ---
+        # Korg v1.2 carries H⁻ through chemical equilibrium and passes it to Hminus_bf as
+        #     n(H⁻) = Hminus_nK(T) * n(H I) * nₑ,
+        # i.e. in terms of the *total* neutral hydrogen density.  Korg.px still derives
+        # n(H⁻) inside Hminus_bf (the v1.1 behaviour) from the ground-state population,
+        #     n(H I, n=1) = 2 n(H I) / U(H I),
+        # which is the same expression with n(H I) → 2 n(H I)/U(H I).  Both are recorded:
+        #  * `nHminus_ground_state` is what `Hminus_bf` below is evaluated with, so that the
+        #    Python comparison is like-for-like and tests the cross-section + stimulated
+        #    emission factor rather than the density convention;
+        #  * `nHminus_korg_v1_2` quantifies the divergence (the ratio is exactly 2/U(H I)).
+        nHminus_gs = Korg.Hminus_nK(T) * (2 * nH_I_div_U) * ne
+        nHminus_korg = Korg.Hminus_nK(T) * nd_str["H_I"] * ne
+
+        outputs = Dict{String,Any}(src => Dict{String,Float64}()
+                                   for src in ("Hminus_bf", "Hminus_bf_unit_ndens", "Hminus_ff",
+                                               "Heminus_ff", "metal_bf", "positive_ion_ff"))
+
+        for wl_A in continuum_wavelengths_A
+            νs = [Korg.c_cgs / (wl_A * 1e-8)]
+            k = string(wl_A)
+
+            outputs["Hminus_bf"][k] = Float64(Korg.ContinuumAbsorption.Hminus_bf(νs, T,
+                                                                                nHminus_gs, ne)[1])
+            # α per H⁻ ion: isolates the McLaughlin+ 2017 cross section and the stimulated
+            # emission factor from the n(H⁻) convention, which differs between v1.1 and v1.2.
+            outputs["Hminus_bf_unit_ndens"][k] = Float64(Korg.ContinuumAbsorption.Hminus_bf(νs, T,
+                                                                                           1.0,
+                                                                                           ne)[1])
+            outputs["Hminus_ff"][k] = Float64(Korg.ContinuumAbsorption.Hminus_ff(νs, T,
+                                                                                nH_I_div_U, ne)[1])
+            outputs["Heminus_ff"][k] = Float64(Korg.ContinuumAbsorption.Heminus_ff(νs, T,
+                                                                                  nHe_I_div_U,
+                                                                                  ne)[1])
+
+            α_metal = zeros(1)
+            Korg.ContinuumAbsorption.metal_bf_absorption!(α_metal, νs, T, nd)
+            outputs["metal_bf"][k] = Float64(α_metal[1])
+
+            α_ff = zeros(1)
+            Korg.ContinuumAbsorption.positive_ion_ff_absorption!(α_ff, νs, T, nd, ne)
+            outputs["positive_ion_ff"][k] = Float64(α_ff[1])
+        end
+
+        src_data[label] = Dict(
+            "T" => T,
+            "ne" => ne,
+            "number_densities" => nd_str,
+            "U_H_I" => U_H_I,
+            "U_He_I" => U_He_I,
+            "nH_I_div_U" => nH_I_div_U,
+            "nHe_I_div_U" => nHe_I_div_U,
+            "Hminus_nK" => Korg.Hminus_nK(T),
+            "nHminus_ground_state" => nHminus_gs,
+            "nHminus_korg_v1_2" => nHminus_korg,
+            "wavelengths_A" => continuum_wavelengths_A,
+            "outputs" => outputs,
+        )
+    end
+
+    reference_data["continuum_sources"] = src_data
+end
+
+# =============================================================================
 # Line class construction (approximate broadening)
 # =============================================================================
 println("  - line_class...")
@@ -960,6 +1091,39 @@ let
             "outputs" => cntm_outputs
         )
     )
+
+    # The single solar layer above is a weak check on the sum: H⁻ dominates the optical
+    # continuum there, so a large relative error in e.g. metal bf or positive-ion ff would
+    # hide inside the tolerance.  Evaluate the total at the same three conditions used for
+    # the per-source references, with the full metal composition.
+    #
+    # n(H⁻) is passed using the ground-state convention (see the `continuum_sources`
+    # section) so the comparison is like-for-like with Korg.px, which still derives n(H⁻)
+    # internally from n(H I, n=1) rather than taking it as an argument.
+    conditions_outputs = Dict{String,Any}()
+    for (label, T, ne, nd_str) in continuum_conditions
+        nd = Dict(continuum_species(k) => v for (k, v) in nd_str)
+        U_H_I = Korg.default_partition_funcs[Korg.species"H I"](log(T))
+        nHminus = Korg.Hminus_nK(T) * (2 * nd_str["H_I"] / U_H_I) * ne
+        nd[Korg.species"H-"] = nHminus
+
+        outs = Dict{String,Float64}()
+        for wl_A in continuum_wavelengths_A
+            νs = [Korg.c_cgs / (wl_A * 1e-8)]
+            outs[string(wl_A)] = Float64(Korg.ContinuumAbsorption.total_continuum_absorption(νs, T,
+                                                                                             ne, nd,
+                                                                                             Korg.default_partition_funcs)[1])
+        end
+
+        conditions_outputs[label] = Dict(
+            "T" => T, "ne" => ne,
+            "number_densities" => nd_str,
+            "nHminus_ground_state" => nHminus,
+            "wavelengths_A" => continuum_wavelengths_A,
+            "outputs" => outs,
+        )
+    end
+    reference_data["total_continuum_absorption"]["conditions"] = conditions_outputs
 end
 
 # =============================================================================

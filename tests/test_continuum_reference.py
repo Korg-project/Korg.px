@@ -507,6 +507,284 @@ class TestContinuumPhysics:
 
 
 # ---------------------------------------------------------------------------
+# 5. Per-source Julia references
+# ---------------------------------------------------------------------------
+#
+# The total-continuum comparison above exercises nine sources at a single solar layer,
+# where H⁻ dominates the optical continuum.  A large relative error in a sub-dominant
+# source (metal bf, positive-ion ff) hides inside the tolerance on that sum, so the five
+# sources below are also compared against Julia individually, at three conditions
+# (T = 3500 / 5778 / 9000 K) spanning 3000–20000 Å.
+#
+# Fixtures live under the ``continuum_sources`` key of tests/julia_reference_data.json;
+# see the matching section of tests/generate_julia_reference.jl.
+
+CONTINUUM_CONDITIONS = ["cool_dense", "solar", "hot"]
+
+
+def _source_case(reference_data, label):
+    """Return the ``continuum_sources`` entry for ``label``, or skip."""
+    sources = reference_data.get("continuum_sources")
+    if not sources or label not in sources:
+        pytest.skip(f"continuum_sources[{label!r}] not in reference data "
+                    "(regenerate tests/julia_reference_data.json)")
+    return sources[label]
+
+
+def _assert_matches(py_vals, julia_vals, wavelengths_A, rtol, what):
+    """Element-wise comparison that also demands exact zeros where Julia gives zero.
+
+    Several sources are identically zero outside their tabulated range (Heminus_ff below
+    5063 Å, Hminus_bf beyond the 1.64 μm threshold), and a relative tolerance says nothing
+    there — so those points are checked exactly.
+    """
+    py_vals = np.asarray(py_vals, dtype=float)
+    julia_vals = np.asarray(julia_vals, dtype=float)
+    assert np.all(np.isfinite(py_vals)), f"{what}: non-finite Python values {py_vals}"
+
+    for wl_A, py, julia in zip(wavelengths_A, py_vals, julia_vals):
+        if julia == 0.0:
+            assert py == 0.0, f"{what} at {wl_A} Å: Julia gives exactly 0, Python {py:.6e}"
+        else:
+            assert np.isclose(py, julia, rtol=rtol, atol=0.0), (
+                f"{what} at {wl_A} Å: Python={py:.10e} Julia={julia:.10e} "
+                f"(rel={py / julia - 1:.3e}, rtol={rtol:g})"
+            )
+
+
+class TestContinuumSourceReference:
+    """Compare each individually-untested continuum source against Julia."""
+
+    @staticmethod
+    def _nus(wavelengths_A):
+        from korg.constants import c_cgs
+        return jnp.array([c_cgs / (wl_A * 1e-8) for wl_A in wavelengths_A])
+
+    # -- H⁻ number density ---------------------------------------------------
+    #
+    # Korg v1.2 changed Hminus_bf to take n(H⁻) directly, supplied by chemical
+    # equilibrium as n(H⁻) = Hminus_nK(T) * n(H I) * nₑ.  Korg.px still derives it inside
+    # Hminus_bf from the ground-state population (the v1.1 behaviour), i.e. the same
+    # expression with n(H I) → n(H I, n=1) = 2 n(H I) / U(H I).  The two therefore differ
+    # by a factor 2/U(H I), which is 1 to within 1e-14 at 3500 K but reaches 1.5e-5 at
+    # 9000 K.  Both comparisons are made explicitly below rather than absorbed into a
+    # loose tolerance on Hminus_bf.
+
+    @pytest.mark.parametrize("label", CONTINUUM_CONDITIONS)
+    def test_hminus_number_density_ground_state_convention(self, reference_data, label):
+        """Python's internal n(H⁻) matches Korg's nK relation in the ground-state convention.
+
+        The residual ~9.24e-7 is *not* noise: Korg.px hardcodes the v1.1 literal
+        coef = 3.31283018e-22 for (h²/2πm)^1.5·k_eV^1.5, whereas Korg v1.2 evaluates
+        1/translational_U(m_e, T) from its constants.  The literal is low by 9.238e-7
+        relative, independent of T, so the tolerance here is 2e-6 rather than 1e-6.
+        """
+        from korg.continuum import ndens_Hminus
+
+        case = _source_case(reference_data, label)
+        py = float(ndens_Hminus(case["nH_I_div_U"], case["ne"], case["T"]))
+        julia = case["nHminus_ground_state"]
+
+        rel = py / julia - 1
+        assert abs(rel) < 2e-6, (
+            f"{label}: Python n(H⁻)={py:.10e} vs Julia ground-state convention "
+            f"{julia:.10e} (rel={rel:.3e})"
+        )
+
+    @pytest.mark.parametrize("label", CONTINUUM_CONDITIONS)
+    def test_hminus_number_density_vs_korg_v1_2(self, reference_data, label):
+        """Quantify the documented v1.1/v1.2 divergence: n(H⁻) differs by 2/U(H I).
+
+        This is a known API difference, not a bug, but it is *not* below 1e-6 everywhere:
+        at 9000 K U(H I) = 2.0000295, so Korg.px's n(H⁻) — and hence its H⁻ bound-free
+        opacity — is 1.4e-5 lower than Korg v1.2 would compute from the same n(H I).
+        The assertion pins the expected 2/U(H I) ratio so the divergence cannot grow
+        silently or acquire a second cause.
+        """
+        from korg.continuum import ndens_Hminus
+
+        case = _source_case(reference_data, label)
+        py = float(ndens_Hminus(case["nH_I_div_U"], case["ne"], case["T"]))
+        julia_v12 = case["nHminus_korg_v1_2"]
+
+        expected_ratio = 2.0 / case["U_H_I"]
+        observed_ratio = py / julia_v12
+        # The extra 9.238e-7 is the stale v1.1 coefficient documented above.
+        assert np.isclose(observed_ratio, expected_ratio, rtol=2e-6), (
+            f"{label}: n(H⁻) ratio to Korg v1.2 relation is {observed_ratio:.12f}, "
+            f"expected 2/U(H I) = {expected_ratio:.12f}"
+        )
+
+    # -- H⁻ bound-free -------------------------------------------------------
+
+    @pytest.mark.parametrize("label", CONTINUUM_CONDITIONS)
+    def test_Hminus_bf_cross_section(self, reference_data, label):
+        """α per H⁻ ion — the McLaughlin+ 2017 cross section and stimulated emission.
+
+        Dividing out Python's own n(H⁻) isolates the physics from the density
+        convention, so this is held to rtol=1e-6.
+        """
+        from korg.continuum import Hminus_bf, ndens_Hminus
+
+        case = _source_case(reference_data, label)
+        wavelengths_A = case["wavelengths_A"]
+        nus = self._nus(wavelengths_A)
+
+        n_Hminus = float(ndens_Hminus(case["nH_I_div_U"], case["ne"], case["T"]))
+        py = np.array(Hminus_bf(nus, case["T"], case["nH_I_div_U"], case["ne"])) / n_Hminus
+        julia = [case["outputs"]["Hminus_bf_unit_ndens"][str(w)] for w in wavelengths_A]
+
+        _assert_matches(py, julia, wavelengths_A, 1e-6, f"Hminus_bf per H⁻ ion [{label}]")
+
+    @pytest.mark.parametrize("label", CONTINUUM_CONDITIONS)
+    def test_Hminus_bf(self, reference_data, label):
+        """H⁻ bound-free absorption vs Julia, fed the same n(H⁻).
+
+        rtol is 2e-6 rather than 1e-6 because Korg.px derives n(H⁻) internally with the
+        v1.1 literal coefficient, which is 9.238e-7 low relative to Korg v1.2's
+        translational_U (see test_hminus_number_density_ground_state_convention).  The
+        cross section itself is checked at 1e-6 in test_Hminus_bf_cross_section.
+        """
+        from korg.continuum import Hminus_bf
+
+        case = _source_case(reference_data, label)
+        wavelengths_A = case["wavelengths_A"]
+        nus = self._nus(wavelengths_A)
+
+        py = np.array(Hminus_bf(nus, case["T"], case["nH_I_div_U"], case["ne"]))
+        julia = [case["outputs"]["Hminus_bf"][str(w)] for w in wavelengths_A]
+
+        _assert_matches(py, julia, wavelengths_A, 2e-6, f"Hminus_bf [{label}]")
+
+    # -- H⁻ free-free --------------------------------------------------------
+
+    @pytest.mark.parametrize("label", CONTINUUM_CONDITIONS)
+    def test_Hminus_ff(self, reference_data, label):
+        """H⁻ free-free (Bell & Berrington 1987 table) vs Julia."""
+        from korg.continuum import Hminus_ff
+
+        case = _source_case(reference_data, label)
+        wavelengths_A = case["wavelengths_A"]
+        nus = self._nus(wavelengths_A)
+
+        py = np.array(Hminus_ff(nus, case["T"], case["nH_I_div_U"], case["ne"]))
+        julia = [case["outputs"]["Hminus_ff"][str(w)] for w in wavelengths_A]
+
+        _assert_matches(py, julia, wavelengths_A, 1e-6, f"Hminus_ff [{label}]")
+
+    # -- He⁻ free-free -------------------------------------------------------
+
+    @pytest.mark.parametrize("label", CONTINUUM_CONDITIONS)
+    def test_Heminus_ff(self, reference_data, label):
+        """He⁻ free-free (John 1994 table) vs Julia, including the λ < 5063 Å cutoff."""
+        from korg.continuum import Heminus_ff
+
+        case = _source_case(reference_data, label)
+        wavelengths_A = case["wavelengths_A"]
+        nus = self._nus(wavelengths_A)
+
+        py = np.array(Heminus_ff(nus, case["T"], case["nHe_I_div_U"], case["ne"]))
+        julia = [case["outputs"]["Heminus_ff"][str(w)] for w in wavelengths_A]
+
+        _assert_matches(py, julia, wavelengths_A, 1e-6, f"Heminus_ff [{label}]")
+
+    # -- Metal bound-free ----------------------------------------------------
+
+    @pytest.mark.parametrize("label", CONTINUUM_CONDITIONS)
+    def test_metal_bf_absorption(self, reference_data, label):
+        """Metal bound-free (TOPBase/NORAD tables) vs Julia."""
+        from korg.continuum import metal_bf_absorption
+
+        case = _source_case(reference_data, label)
+        wavelengths_A = case["wavelengths_A"]
+        nus = self._nus(wavelengths_A)
+
+        py = np.array(metal_bf_absorption(nus, case["T"], case["number_densities"]))
+        julia = [case["outputs"]["metal_bf"][str(w)] for w in wavelengths_A]
+
+        assert np.any(py > 0), f"metal_bf_absorption is identically zero at [{label}]"
+        _assert_matches(py, julia, wavelengths_A, 1e-6, f"metal_bf_absorption [{label}]")
+
+    def test_metal_bf_absorption_key_spelling(self, reference_data):
+        """'Fe_I' and 'Fe I' must give the same answer.
+
+        The cross-section tables are keyed with a space while the rest of the package
+        keys number densities with an underscore; a mismatch here silently drops every
+        metal bf contribution from total_continuum_absorption rather than erroring.
+        """
+        from korg.continuum import metal_bf_absorption
+
+        case = _source_case(reference_data, "solar")
+        nus = self._nus(case["wavelengths_A"])
+        nd_underscore = case["number_densities"]
+        nd_space = {k.replace("_", " "): v for k, v in nd_underscore.items()}
+
+        a_underscore = np.array(metal_bf_absorption(nus, case["T"], nd_underscore))
+        a_space = np.array(metal_bf_absorption(nus, case["T"], nd_space))
+
+        assert np.any(a_underscore > 0), "underscore-keyed metal bf is identically zero"
+        assert np.allclose(a_underscore, a_space, rtol=1e-12, atol=0.0), (
+            f"key spelling changes metal bf: {a_underscore} vs {a_space}"
+        )
+
+    # -- Positive-ion free-free ---------------------------------------------
+
+    @pytest.mark.parametrize("label", CONTINUUM_CONDITIONS)
+    def test_positive_ion_ff_absorption(self, reference_data, label):
+        """Positive-ion free-free (hydrogenic + Peach 1970 departures) vs Julia."""
+        from korg.continuum import positive_ion_ff_absorption
+
+        case = _source_case(reference_data, label)
+        wavelengths_A = case["wavelengths_A"]
+        nus = self._nus(wavelengths_A)
+
+        py = np.array(positive_ion_ff_absorption(nus, case["T"], case["number_densities"],
+                                                 case["ne"]))
+        julia = [case["outputs"]["positive_ion_ff"][str(w)] for w in wavelengths_A]
+
+        assert np.any(py > 0), f"positive_ion_ff_absorption is identically zero at [{label}]"
+        _assert_matches(py, julia, wavelengths_A, 1e-6,
+                        f"positive_ion_ff_absorption [{label}]")
+
+
+class TestTotalContinuumConditions:
+    """The summed continuum at three conditions where different sources dominate."""
+
+    # Per-condition tolerances.  The sum is limited by H_I_bf, which agrees with Julia
+    # only at the few×1e-4 level (its own reference test uses rtol=1e-4, citing the MHD
+    # occupation-probability formalism).  H_I_bf is negligible in the cool case, ~1% of
+    # the total at 3000 Å in the solar case, and up to 93% of it in the hot case, so the
+    # tolerance is set per condition instead of using one loose bound everywhere.
+    # Observed maxima: 9.0e-7 (cool_dense), 3.1e-6 (solar), 1.0e-4 (hot).
+    RTOL = {"cool_dense": 2e-6, "solar": 1e-5, "hot": 3e-4}
+
+    @pytest.mark.parametrize("label", CONTINUUM_CONDITIONS)
+    def test_total_continuum_absorption(self, reference_data, label):
+        from korg.continuum import total_continuum_absorption
+        from korg.constants import c_cgs
+        from korg.data_loader import default_partition_funcs
+        from korg.species import Species
+
+        ref = reference_data.get("total_continuum_absorption", {}).get("conditions")
+        if not ref or label not in ref:
+            pytest.skip(f"total_continuum_absorption['conditions'][{label!r}] not in "
+                        "reference data (regenerate tests/julia_reference_data.json)")
+        case = ref[label]
+
+        wavelengths_A = case["wavelengths_A"]
+        nus = jnp.array([c_cgs / (wl_A * 1e-8) for wl_A in wavelengths_A])
+        pf_str = {str(k).replace(" ", "_"): v for k, v in default_partition_funcs.items()
+                  if isinstance(k, Species)}
+
+        py = np.array(total_continuum_absorption(nus, case["T"], case["ne"],
+                                                 case["number_densities"], pf_str))
+        julia = [case["outputs"][str(w)] for w in wavelengths_A]
+
+        _assert_matches(py, julia, wavelengths_A, self.RTOL[label],
+                        f"total_continuum_absorption [{label}]")
+
+
+# ---------------------------------------------------------------------------
 # Differentiability
 # ---------------------------------------------------------------------------
 

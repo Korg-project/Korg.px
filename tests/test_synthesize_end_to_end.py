@@ -7,7 +7,7 @@ tests/generate_solar_synthesis_reference.jl and committed as a CI artifact.
 These tests call korg.synthesize() as a black box with the same inputs Julia
 used and compare the continuum-normalised output.  The Na I line at 6000 Å
 is a simple, single-line case that exercises the full synthesis pipeline:
-  chemical_equilibrium → line_absorption → radiative_transfer
+  chemical_equilibrium_all_layers → line_absorption → radiative_transfer
 """
 
 from pathlib import Path

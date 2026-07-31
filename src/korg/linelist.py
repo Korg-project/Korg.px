@@ -18,6 +18,10 @@ from .constants import (
     kboltz_cgs, kboltz_eV, bohr_radius_cgs, RydbergH_eV, Rydberg_eV
 )
 from .data_loader import ionization_energies
+# Single implementation of the Birch & Downs (1994) air/vacuum conversion, as
+# in Korg.jl's utils.jl. Re-exported here (and from ``korg``) so that
+# ``korg.linelist.air_to_vacuum`` keeps working.
+from .utils import air_to_vacuum, vacuum_to_air  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -236,43 +240,6 @@ def create_line(
         gamma_stark=float(gamma_stark),
         vdW=(float(vdW[0]), float(vdW[1]))
     )
-
-
-def air_to_vacuum(wl_air: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
-    """
-    Convert air wavelength to vacuum wavelength using the Edlén (1966) formula.
-
-    Args:
-        wl_air: Wavelength in air (Ångströms)
-
-    Returns:
-        Wavelength in vacuum (Ångströms)
-    """
-    # Edlén (1966) formula, standard conversion
-    # This is the IAU standard: https://www.iau.org/publications/proceedings_rules/units/
-    sigma2 = (1e4 / wl_air) ** 2  # (μm⁻¹)²
-    n = 1 + 0.00008336624212083 + 0.02408926 / (130.1065 - sigma2) + 0.0001599740 / (38.92568 - sigma2)
-    return wl_air * n
-
-
-def vacuum_to_air(wl_vac: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
-    """
-    Convert vacuum wavelength to air wavelength.
-
-    This uses an iterative approach to invert the air_to_vacuum formula.
-
-    Args:
-        wl_vac: Wavelength in vacuum (Ångströms)
-
-    Returns:
-        Wavelength in air (Ångströms)
-    """
-    # Start with vacuum wavelength as initial guess
-    wl_air = wl_vac
-    # Iterate to converge
-    for _ in range(5):
-        wl_air = wl_vac / (air_to_vacuum(wl_air) / wl_air)
-    return wl_air
 
 
 def read_vald_linelist(filename: str) -> list:

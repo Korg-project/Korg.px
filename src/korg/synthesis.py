@@ -8,6 +8,8 @@ Reference: Korg.jl synthesize.jl
 """
 
 import functools
+import warnings
+
 import numpy as np
 import jax.numpy as jnp
 from dataclasses import dataclass
@@ -16,8 +18,8 @@ from typing import Optional, Tuple, List, Dict, Callable, Union
 from scipy.interpolate import interp1d
 
 from .atmosphere import PlanarAtmosphere, ShellAtmosphere
-from .statmech import (chemical_equilibrium, chemical_equilibrium_fast,
-                       chemical_equilibrium_all_layers)
+from .statmech import (chemical_equilibrium_fast, chemical_equilibrium_all_layers,
+                       precompute_chemical_equilibrium_data)
 from .data_loader import (ionization_energies, default_partition_funcs,
                           default_log_equilibrium_constants,
                           default_chem_eq_data, default_mol_species)
@@ -301,6 +303,14 @@ def synthesize_spectrum(
     """
     Compute synthetic spectrum with lines.
 
+    .. deprecated::
+        Use :func:`synthesize_jit` instead. This implementation cannot be traced by
+        ``jax.jit``: it orchestrates jitted kernels from Python and drops to host NumPy
+        in places, so it cannot be placed on a GPU as one kernel, ``vmap``ped over
+        stellar parameters, or differentiated end to end — the properties this package
+        exists to provide. It is retained until ``synthesize_jit`` covers the same
+        options, and will then be removed.
+
     This is the main synthesis function following Julia's synthesize().
 
     Parameters
@@ -343,6 +353,13 @@ def synthesize_spectrum(
     result : SynthesisResult
         Synthesis results with wavelengths, flux, and continuum
     """
+    warnings.warn(
+        "synthesize_spectrum() is deprecated and will be removed; it cannot be "
+        "jit-compiled or differentiated. Use synthesize_jit() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     import time
     timings = {} if profile else None
     t_start = time.time() if profile else None
@@ -408,8 +425,8 @@ def synthesize_spectrum(
     # Reference wavelength for optical depth (5000 Å for MARCS models)
     lambda_ref_cm = 5e-5  # 5000 Å in cm
 
-    # Convert A(X) format abundances to linear number fractions for chemical_equilibrium.
-    # Julia's format_A_X() returns A(X) = log10(N_X/N_H) + 12; chemical_equilibrium
+    # Convert A(X) format abundances to linear number fractions for chemical equilibrium.
+    # Julia's format_A_X() returns A(X) = log10(N_X/N_H) + 12; the solver
     # expects N(X)/N_total (values summing to ~1). Detect A(X) by H abundance > 1.
     if abundances[0] > 1.0:
         abs_abundances = A_X_to_absolute(np.asarray(abundances))
@@ -435,28 +452,31 @@ def synthesize_spectrum(
     # Pass 1: chemical equilibrium for all layers
     if profile:
         t0 = time.time()
+    # Both paths use the same batched solver; they differ only in whether the
+    # temperature-gridded coefficients are the cached default tables or built here from
+    # caller-supplied partition functions and equilibrium constants.
     if using_defaults:
-        # Batch all layers at once: single XLA dispatch, avoids 56× dict overhead
-        electron_densities, number_densities_batch, raw_arrays_list = \
-            chemical_equilibrium_all_layers(
-                T, n_total, ne_model, abs_abundances,
-                default_chem_eq_data, default_mol_species
-            )
-        number_densities_list = None  # not used in fast path
+        chem_eq_data, mol_species = default_chem_eq_data, default_mol_species
     else:
-        for i in range(n_layers):
-            T_i = T[i]
-            ne_i = ne_model[i]
-            n_i = n_total[i]
-            ne_calc, n_dict = chemical_equilibrium(
-                T_i, n_i, ne_i, abs_abundances,
-                ionization_energies_dict,
-                partition_funcs,
-                log_equilibrium_constants,
-                electron_density_warn_threshold=1.0
-            )
-            electron_densities[i] = ne_calc
-            number_densities_list.append(n_dict)
+        chem_eq_data = precompute_chemical_equilibrium_data(
+            ionization_energies_dict, partition_funcs, log_equilibrium_constants
+        )
+        mol_species = list(log_equilibrium_constants.keys())
+
+    # Batch all layers at once: single XLA dispatch, avoids 56× dict overhead
+    electron_densities, number_densities_batch, raw_arrays_list = \
+        chemical_equilibrium_all_layers(
+            T, n_total, ne_model, abs_abundances, chem_eq_data, mol_species
+        )
+
+    if using_defaults:
+        number_densities_list = None  # fast path consumes the batched arrays directly
+    else:
+        # The custom-data continuum path below still wants one dict per layer.
+        number_densities_list = [
+            {spec: float(arr[i]) for spec, arr in number_densities_batch.items()}
+            for i in range(n_layers)
+        ]
     if profile:
         t_chem_eq = time.time() - t0
 
@@ -928,10 +948,10 @@ def synth(
 import jax
 from typing import NamedTuple
 from .statmech import (ChemicalEquilibriumData, precompute_chemical_equilibrium_data,
-                       chemical_equilibrium_jit, MAX_ATOMIC_NUMBER,
+                       picard_chemical_equilibrium_guess, MAX_ATOMIC_NUMBER,
                        _compute_saha_weights_jit, translational_U,
                        _compute_mol_densities_jit,
-                       _chemical_equilibrium_batch_jit,
+                       _picard_chemical_equilibrium_guess_batch,
                        _compute_mol_densities_batch_jit,
                        _compute_saha_weights_batch_jit,
                        _chem_eq_newton_batch_jit,
@@ -1248,7 +1268,7 @@ def precompute_atmosphere(
     c_cgs_float = float(c_cgs)
 
     # ── Phase 1: Picard initial guess ────────────────────────────────────────
-    ne_init, nf_init = _chemical_equilibrium_batch_jit(
+    ne_init, nf_init = _picard_chemical_equilibrium_guess_batch(
         T_layers, n_total_layers, ne_layers, abundances, data.chem_eq_data
     )
 
@@ -2177,7 +2197,7 @@ def _compute_number_densities_jit(T, n_total, ne, abundances, data):
     Returns arrays indexed by (Z-1) for H I, H II, He I, H2, plus the self-consistent ne.
     """
     # Picard iteration for self-consistent electron density and neutral fractions
-    ne_sol, neutral_fracs = chemical_equilibrium_jit(T, n_total, ne, abundances, data.chem_eq_data)
+    ne_sol, neutral_fracs = picard_chemical_equilibrium_guess(T, n_total, ne, abundances, data.chem_eq_data)
 
     # First-ionization weights at the self-consistent ne
     wII_ne1, _ = _compute_saha_weights_jit(T, 1.0, data.chem_eq_data)
@@ -2554,7 +2574,7 @@ def synthesize_jit(
         # ── Phase 1: Picard initial guess for Newton solver ──────────────────────
         # A single Picard pass (300 iterations, all layers at once) gives ne and
         # neutral fractions close enough that Newton converges in ~5 iterations.
-        ne_init, nf_init = _chemical_equilibrium_batch_jit(
+        ne_init, nf_init = _picard_chemical_equilibrium_guess_batch(
             T_layers, n_total_layers, ne_layers, abundances, data.chem_eq_data
         )
 
