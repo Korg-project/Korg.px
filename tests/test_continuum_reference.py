@@ -504,3 +504,77 @@ class TestContinuumPhysics:
         assert np.isclose(a2 / a1, 2.0, rtol=1e-4), (
             f"Thomson scattering should scale linearly with ne: ratio={a2/a1:.4f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Differentiability
+# ---------------------------------------------------------------------------
+
+class TestContinuumGradients:
+    """The continuum must be differentiable, not merely finite-valued.
+
+    ``H_I_bf`` computes an effective quantum number 1/sqrt(1/n^2 - h*nu/chi) for the
+    level an electron is excited into. Above the series limit that radicand is negative,
+    so the expression is NaN, and the result is discarded by a ``jnp.where``. Masking a
+    NaN does not mask its gradient, so before the radicand was clamped this returned a
+    NaN derivative while the value looked perfectly healthy — which is exactly the
+    failure mode these tests exist to catch.
+    """
+
+    @staticmethod
+    def _nu(wavelength_A):
+        from korg.constants import c_cgs
+        return c_cgs / (wavelength_A * 1e-8)
+
+    @staticmethod
+    def _central_diff(f, x, rel_step=1e-4):
+        return (float(f(x * (1 + rel_step))) - float(f(x * (1 - rel_step)))) / (2 * rel_step * x)
+
+    # Wavelengths straddle the Balmer (3646 A) and Paschen (8206 A) limits, where the
+    # masked branch is taken for different sets of levels.
+    @pytest.mark.parametrize("T", [4000.0, 5000.0, 8000.0])
+    @pytest.mark.parametrize("wavelength_A", [3000.0, 4000.0, 5000.0, 8000.0])
+    def test_H_I_bf_grad_wrt_ne(self, T, wavelength_A):
+        from korg.continuum import H_I_bf
+
+        nu = jnp.array([self._nu(wavelength_A)])
+        f = lambda ne: jnp.sum(H_I_bf(nu, T, 1e17, 1e16, ne, 2.0))
+
+        grad = float(jax.grad(f)(jnp.float64(1e13)))
+        assert np.isfinite(grad), f"d(H_I_bf)/dne is NaN at T={T}, {wavelength_A} A"
+
+        fd = self._central_diff(f, 1e13)
+        assert np.isclose(grad, fd, rtol=1e-4), (
+            f"T={T}, {wavelength_A} A: grad={grad:.6e} vs finite difference {fd:.6e}"
+        )
+
+    def test_H_I_bf_grad_wrt_other_inputs_finite(self):
+        from korg.continuum import H_I_bf
+
+        nu = jnp.array([self._nu(5000.0)])
+        cases = {
+            "T": (lambda x: jnp.sum(H_I_bf(nu, x, 1e17, 1e16, 1e13, 2.0)), 5000.0),
+            "nH_I": (lambda x: jnp.sum(H_I_bf(nu, 5000.0, x, 1e16, 1e13, 2.0)), 1e17),
+            "nHe_I": (lambda x: jnp.sum(H_I_bf(nu, 5000.0, 1e17, x, 1e13, 2.0)), 1e16),
+        }
+        for name, (f, x0) in cases.items():
+            grad = float(jax.grad(f)(jnp.float64(x0)))
+            assert np.isfinite(grad), f"d(H_I_bf)/d{name} is not finite"
+
+    def test_total_continuum_absorption_grad_wrt_ne(self):
+        from korg.continuum import total_continuum_absorption
+        from korg.data_loader import default_partition_funcs
+
+        nu = jnp.array([self._nu(5000.0)])
+        number_densities = {"H_I": 1e17, "H_II": 1e13, "He_I": 1e16, "H2": 1e10}
+        f = lambda ne: jnp.sum(
+            total_continuum_absorption(nu, 5000.0, ne, number_densities, default_partition_funcs)
+        )
+
+        grad = float(jax.grad(f)(jnp.float64(1e13)))
+        assert np.isfinite(grad), "d(total_continuum_absorption)/dne is NaN"
+
+        fd = self._central_diff(f, 1e13)
+        assert np.isclose(grad, fd, rtol=1e-4), (
+            f"grad={grad:.6e} vs finite difference {fd:.6e}"
+        )

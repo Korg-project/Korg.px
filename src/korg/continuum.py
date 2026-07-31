@@ -676,8 +676,20 @@ def H_I_bf(nu, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
             # For nu >= nu_break: fully dissolved
             # For nu < nu_break: compute dissolution using MHD
             def compute_dissolution(nu_val):
-                # Effective quantum number for absorbed photon
-                n_eff = 1.0 / jnp.sqrt(1.0 / (n * n) - hplanck_eV * nu_val / chi_ion)
+                # Effective quantum number of the level the electron is excited to.
+                # The radicand 1/n² - hν/χ is only positive below the series limit
+                # (ν < nu_break); at or above it the electron is unbound and there is
+                # no upper level.  The result is discarded by the jnp.where below, but
+                # reverse-mode AD still pushes a cotangent through this branch, and a
+                # cotangent multiplied by a NaN is NaN — masking a NaN does not mask
+                # its gradient.  So clamp the radicand to a small positive floor
+                # *before* the square root (the standard "double where" trick).  The
+                # floor is never active for ν < nu_break in any regime of interest: it
+                # caps n_eff at 1e5, for which the upper level is already completely
+                # dissolved (w_upper underflows to exactly 0), so the selected values
+                # are bit-for-bit unchanged.
+                radicand = 1.0 / (n * n) - hplanck_eV * nu_val / chi_ion
+                n_eff = 1.0 / jnp.sqrt(jnp.maximum(radicand, 1e-10))
 
                 # Occupation probability for upper level
                 w_upper = hummer_mihalas_w(
