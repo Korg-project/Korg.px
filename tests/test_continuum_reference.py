@@ -574,10 +574,10 @@ class TestContinuumSourceReference:
     def test_hminus_number_density_ground_state_convention(self, reference_data, label):
         """Python's internal n(H⁻) matches Korg's nK relation in the ground-state convention.
 
-        The residual ~9.24e-7 is *not* noise: Korg.px hardcodes the v1.1 literal
-        coef = 3.31283018e-22 for (h²/2πm)^1.5·k_eV^1.5, whereas Korg v1.2 evaluates
-        1/translational_U(m_e, T) from its constants.  The literal is low by 9.238e-7
-        relative, independent of T, so the tolerance here is 2e-6 rather than 1e-6.
+        Korg.px previously carried Korg.jl v1.1's literal coef = 3.31283018e-22, which is
+        high by 9.238e-7 relative to (h²·k_eV / 2π·m_e·k_cgs)^1.5 — the value v1.2 obtains
+        via 1/translational_U(m_e, T).  The coefficient is now derived from the constants
+        instead, so this agrees to machine precision and the tolerance is 1e-12.
         """
         from korg.continuum import ndens_Hminus
 
@@ -586,7 +586,7 @@ class TestContinuumSourceReference:
         julia = case["nHminus_ground_state"]
 
         rel = py / julia - 1
-        assert abs(rel) < 2e-6, (
+        assert abs(rel) < 1e-12, (
             f"{label}: Python n(H⁻)={py:.10e} vs Julia ground-state convention "
             f"{julia:.10e} (rel={rel:.3e})"
         )
@@ -609,8 +609,10 @@ class TestContinuumSourceReference:
 
         expected_ratio = 2.0 / case["U_H_I"]
         observed_ratio = py / julia_v12
-        # The extra 9.238e-7 is the stale v1.1 coefficient documented above.
-        assert np.isclose(observed_ratio, expected_ratio, rtol=2e-6), (
+        # With the coefficient derived rather than hardcoded, the only remaining
+        # difference is the convention itself: Korg v1.2 folds U(H I) = 2 into its
+        # constant, where Korg.px divides by the actual partition function.
+        assert np.isclose(observed_ratio, expected_ratio, rtol=1e-12), (
             f"{label}: n(H⁻) ratio to Korg v1.2 relation is {observed_ratio:.12f}, "
             f"expected 2/U(H I) = {expected_ratio:.12f}"
         )

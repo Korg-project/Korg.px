@@ -16,7 +16,8 @@ import jax.numpy as jnp
 from scipy.interpolate import RegularGridInterpolator
 import h5py
 
-from ..constants import hplanck_cgs, hplanck_eV, kboltz_cgs, kboltz_eV, c_cgs
+from ..constants import (hplanck_cgs, hplanck_eV, kboltz_cgs, kboltz_eV, c_cgs,
+                         electron_mass_cgs)
 
 
 # H⁻ ionization energy from McLaughlin+ 2017
@@ -115,7 +116,7 @@ def _ndens_Hminus(nH_I_div_partition, ne, T, ion_energy=H_MINUS_ION_ENERGY_EV):
     where:
         - n(H I, gs) = 2 × n(H I) / U(T) is the ground state H I density
           (Boltzmann factor is 1, degeneracy is 2)
-        - coef = (h²/(2πm))^1.5 ≈ 3.31283018e-22 cm³·eV^1.5
+        - coef = (h²·k_eV / 2π·m_e·k_cgs)^1.5, derived from the physical constants
         - β = 1/(k_B T) in eV^-1
 
     Warning: For JIT compatibility, temperature validation is removed.
@@ -124,8 +125,12 @@ def _ndens_Hminus(nH_I_div_partition, ne, T, ion_energy=H_MINUS_ION_ENERGY_EV):
     # Ground state H I number density: Boltzmann factor = 1, degeneracy = 2
     nHI_groundstate = 2 * nH_I_div_partition
 
-    # Coefficient: (h²/(2πm_e))^1.5
-    coef = 3.31283018e-22  # cm³·eV^1.5
+    # Coefficient (h²·k_eV / 2π·m_e·k_cgs)^1.5, in cm³·eV^1.5. Korg.jl v1.1 carried this
+    # as the literal 3.31283018e-22, which is high by 9.2e-7 relative; v1.2 dropped the
+    # literal and evaluates the equivalent 1/translational_U(m_e, T) instead. Derive it
+    # from the constants so the two agree exactly rather than to ~1e-6.
+    coef = (hplanck_cgs ** 2 * kboltz_eV
+            / (2 * jnp.pi * electron_mass_cgs * kboltz_cgs)) ** 1.5
 
     # Inverse temperature in eV
     beta = 1.0 / (kboltz_eV * T)

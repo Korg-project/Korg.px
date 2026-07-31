@@ -257,7 +257,10 @@ def ndens_Hminus(nH_I_div_partition, ne, T, ion_energy=_H_MINUS_ION_ENERGY):
     nHI_groundstate = 2.0 * nH_I_div_partition
 
     # Coefficient: (h²/(2πm))^1.5 where m is electron mass
-    coef = 3.31283018e-22  # cm³·eV^1.5
+    # See absorption_h_minus._ndens_Hminus: derived from constants rather than carried as
+    # Korg.jl v1.1's literal, which is high by 9.2e-7 relative to what v1.2 computes.
+    coef = (hplanck_cgs ** 2 * kboltz_eV
+            / (2 * jnp.pi * electron_mass_cgs * kboltz_cgs)) ** 1.5
 
     # β = 1/(k·T) in eV units
     beta = 1.0 / (kboltz_eV * T)

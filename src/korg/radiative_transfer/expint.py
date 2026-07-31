@@ -72,6 +72,20 @@ def exponential_integral_1(x):
         return ((x * (x + 2.334733) + 0.25062) /
                 (x * (x + 3.330657) + 1.681534) / x * jnp.exp(-x))
 
+    # jnp.where masks the *value* of the branch that is not taken, but not its
+    # cotangent: reverse-mode AD still differentiates the dead branch and
+    # multiplies the result by a zero cotangent, so an infinite derivative in a
+    # dead branch poisons the gradient with 0 * inf = NaN. Feed each dangerous
+    # branch an argument that is inside its own domain whenever the branch is
+    # not selected; where it *is* selected the argument is bitwise x, so values
+    # are unchanged.
+    #
+    # _e1_small divides by nothing but takes log(x), whose derivative 1/x is
+    # infinite at x = 0. _e1_medium divides by x (pole at x = 0) and by
+    # x*(x + 3.330657) + 1.681534, which vanishes at x ~ -0.620 and x ~ -2.710.
+    x_small = jnp.where((x > 0.01) & (x <= 1.0), x, 0.5)
+    x_medium = jnp.where((x > 1.0) & (x <= 30.0), x, 2.0)
+
     # Piecewise function using nested jnp.where
     return jnp.where(
         x < 0,
@@ -81,10 +95,10 @@ def exponential_integral_1(x):
             _e1_tiny(x),
             jnp.where(
                 x <= 1.0,
-                _e1_small(x),
+                _e1_small(x_small),
                 jnp.where(
                     x <= 30.0,
-                    _e1_medium(x),
+                    _e1_medium(x_medium),
                     0.0
                 )
             )
@@ -206,13 +220,32 @@ def exponential_integral_2(x):
                   (-7.862405341465122e-6 +
                    (2.2386015208338193e-6 - 5.173353514609864e-7 * x_shifted) * x_shifted) * x_shifted) * x_shifted) * x_shifted)
 
+    # At x == 0 the exact value 1.0 is selected, but jnp.where masks only the
+    # value of the branches that are not taken -- reverse-mode AD still walks
+    # them. _expint_small(0) is NaN (log(0) * 0) with a NaN derivative and
+    # _expint_large(0) divides by zero, so the zero cotangent of the dead branch
+    # gives 0 * NaN = NaN and the gradient at x = 0 comes back NaN even though
+    # the value is a healthy 1.0. Substitute a strictly positive argument in
+    # exactly the case where the branch is dead; everywhere else x_safe is
+    # bitwise x, so no value changes. Only the two branches containing log(x)
+    # and 1/x need this; the polynomial branches are entire.
+    x_safe = jnp.where(x == 0.0, 1.0, x)
+
+    # _expint_large needs a stronger guard than the other branches: it forms
+    # 120/x**4, which overflows to inf for x below ~5e-77 and then contributes
+    # 0 * inf = NaN to the gradient, even though the branch is dead for every
+    # x < 9. Substituting the branch's own lower limit keeps it bitwise x
+    # wherever it is selected. The comparison is written as `x < 9.0` rather
+    # than `x >= 9.0` so that a NaN argument still propagates a NaN, as before.
+    x_large = jnp.where(x < 9.0, 9.0, x_safe)
+
     # Piecewise function using nested jnp.where (matching Julia's if-elseif chain exactly)
     return jnp.where(
         x == 0.0,
         1.0,  # Exact value at x=0
         jnp.where(
             x < 1.1,
-            _expint_small(x),
+            _expint_small(x_safe),
             jnp.where(
                 x < 2.5,
                 _expint_2(x),
@@ -234,7 +267,7 @@ def exponential_integral_2(x):
                                     jnp.where(
                                         x < 9.0,
                                         _expint_8(x),
-                                        _expint_large(x)
+                                        _expint_large(x_large)
                                     )
                                 )
                             )
