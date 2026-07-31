@@ -65,5 +65,8 @@ h5open(outfile, "w") do fid
         attributes(g)["lambda0"] = λ0
         println("  $name: max alpha = ", maximum(αs))
     end
+    # Provenance: which Korg.jl produced this reference.
+    attributes(fid)["korg_version"] = string(pkgversion(Korg))
+    attributes(fid)["julia_version"] = string(VERSION)
 end
 println("Wrote ", outfile)

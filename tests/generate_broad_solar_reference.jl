@@ -50,6 +50,9 @@ h5open(output_file, "w") do f
     f["atmosphere/tau_ref"] = [layer.tau_ref for layer in atm.layers]
     f["atmosphere/vmic"] = 1.0
     f["abundances"] = A_X
+    # Provenance: which Korg.jl produced this reference.
+    attributes(f)["korg_version"] = string(pkgversion(Korg))
+    attributes(f)["julia_version"] = string(VERSION)
 end
 
 println("✓ Saved: $output_file")

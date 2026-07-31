@@ -926,12 +926,18 @@ let
     nHe_II_cntm = 1.0e9
     nH2_cntm   = 1.0e12
 
+    # Korg 1.2 treats H⁻ as a species carried by chemical_equilibrium rather than deriving it
+    # inside Hminus_bf, so total_continuum_absorption now requires it in number_densities.
+    # Use the same relation chemical_equilibrium uses: n(H⁻) = nK(T) * n(H I) * nₑ.
+    nHminus_cntm = Korg.Hminus_nK(T_cntm) * nH_I_cntm * ne_cntm
+
     number_densities_cntm = Dict(
         Korg.species"H_I"  => nH_I_cntm,
         Korg.species"H_II" => nH_II_cntm,
         Korg.species"He_I" => nHe_I_cntm,
         Korg.species"He_II"=> nHe_II_cntm,
         Korg.species"H2"   => nH2_cntm,
+        Korg.species"H-"   => nHminus_cntm,
     )
 
     wavelengths_A = [3000.0, 4000.0, 5000.0, 6000.0, 8000.0, 10000.0]
@@ -949,6 +955,7 @@ let
             "T" => T_cntm, "ne" => ne_cntm,
             "nH_I" => nH_I_cntm, "nH_II" => nH_II_cntm,
             "nHe_I" => nHe_I_cntm, "nHe_II" => nHe_II_cntm, "nH2" => nH2_cntm,
+            "nHminus" => nHminus_cntm,
             "wavelengths_A" => wavelengths_A,
             "outputs" => cntm_outputs
         )
@@ -1146,9 +1153,21 @@ let
 end
 
 # =============================================================================
+# Provenance
+# =============================================================================
+# Record which Korg.jl produced this file. tests/test_julia_reference.py asserts
+# this matches EXPECTED_KORG_VERSION, so stale reference data is a test failure
+# rather than a silent comparison against the wrong physics.
+reference_data["metadata"] = Dict(
+    "korg_version" => string(pkgversion(Korg)),
+    "julia_version" => string(VERSION),
+)
+println("\nGenerated with Korg.jl v$(pkgversion(Korg)) on Julia v$(VERSION)")
+
+# =============================================================================
 # Save to JSON
 # =============================================================================
-println("\nSaving to $output_file...")
+println("Saving to $output_file...")
 open(output_file, "w") do f
     JSON.print(f, reference_data, 2)  # 2-space indentation
 end

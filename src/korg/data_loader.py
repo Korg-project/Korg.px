@@ -711,8 +711,9 @@ def calculate_polyatomic_equilibrium_constants(partition_funcs):
                                                for Z in Zs])
                         log_Us_ratio -= np.log10(pfuncs[spec](logT))
 
-                        # Mass ratio: Π m_atoms / m_molecule
-                        log_masses_ratio = (np.sum([np.log10(atomic_masses[int(Z)])
+                        # Mass ratio: Π m_atoms / m_molecule.
+                        # atomic_masses is 0-indexed, so element Z is at index Z-1.
+                        log_masses_ratio = (np.sum([np.log10(atomic_masses[int(Z) - 1])
                                                     for Z in Zs])
                                            - np.log10(spec.get_mass()))
 

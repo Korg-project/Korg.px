@@ -2,6 +2,28 @@
 
 This file tracks the progress of converting Julia functions to JAX-compatible Python.
 
+**Reference version: Korg.jl v1.2.1** (pinned exactly in `Project.toml`). All Julia reference
+fixtures are regenerated from that release; `tests/test_julia_reference.py` asserts the fixtures
+carry a matching version stamp.
+
+`statmech.chemical_equilibrium` implements the v1.2 formulation: the system is solved in log₁₀
+space with a step-clipped Newton method, nₑ is a free parameter, H⁻ is carried as a species and
+enters charge balance via `Hminus_nK(T)`, molecules contribute their extra nuclei to the nucleus
+budget, and a continuation on molecular abundance anneals into cool, dense regimes. It reproduces
+Korg.jl v1.2.1 to machine precision (worst relative difference 8e-15 over T = 2500–8000 K,
+nₜ = 1e15–1e17).
+
+Remaining differences between this port and the v1.2.1 target:
+
+- **H⁻ opacity.** v1.2 also changed `Hminus_bf` to take n(H⁻) directly instead of deriving it from
+  a local Saha relation. `continuum.Hminus_bf` still derives it internally. The two agree to <1e-6
+  at solar conditions, and `chemical_equilibrium` now returns n(H⁻) for callers that want it.
+- **Batched / JIT chemistry.** `chemical_equilibrium_all_layers`,
+  `_chemical_equilibrium_batch_jit` and `_chem_eq_residuals_newton` (with its hand-derived
+  analytic Jacobian) still implement the v1.1 formulation. These feed `synthesize()` and
+  `synthesize_jit()`. Porting them requires rederiving the analytic Jacobian for the log-space
+  system.
+
 Legend:
 - [ ] Not started
 - [x] Completed
@@ -228,7 +250,10 @@ Each function has three checkboxes:
 
 | Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
 |-------|----------|------|-----------|-----------------|--------------|
-| 4 | `chemical_equilibrium(T, nₜ, nₑ, ...)` | solve equilibrium (JIT via chemical_equilibrium_jit) | ✓ | ✓ | ✓ |
+| 4 | `chemical_equilibrium(T, nₜ, nₑ, ...)` | v1.2 formulation: log-space clipped Newton, nₑ free, H⁻ in charge balance, molecular continuation. Matches v1.2.1 to 8e-15 | ✓ | ✓ | N/A (Python loop) |
+| 4 | `Hminus_nK(T)` | H⁻ formation coefficient, n(H⁻) = nK·n(H I)·nₑ (new in v1.2) | ✓ | ✓ | ✓ |
+| 4 | `clipped_newton(...)` | Newton with per-decade step clipping, matches v1.2 `clipped_newton` | ✓ | ✓ | N/A (Python loop) |
+| 4 | `chemical_equilibrium_all_layers(...)` | batched path used by `synthesize()`; still v1.1 formulation | ✓ | ✓ | ✓ |
 
 ### Total Continuum (`continuum.py`)
 

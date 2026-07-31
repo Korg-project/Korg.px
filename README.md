@@ -4,6 +4,13 @@
 
 A Python (JAX) implementation of [Korg.jl](https://github.com/ajwheeler/Korg.jl), a package for computing stellar spectra from 1D model atmospheres and linelists assuming local thermodynamic equilibrium.
 
+**Target version: Korg.jl v1.2.1.** Every reference fixture the test suite compares against is generated
+from that release, pinned exactly in `Project.toml`. To regenerate them all:
+
+```bash
+./run_tests.sh --regen
+```
+
 ## Note
 This is a research project in development that has used large language models. No guarantee is given (yet) about the accuracy or completeness of the calculations.
 
