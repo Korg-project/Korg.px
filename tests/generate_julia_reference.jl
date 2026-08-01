@@ -1301,6 +1301,116 @@ let
 end
 
 # =============================================================================
+# Spherical radiative transfer (calculate_rays + the spherical solver)
+# =============================================================================
+println("  - spherical radiative transfer...")
+let
+    n_layers = 25
+
+    # Build a self-consistent shell atmosphere: the anchored optical depth
+    # scheme assumes dr/d(ln τ_ref) = -τ_ref/α_ref, so integrate that to get
+    # the radii instead of inventing an unrelated radial grid.  The τ_ref^0.9
+    # factor makes the geometric thickness spread over the whole optical depth
+    # range, as it does in a real extended model, rather than piling up in the
+    # deepest couple of layers.
+    tau_ref = Float64.(10 .^ range(-5, 2; length=n_layers))
+    log_tau_ref = log.(tau_ref)                   # Korg uses natural log
+    profile = (1.0 .+ 0.5 .* sin.(range(0, π; length=n_layers))) .* tau_ref .^ 0.9
+
+    R_inner = 1.0e12                              # innermost radius [cm]
+
+    # Returns (radii, α_ref) for an atmosphere whose geometric thickness is
+    # `t_over_R` times the innermost radius.
+    function build_atmosphere(t_over_R)
+        g = tau_ref ./ profile                    # -dr/d(ln τ_ref), up to a scale
+        dr = 0.5 .* (g[1:end-1] .+ g[2:end]) .* diff(log_tau_ref)
+        depth = vcat(0.0, cumsum(dr))
+        scale = depth[end] / (t_over_R * R_inner)
+        # radii[1] is the outermost layer, radii[end] the innermost
+        Float64.(R_inner .+ depth[end] / scale .- depth ./ scale), Float64.(profile .* scale)
+    end
+
+    # Source function and two absorption columns (layers × wavelengths)
+    S_col = Float64.(range(2.0e-5, 9.0e-5; length=n_layers))
+    S = hcat(S_col, S_col .* 1.1)
+
+    cases = Dict{String, Any}()
+    for (label, t_over_R) in [("extended", 0.3), ("thin", 1.0e-3)]
+        radii, alpha_ref = build_atmosphere(t_over_R)
+
+        alpha = hcat(alpha_ref .* 1.5,
+                     alpha_ref .* (1.0 .+ 0.8 .* cos.(range(0, 2π; length=n_layers))))
+
+        # --- calculate_rays geometry, for a 7-point μ grid ---
+        μ_geom, _ = Korg.RadiativeTransfer.generate_mu_grid(7)
+        rays = Korg.RadiativeTransfer.calculate_rays(μ_geom, radii, true)
+        ray_out = [Dict("mu" => Float64(μ_geom[i]),
+                        "b" => Float64(radii[1] * sqrt(1 - μ_geom[i]^2)),
+                        "n_layers" => length(rays[i][1]),
+                        "s" => Float64.(rays[i][1]),
+                        "dsdr" => Float64.(rays[i][2]))
+                   for i in eachindex(μ_geom)]
+
+        # --- the spherical solver, for each I_scheme and μ count ---
+        solver_out = Dict{String, Any}()
+        for I_scheme in ["linear_flux_only", "linear"], n_mu in [5, 20]
+            F, I, μ_grid, μ_weights = Korg.RadiativeTransfer.radiative_transfer(
+                alpha, S, radii, n_mu, true;
+                α_ref=alpha_ref, τ_ref=tau_ref,
+                I_scheme=I_scheme, τ_scheme="anchored")
+            n_inward = size(I, 1) - length(μ_grid)
+            surface_I = if I_scheme == "linear"
+                I[n_inward+1:end, :, 1]
+            else
+                I[n_inward+1:end, :]
+            end
+            solver_out["$(I_scheme)_$(n_mu)"] = Dict(
+                "flux" => Float64.(F),
+                "mu_grid" => Float64.(μ_grid),
+                "mu_weights" => Float64.(μ_weights),
+                "n_inward_rays" => n_inward,
+                # surface_I is (n_mu × n_wavelengths); store row-per-μ
+                "surface_I" => [Float64.(surface_I[i, :]) for i in 1:size(surface_I, 1)],
+            )
+        end
+
+        # Plane-parallel flux for the same columns, so the thin-atmosphere
+        # limit can be checked against Julia on both sides of the comparison.
+        # (I_scheme="linear" avoids Korg's expint shortcut, which would change
+        # the quadrature rather than just the geometry.)
+        planar_out = Dict{String, Any}()
+        for n_mu in [5, 20]
+            F_planar, _, _, _ = Korg.RadiativeTransfer.radiative_transfer(
+                alpha, S, radii .- radii[end], n_mu, false;
+                α_ref=alpha_ref, τ_ref=tau_ref,
+                I_scheme="linear", τ_scheme="anchored")
+            planar_out["linear_$(n_mu)"] = Float64.(F_planar)
+        end
+
+        cases[label] = Dict(
+            "radii" => Float64.(radii),
+            "alpha_ref" => alpha_ref,
+            "alpha" => [Float64.(alpha[:, j]) for j in 1:size(alpha, 2)],
+            "thickness_over_radius" => Float64((radii[1] - radii[end]) / radii[end]),
+            "rays" => ray_out,
+            "solver" => solver_out,
+            "planar" => planar_out,
+        )
+    end
+
+    reference_data["spherical_radiative_transfer"] = Dict(
+        "inputs" => Dict(
+            "n_layers" => n_layers,
+            "tau_ref" => tau_ref,
+            "log_tau_ref" => log_tau_ref,
+            "S" => [Float64.(S[:, j]) for j in 1:size(S, 2)],
+            "mu_geom_n_points" => 7,
+        ),
+        "cases" => cases,
+    )
+end
+
+# =============================================================================
 # Blackbody / Planck function
 # =============================================================================
 println("  - blackbody...")

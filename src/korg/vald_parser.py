@@ -11,7 +11,7 @@ import re
 from typing import List, Dict, Optional
 import io
 
-from .linelist import Line, approximate_radiative_gamma
+from .linelist import Line, approximate_radiative_gamma, create_line  # noqa: F401
 from .species import Species
 from .atomic_data import atomic_numbers, atomic_symbols
 from .isotopic_data import isotopic_abundances
@@ -104,10 +104,22 @@ def parse_vald_linelist(file_content: str,
                        "lower_lande", "upper_lande", "mean_lande", "gamma_rad",
                        "gamma_stark", "gamma_vdW"]
 
-    # Parse CSV body
+    # Parse CSV body.
+    # Korg.jl uses ``CSV.File(...; header=CSVheader)``, which silently ignores any
+    # columns beyond the supplied header.  pandas instead promotes the surplus
+    # leading column(s) to an index when ``names`` is shorter than the row, which
+    # silently shifts every field by one.  Long "extract stellar" rows carry a
+    # trailing depth column (and a trailing comma), so read positionally and then
+    # truncate/pad to the expected header.
     csv_data = '\n'.join(body)
-    df = pd.read_csv(io.StringIO(csv_data), names=csv_header,
-                      skipinitialspace=True, on_bad_lines='skip')
+    df = pd.read_csv(io.StringIO(csv_data), header=None, index_col=False,
+                     skipinitialspace=True, on_bad_lines='skip')
+    n_cols = len(csv_header)
+    if df.shape[1] > n_cols:
+        df = df.iloc[:, :n_cols]
+    df.columns = csv_header[:df.shape[1]]
+    for missing_col in csv_header[df.shape[1]:]:
+        df[missing_col] = np.nan
 
     # Convert E_low to eV if necessary
     if "cm" in header:
@@ -166,19 +178,24 @@ def parse_vald_linelist(file_content: str,
         else:
             gamma_rad.append(10**df['gamma_rad'].iloc[i])
 
-    # Create Line objects
+    # Create Line objects.
+    # Korg.jl calls the ``Line`` *constructor*, which fills in missing Stark/vdW
+    # broadening with approximate_gammas and decodes the scalar vdW column into
+    # the (γ_vdW, -1) / (σ, α) tuple.  ``korg.linelist.Line`` is a plain dataclass
+    # with no such logic, so go through ``create_line``, which is the port of that
+    # constructor.
     result_lines = []
     for i in range(len(df)):
         try:
-            spec = Species(df['species'].iloc[i].strip('"'))
-            line = Line(
-                wl=wl[i],
-                log_gf=df['loggf'].iloc[i] + delta_log_gf[i],
-                species=spec,
-                E_lower=E_low[i],
+            spec = Species(str(df['species'].iloc[i]).strip('"').strip())
+            line = create_line(
+                wl[i],
+                df['loggf'].iloc[i] + delta_log_gf[i],
+                spec,
+                E_low[i],
                 gamma_rad=gamma_rad[i],
                 gamma_stark=ten_to_the_or_missing(df['gamma_stark'].iloc[i]),
-                vdW=id_or_missing(df['gamma_vdW'].iloc[i])
+                vdW=id_or_missing(df['gamma_vdW'].iloc[i]),
             )
             result_lines.append(line)
         except Exception as e:

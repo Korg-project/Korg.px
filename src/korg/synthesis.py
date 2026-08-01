@@ -59,6 +59,20 @@ class SynthesisResult:
     flux: np.ndarray
     continuum: np.ndarray
     intensities: Optional[np.ndarray] = None
+    # Korg.jl's SynthesisResult also carries the absorption coefficient, the
+    # per-species number densities and the electron number density.  They are
+    # needed by prune_linelist (and are part of Korg.jl's public result), so
+    # expose them here under Korg.jl's names.  They default to None so that
+    # existing constructions of SynthesisResult keep working unchanged.
+    alpha: Optional[np.ndarray] = None                     # (n_layers, n_wl), cm⁻¹
+    alpha_cntm: Optional[np.ndarray] = None                # continuum-only alpha
+    number_densities: Optional[dict] = None                # Species -> (n_layers,) cm⁻³
+    electron_number_density: Optional[np.ndarray] = None   # (n_layers,) cm⁻³
+
+    @property
+    def cntm(self):
+        """Alias for ``continuum``, matching Korg.jl's field name."""
+        return self.continuum
 
 
 def planck_function(nu, T):
@@ -740,7 +754,11 @@ def synthesize_spectrum(
         wavelengths=wavelengths_angstrom,
         flux=np.array(flux_lambda),
         continuum=np.array(continuum_flux) if continuum_flux is not None else np.array(flux_lambda),
-        intensities=None
+        intensities=None,
+        alpha=alpha,
+        alpha_cntm=alpha_cntm_only,
+        number_densities=number_densities,
+        electron_number_density=electron_densities,
     )
 
 

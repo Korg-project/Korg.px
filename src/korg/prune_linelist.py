@@ -102,7 +102,7 @@ def prune_linelist(
     """
     from .synthesis import synthesize_spectrum
     from .constants import kboltz_eV, c_cgs, hplanck_eV
-    from .line_broadening import doppler_width
+    from .line_absorption import doppler_width, sigma_line
 
     # Determine wavelength grid
     if isinstance(wavelengths, (tuple, list)) and len(wavelengths) == 2:
@@ -127,7 +127,7 @@ def prune_linelist(
 
     # Get atmosphere properties
     zs = np.array(atmosphere.z)       # depths (cm), top to bottom
-    temps = np.array(atmosphere.temp)
+    temps = np.array(atmosphere.T)     # temperatures (K)
 
     # Compute cumulative optical depth to find photosphere (tau~1)
     # sol.alpha shape: (n_layers, n_wavelengths)
@@ -169,16 +169,8 @@ def prune_linelist(
             doppler_width(wl_start * 1e-8, T, mass, 0.0) * 1e8 for T in temps
         ])
 
-    # sigma_line: cross-section coefficient
-    sigma_line_const = (np.pi * (1.6021766e-19) ** 2 /   # e in SI-ish? No, cgs:
-                        (4.8032e-10 ** 2 / (9.1094e-28 * c_cgs)))
-    # Actually use the Korg formula: sigma_line(wl) = pi e^2 / (m_e c) * wl^2/c
-    # = pi * e^2 * wl^2 / (m_e * c^2) but in cgs:
-    from .constants import electron_charge_cgs, electron_mass_cgs
-
-    def sigma_line(wl_cm):
-        return (np.pi * electron_charge_cgs**2 / (electron_mass_cgs * c_cgs) *
-                wl_cm**2 / c_cgs)
+    # Note: sigma_line is the single implementation in korg.line_absorption
+    # (imported above), matching Korg.jl's sigma_line.
 
     # Get continuum alpha at each wavelength
     cntm_alpha = np.array(cntm_sol.alpha)  # (n_layers, n_wl)

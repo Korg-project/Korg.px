@@ -48,9 +48,14 @@ branch that is not selected).
 
 Notes
 -----
-``calculate_rays`` does not exist anywhere in this port -- the spherical ray
-geometry of Korg.jl has not been ported, and ``spherical=True`` is accepted but
-ignored by ``compute_tau_anchored``. It therefore has no gradient tests here.
+``calculate_rays`` and the spherical solver now exist
+(``korg.radiative_transfer.rays`` and ``korg.radiative_transfer.spherical``), so
+``spherical=True`` no longer returns the plane-parallel answer. Their own
+gradient tests -- including the ``sqrt(0)`` at a ray's tangent point, which is
+exactly the trap described above -- live in
+``tests/test_spherical_radiative_transfer.py``. What is kept here is the
+end-to-end check that the two geometries are reachable through the same entry
+point and differ.
 """
 
 # Import korg FIRST to enable JAX x64 mode before any other JAX operations
@@ -1769,7 +1774,17 @@ class TestRadiativeTransferEndToEnd:
         """
         More opacity means less emergent flux, everywhere in the atmosphere.
 
-        A finite gradient is the minimum bar; the sign is the physics.
+        A finite gradient is the minimum bar; the sign is the physics -- but
+        only in plane-parallel geometry. A plane-parallel ray always reaches
+        optical depths where it saturates at the local source function, so
+        extra opacity can only push the emitting surface outwards. A spherical
+        tangent ray turns around at its own impact parameter, and while it is
+        optically thin its emergent intensity is roughly ``S * tau_ray``, which
+        *rises* with opacity. Because ``model_atmosphere`` puts its innermost
+        layer at the origin, every ray here is a tangent ray, so the sign is
+        genuinely not universal and only finiteness is asserted. The spherical
+        sign tests -- the radial ray, and the response to scaling the whole
+        opacity column -- are in ``test_spherical_radiative_transfer.py``.
         """
         atm = model_atmosphere(n_layers=16)
         alpha_grid = jnp.stack([atm["alpha"], atm["alpha"] * 1.4, atm["alpha"] * 0.6])
@@ -1779,9 +1794,10 @@ class TestRadiativeTransferEndToEnd:
         )(alpha_grid))
         assert np.all(np.isfinite(grad)), f"d(flux)/d(alpha) is non-finite: {grad}"
         assert np.any(grad != 0.0), "d(flux)/d(alpha) is identically zero"
-        assert np.all(grad <= 0.0), (
-            f"increasing opacity must not increase the flux, got max {grad.max()}"
-        )
+        if not spherical:
+            assert np.all(grad <= 0.0), (
+                f"increasing opacity must not increase the flux, got max {grad.max()}"
+            )
 
     @pytest.mark.parametrize("spherical", [False, True])
     @pytest.mark.parametrize("tau_scheme,intensity_scheme,use_expint_flux",
@@ -1925,28 +1941,100 @@ class TestRadiativeTransferEndToEnd:
 
     @pytest.mark.parametrize("tau_scheme,intensity_scheme,use_expint_flux",
                              SCHEME_COMBINATIONS)
-    def test_spherical_and_planar_gradients_agree(
+    def test_spherical_and_planar_differ(
             self, tau_scheme, intensity_scheme, use_expint_flux):
         """
-        ``spherical=True`` is accepted but has no effect in this port.
+        ``spherical=True`` changes the answer, values and gradients alike.
 
-        ``compute_tau_anchored`` takes the flag and ignores it, and the Bezier
-        scheme never receives it, so both the values and the gradients are
-        identical to the planar case. Pinned so that implementing spherical
-        geometry cannot slip in unnoticed, and so nobody assumes the flag does
-        something today.
+        It used to be accepted and ignored: ``compute_tau_anchored`` took the
+        flag and dropped it, so a spherical synthesis silently returned the
+        plane-parallel result, bit for bit. Now the flag routes through
+        ``calculate_rays`` and the ray solver, so the two geometries must
+        disagree -- and by far more than round-off, which is what makes this a
+        regression test rather than a formality.
         """
         atm = model_atmosphere(n_layers=16)
         alpha_grid = jnp.stack([atm["alpha"], atm["alpha"] * 1.4, atm["alpha"] * 0.6])
-        grads = [
-            np.asarray(jax.grad(
+        values, grads = [], []
+        for sph in (False, True):
+            values.append(float(_rt_flux(atm, tau_scheme, intensity_scheme,
+                                         use_expint_flux, sph)))
+            grads.append(np.asarray(jax.grad(
                 lambda a, sph=sph: _rt_flux(atm, tau_scheme, intensity_scheme,
                                             use_expint_flux, sph, alpha_grid=a)
-            )(alpha_grid))
-            for sph in (False, True)
-        ]
+            )(alpha_grid)))
+
         assert np.all(np.isfinite(grads[0])) and np.all(np.isfinite(grads[1]))
-        np.testing.assert_array_equal(grads[0], grads[1])
+        assert abs(values[1] / values[0] - 1.0) > 1e-3, (
+            f"spherical geometry left the flux essentially unchanged: {values}"
+        )
+        relative = np.abs(grads[1] - grads[0]) / np.maximum(np.abs(grads[0]), 1e-300)
+        assert np.max(relative) > 1e-3, (
+            "spherical geometry left d(flux)/d(alpha) essentially unchanged"
+        )
+
+    @pytest.mark.parametrize("tau_scheme,intensity_scheme,use_expint_flux",
+                             SCHEME_COMBINATIONS)
+    def test_spherical_converges_to_planar_as_the_atmosphere_thins(
+            self, tau_scheme, intensity_scheme, use_expint_flux):
+        """
+        The difference must vanish as the shell becomes geometrically thin.
+
+        ``model_atmosphere`` spans 2e9 cm; placing it on top of an ever larger
+        core shrinks the thickness-to-radius ratio without touching the optical
+        depth scale, so the ray geometry has to relax to the plane-parallel
+        limit. The reference is the *same* ray solver run over plane-parallel
+        rays, so the μ quadrature is identical on both sides and geometry is
+        the only difference -- comparing against the exponential-integral flux
+        instead would leave a quadrature residual that never converges away.
+        """
+        from korg.radiative_transfer.core import generate_mu_grid
+        from korg.radiative_transfer.spherical import spherical_ray_flux
+
+        atm = model_atmosphere(n_layers=16)
+        alpha_grid = jnp.stack([atm["alpha"], atm["alpha"] * 1.4, atm["alpha"] * 0.6])
+        S_grid = jnp.stack([atm["S"], atm["S"] * 1.05, atm["S"] * 0.95])
+        thickness = float(atm["spatial_coord"][0] - atm["spatial_coord"][-1])
+        mu_grid, mu_weights = generate_mu_grid(5)
+
+        def planar(alpha):
+            fluxes, _ = spherical_ray_flux(
+                alpha, S_grid, atm["spatial_coord"], atm["log_tau_ref"],
+                atm["alpha_ref"], mu_grid, mu_weights, tau_scheme=tau_scheme,
+                intensity_scheme=intensity_scheme, spherical=False)
+            return jnp.sum(fluxes)
+
+        planar_value = float(planar(alpha_grid))
+        planar_grad = np.asarray(jax.grad(planar)(alpha_grid))
+
+        value_errors, grad_errors = [], []
+        for ratio in (1e-2, 1e-4, 1e-6):
+            radii = atm["spatial_coord"] + thickness / ratio
+
+            def spherical(alpha, radii=radii):
+                fluxes, _ = spherical_ray_flux(
+                    alpha, S_grid, radii, atm["log_tau_ref"], atm["alpha_ref"],
+                    mu_grid, mu_weights, tau_scheme=tau_scheme,
+                    intensity_scheme=intensity_scheme, spherical=True)
+                return jnp.sum(fluxes)
+
+            value = float(spherical(alpha_grid))
+            grad = np.asarray(jax.grad(spherical)(alpha_grid))
+            value_errors.append(abs(value / planar_value - 1.0))
+            grad_errors.append(float(np.max(np.abs(grad - planar_grad))
+                                     / np.max(np.abs(planar_grad))))
+
+        assert all(later < earlier
+                   for earlier, later in zip(value_errors, value_errors[1:])), (
+            f"flux did not converge to the planar limit: {value_errors}"
+        )
+        assert all(later < earlier
+                   for earlier, later in zip(grad_errors, grad_errors[1:])), (
+            f"gradient did not converge to the planar limit: {grad_errors}"
+        )
+        assert value_errors[-1] < 1e-4, (
+            f"flux has not reached the planar limit: {value_errors}"
+        )
 
     @pytest.mark.parametrize("n_layers", [3, 5, 56])
     def test_gradients_are_finite_for_various_layer_counts(self, n_layers):

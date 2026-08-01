@@ -11,11 +11,35 @@ Julia's native-compiled code does the same synthesis in ~0.1 s, so consider
 using the Julia package directly for large-scale fitting.  This module is
 provided for correctness testing, single-star analyses, and as a foundation
 for future optimisation.
+
+Gradients
+---------
+Korg.jl differentiates its fitting objective with ForwardDiff.  Here the
+picture is split:
+
+* ``vsini``, ``epsilon``, ``cntm_offset`` and ``cntm_slope``
+  (:data:`_POSTPROCESSING_PARAMS`) act *only* through
+  :func:`_postprocess_flux`, which is pure JAX -- ``apply_rotation`` and the
+  LSF matrix were rewritten in JAX earlier in this project.  When every free
+  parameter is one of these, :func:`fit_spectrum` synthesises once and hands
+  BFGS exact ``jax.grad`` derivatives, instead of re-synthesising the spectrum
+  once per parameter per gradient.
+* ``Teff``, ``logg``, ``M_H``, ``vmic`` and per-element abundances act through
+  ``interpolate_marcs`` and ``synthesize``.  ``synthesize`` dispatches to
+  ``synthesize_spectrum``, which orchestrates jitted kernels from Python and
+  drops to host NumPy, and ``interpolate_marcs`` calls ``float()`` on its
+  arguments; both raise under a JAX trace.  Those parameters therefore still
+  use numerical differentiation (BFGS's own finite differences in
+  :func:`fit_spectrum`, an explicit finite-difference Jacobian in
+  :func:`ews_to_stellar_parameters`), and will until ``synthesize_jit``
+  replaces ``synthesize_spectrum``.
 """
 
 import warnings
 from copy import deepcopy
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 from scipy.optimize import minimize
 
@@ -44,6 +68,36 @@ _TAN_SCALE_BOUNDS = {
 }
 
 
+def _line_atoms(line):
+    """
+    Atomic numbers of the atoms in a line's species, padding removed.
+
+    ``Species.formula.atoms`` is a fixed-width tuple, left-padded with zeros, so
+    its ``len`` says nothing about the species.  This mirrors Julia's
+    ``Korg.get_atoms``.  Objects that do not expose a species at all are treated
+    as hydrogen, matching the pre-existing fallbacks in this module.
+    """
+    species = getattr(line, "species", None)
+    formula = getattr(species, "formula", None)
+    if formula is None:
+        return [1]
+    return [int(a) for a in formula.atoms if a != 0] or [1]
+
+
+def _line_atomic_number(line):
+    """Atomic number of the principal atom of ``line`` (Julia: ``get_atoms(...)[1]``)."""
+    return _line_atoms(line)[0]
+
+
+def _line_is_molecule(line):
+    """True if ``line``'s species contains more than one atom (Julia: ``ismolecule``)."""
+    species = getattr(line, "species", None)
+    formula = getattr(species, "formula", None)
+    if formula is None:
+        return False
+    return sum(1 for a in formula.atoms if a != 0) > 1
+
+
 def _tan_scale(p, lower, upper):
     """Map p ∈ [lower, upper] to ℝ via atan-based transform."""
     if not (lower <= p <= upper):
@@ -54,6 +108,30 @@ def _tan_scale(p, lower, upper):
 def _tan_unscale(p, lower, upper):
     """Inverse of _tan_scale."""
     return float((np.arctan(p) / np.pi + 0.5) * (upper - lower) + lower)
+
+
+def _tan_unscale_jax(p, lower, upper):
+    """``_tan_unscale`` written in JAX, for use inside a differentiated objective.
+
+    Identical arithmetic to :func:`_tan_unscale`, minus the ``float()`` cast that
+    would abort tracing.  ``jnp.arctan`` is smooth everywhere, so no guarding is
+    needed: unlike ``sqrt``, the derivative ``1/(1+p²)`` is finite for every
+    finite ``p``, and bounded by 1.
+    """
+    return (jnp.arctan(p) / jnp.pi + 0.5) * (upper - lower) + lower
+
+
+def _unscale_param_jax(name, p):
+    """Unscale one parameter from ℝ back to its physical range, differentiably."""
+    if name in _TAN_SCALE_BOUNDS:
+        lo, hi = _TAN_SCALE_BOUNDS[name]
+        return _tan_unscale_jax(p, lo, hi)
+    if name in ("vmic", "vsini"):
+        # The forward map is tan_scale(sqrt(p)); the inverse squares, and x**2
+        # has a finite derivative everywhere (the *forward* sqrt is the singular
+        # direction, and it is never differentiated).
+        return _tan_unscale_jax(p, 0.0, np.sqrt(250.0)) ** 2
+    raise ValueError(f"Unknown parameter '{name}'")
 
 
 def _scale_params(params):
@@ -88,27 +166,76 @@ def _unscale_params(params):
 # Spectrum synthesis helper
 # ---------------------------------------------------------------------------
 
-def _synthetic_spectrum(synthesis_wls, linelist, LSF_matrix, params, synthesis_kwargs):
+#: Parameters that affect the observed spectrum *only* through the
+#: post-synthesis pipeline (:func:`_postprocess_flux`).  For a fit in which
+#: every free parameter is one of these, the raw synthesis is a constant and
+#: the whole objective is a JAX expression, so ``jax.grad`` supplies exact
+#: gradients and only one synthesis is needed for the entire fit.  Everything
+#: else (Teff, logg, M_H, vmic, per-element abundances) enters through
+#: ``synthesize``/``interpolate_marcs``, which drop to host NumPy and cannot be
+#: traced -- see the module docstring.
+_POSTPROCESSING_PARAMS = frozenset({"vsini", "epsilon", "cntm_offset", "cntm_slope"})
+
+
+def _concrete(value):
+    """Concrete float for a value that may be a JAX tracer's primal.
+
+    Window *shapes* in ``apply_rotation`` cannot depend on a traced quantity, so
+    the ``vsini > 0`` short-circuit has to be decided from the primal value.
+    Under eager ``jax.grad`` the primal is concrete and this succeeds.
     """
-    Synthesise a spectrum, apply LSF, and rectify to continuum.
+    try:
+        return float(np.asarray(value))
+    except Exception:
+        return float(np.asarray(jax.lax.stop_gradient(value)))
+
+
+def _postprocess_flux(raw_flux, raw_cntm, wavelengths, LSF_matrix,
+                      cntm_offset, cntm_slope, vsini, epsilon):
+    """
+    Rectify, rotationally broaden, and LSF-convolve a raw synthesis.
+
+    This is the entire dependence of the model spectrum on ``cntm_offset``,
+    ``cntm_slope``, ``vsini`` and ``epsilon``.  Every operation here is a JAX
+    primitive (``apply_rotation`` was rewritten in JAX earlier in this
+    project), so ``jax.grad`` flows through it with respect to all four.
 
     Parameters
     ----------
-    synthesis_wls : Wavelengths
-        Wavelength grid for synthesis.
-    linelist : list of Line
-        Spectral lines.
+    raw_flux, raw_cntm : ndarray, shape (n_synth,)
+        Flux and continuum straight out of ``synthesize``.
+    wavelengths : ndarray, shape (n_synth,)
+        Synthesis wavelengths in Å.
     LSF_matrix : ndarray, shape (n_obs, n_synth)
-        LSF convolution matrix.
-    params : dict
-        All parameters (merged initial_guesses + fixed_params, unscaled).
-    synthesis_kwargs : dict
-        Extra keyword arguments forwarded to synthesize().
+    cntm_offset, cntm_slope, vsini, epsilon : float or JAX scalar
 
     Returns
     -------
-    ndarray, shape (n_obs,)
-        Continuum-normalised, LSF-convolved flux at observed wavelengths.
+    array, shape (n_obs,)
+        Continuum-normalised, broadened, LSF-convolved flux.
+    """
+    central_wl = (wavelengths[0] + wavelengths[-1]) / 2.0
+    cntm_adj = 1.0 - cntm_offset - cntm_slope * (wavelengths - central_wl)
+    F = raw_flux / (raw_cntm * cntm_adj)
+
+    if _concrete(vsini) > 0:
+        F = apply_rotation(F, wavelengths, vsini, epsilon)
+
+    return LSF_matrix @ F
+
+
+def _raw_synthesis(synthesis_wls, linelist, params, synthesis_kwargs):
+    """
+    Run ``synthesize`` for a parameter dict and return ``(flux, cntm, wls_Å)``.
+
+    This is the half of :func:`_synthetic_spectrum` that depends on the
+    atmospheric parameters.  It is factored out so that a fit over
+    post-processing-only parameters can call it exactly once.
+
+    Returns
+    -------
+    tuple of ndarray
+        ``(raw_flux, raw_continuum, wavelengths_angstrom)``.
     """
     # Build abundance vector from element-specific params
     element_abunds = {el: params[el] for el in atomic_symbols if el in params}
@@ -134,20 +261,39 @@ def _synthetic_spectrum(synthesis_wls, linelist, LSF_matrix, params, synthesis_k
                      verbose=False,
                      **_synth_kw)
 
-    # Continuum rectification with optional linear correction
-    central_wl = (sol.wavelengths[0] + sol.wavelengths[-1]) / 2.0
-    cntm_adj = (1.0
-                - params.get("cntm_offset", 0.0)
-                - params.get("cntm_slope", 0.0) * (sol.wavelengths - central_wl))
-    F = np.asarray(sol.flux / (sol.continuum * cntm_adj))
+    return (np.asarray(sol.flux), np.asarray(sol.continuum),
+            np.asarray(sol.wavelengths))
 
-    # Rotational broadening
-    vsini = params.get("vsini", 0.0)
-    epsilon = params.get("epsilon", 0.6)
-    if vsini > 0:
-        F = apply_rotation(F, np.asarray(sol.wavelengths), vsini, epsilon)
 
-    return LSF_matrix @ F
+def _synthetic_spectrum(synthesis_wls, linelist, LSF_matrix, params, synthesis_kwargs):
+    """
+    Synthesise a spectrum, apply LSF, and rectify to continuum.
+
+    Parameters
+    ----------
+    synthesis_wls : Wavelengths
+        Wavelength grid for synthesis.
+    linelist : list of Line
+        Spectral lines.
+    LSF_matrix : ndarray, shape (n_obs, n_synth)
+        LSF convolution matrix.
+    params : dict
+        All parameters (merged initial_guesses + fixed_params, unscaled).
+    synthesis_kwargs : dict
+        Extra keyword arguments forwarded to synthesize().
+
+    Returns
+    -------
+    ndarray, shape (n_obs,)
+        Continuum-normalised, LSF-convolved flux at observed wavelengths.
+    """
+    raw_flux, raw_cntm, wls = _raw_synthesis(synthesis_wls, linelist, params,
+                                             synthesis_kwargs)
+    return _postprocess_flux(
+        raw_flux, raw_cntm, wls, LSF_matrix,
+        params.get("cntm_offset", 0.0), params.get("cntm_slope", 0.0),
+        params.get("vsini", 0.0), params.get("epsilon", 0.6),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +323,108 @@ def _linear_continuum_adjustment(obs_wls, windows, model_flux, obs_flux, obs_err
         XtW = X.T * ivar
         beta = np.linalg.solve(XtW @ X, XtW @ obs_flux[sl])
         model_flux[sl] *= beta[0] + beta[1] * wl
+
+
+def _linear_continuum_adjustment_jax(obs_wls, windows, model_flux, obs_flux, obs_err):
+    """
+    Functional, JAX-traceable twin of :func:`_linear_continuum_adjustment`.
+
+    Same arithmetic, but returns a new array instead of mutating in place (JAX
+    arrays are immutable) so that it can sit inside a differentiated objective.
+    The window index bounds come from ``obs_wls``, which is never a traced
+    quantity, so the slicing stays static.
+    """
+    obs_wls = np.asarray(obs_wls, dtype=float)
+    obs_err = np.asarray(obs_err, dtype=float)
+    obs_flux = jnp.asarray(obs_flux)
+    model_flux = jnp.asarray(model_flux)
+
+    if windows is None:
+        windows = [(float(obs_wls[0]), float(obs_wls[-1]))]
+
+    for lam_start, lam_stop in windows:
+        lb = int(np.searchsorted(obs_wls, lam_start))
+        ub = int(np.searchsorted(obs_wls, lam_stop, side="right"))
+        if ub <= lb:
+            continue
+        ivar = 1.0 / obs_err[lb:ub] ** 2
+        mf = model_flux[lb:ub]
+        wl = obs_wls[lb:ub]
+        X = jnp.stack([mf, mf * wl], axis=1)
+        XtW = X.T * ivar
+        beta = jnp.linalg.solve(XtW @ X, XtW @ obs_flux[lb:ub])
+        model_flux = model_flux.at[lb:ub].multiply(beta[0] + beta[1] * wl)
+
+    return model_flux
+
+
+# ---------------------------------------------------------------------------
+# Exact-gradient (jax.grad) objective
+# ---------------------------------------------------------------------------
+
+def _make_autodiff_chi2(raw, LSF_matrix, params_to_fit, fixed_params, obs_wls,
+                        obs_flux, obs_err, windows, adjust_continuum):
+    """
+    Build ``chi2(scaled_p)`` as a pure JAX function of the scaled parameters.
+
+    ``raw`` is ``(raw_flux, raw_cntm, wavelengths)`` from a single call to
+    :func:`_raw_synthesis`.  Because every name in ``params_to_fit`` is in
+    :data:`_POSTPROCESSING_PARAMS`, the raw synthesis does not depend on them,
+    so it is a constant and the objective is differentiable end to end.
+
+    Returns a callable suitable for ``jax.value_and_grad``.
+    """
+    raw_flux, raw_cntm, wls = raw
+    raw_flux = jnp.asarray(raw_flux)
+    raw_cntm = jnp.asarray(raw_cntm)
+    wls = np.asarray(wls, dtype=float)
+    LSF_matrix = jnp.asarray(LSF_matrix)
+    obs_flux = jnp.asarray(obs_flux)
+    obs_err = jnp.asarray(obs_err)
+
+    def chi2(scaled_p):
+        # Weak Gaussian prior in scaled space to regularise (matches Julia)
+        neg_log_prior = jnp.sum(scaled_p ** 2 / 100.0 ** 2)
+
+        params = dict(fixed_params)
+        for name, value in zip(params_to_fit, scaled_p):
+            params[name] = _unscale_param_jax(name, value)
+
+        flux = _postprocess_flux(
+            raw_flux, raw_cntm, wls, LSF_matrix,
+            params.get("cntm_offset", 0.0), params.get("cntm_slope", 0.0),
+            params.get("vsini", 0.0), params.get("epsilon", 0.6),
+        )
+        if adjust_continuum:
+            flux = _linear_continuum_adjustment_jax(obs_wls, windows, flux,
+                                                    obs_flux, obs_err)
+        return jnp.sum(((flux - obs_flux) / obs_err) ** 2) + neg_log_prior
+
+    return chi2
+
+
+def _make_autodiff_objective(raw, LSF_matrix, params_to_fit, fixed_params, obs_wls,
+                             obs_flux, obs_err, windows, adjust_continuum, trace,
+                             start_time, time_limit):
+    """Wrap :func:`_make_autodiff_chi2` for scipy's ``minimize(..., jac=True)``."""
+    from datetime import datetime
+
+    chi2 = _make_autodiff_chi2(raw, LSF_matrix, params_to_fit, fixed_params, obs_wls,
+                               obs_flux, obs_err, windows, adjust_continuum)
+    value_and_grad = jax.value_and_grad(chi2)
+
+    def objective(scaled_p):
+        scaled_p = jnp.asarray(scaled_p, dtype=float)
+        total, grad = value_and_grad(scaled_p)
+        total = float(total)
+        neg_log_prior = float(np.sum(np.asarray(scaled_p) ** 2 / 100.0 ** 2))
+        guess = _unscale_params(dict(zip(params_to_fit, np.asarray(scaled_p))))
+        trace.append({**guess, "chi2": total - neg_log_prior})
+        if (datetime.now() - start_time).total_seconds() > time_limit:
+            raise StopIteration("Time limit reached")
+        return total, np.asarray(grad, dtype=float)
+
+    return objective
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +578,12 @@ def fit_spectrum(obs_wls, obs_flux, obs_err, linelist, initial_guesses, fixed_pa
     Uses BFGS optimisation with a tan-based parameter scaling so that bounded
     parameters can be optimised without constraints.
 
+    If every free parameter is a post-processing parameter (``vsini``,
+    ``epsilon``, ``cntm_offset``, ``cntm_slope``) and no ``postprocess``
+    callback is supplied, the spectrum is synthesised once and BFGS is driven
+    with exact ``jax.grad`` gradients; otherwise BFGS's numerical gradient is
+    used.  See the module docstring for why the split exists.
+
     Parameters
     ----------
     obs_wls : array, shape (n_obs,)
@@ -450,10 +704,35 @@ def fit_spectrum(obs_wls, obs_flux, obs_err, linelist, initial_guesses, fixed_pa
 
         return total
 
+    # ------------------------------------------------------------------
+    # Exact gradients via jax.grad, when every free parameter is one that
+    # acts only after synthesis.  In that case the raw synthesis is a
+    # constant of the fit: it is computed once, and BFGS gets analytic
+    # derivatives instead of a numerical gradient costing one extra
+    # synthesis per free parameter per iteration.
+    # ------------------------------------------------------------------
+    use_autodiff = (
+        set(params_to_fit) <= _POSTPROCESSING_PARAMS
+        and postprocess is None      # postprocess mutates a NumPy buffer in place
+    )
+    objective, jac = _chi2, None
+    if use_autodiff:
+        try:
+            raw = _raw_synthesis(synthesis_wls, linelist, fixed_params, synthesis_kwargs)
+        except Exception as e:  # fall back to the numerical path
+            warnings.warn(f"Falling back to numerical gradients: {e}")
+            use_autodiff = False
+        else:
+            objective = _make_autodiff_objective(
+                raw, LSF_mat, params_to_fit, fixed_params, _obs_wls, _obs_flux,
+                _obs_err, windows, adjust_continuum, trace, start_time, time_limit,
+            )
+            jac = True
+
     try:
         res = minimize(
-            _chi2, p0,
-            method="BFGS",
+            objective, p0,
+            method="BFGS", jac=jac,
             options={"gtol": precision, "maxiter": 10_000},
         )
     except StopIteration:
@@ -690,12 +969,7 @@ def ews_to_abundances(atm, linelist, A_X, measured_EWs, ew_window_size=2.0, wl_s
 
     for i, (line, ew_obs) in enumerate(zip(lines, measured_EWs)):
         # Identify the element (Z) from the line species.
-        # formula.atoms is a fixed-size tuple padded with zeros; the first non-zero
-        # entry is the atomic number of the principal (or only) atom.
-        Z = 1
-        if hasattr(line, "species") and hasattr(line.species, "formula"):
-            atoms = line.species.formula.atoms
-            Z = next((int(a) for a in atoms if a != 0), 1)
+        Z = _line_atomic_number(line)
 
         A_X_mod = A_X.copy()
 
@@ -779,19 +1053,20 @@ def ews_to_abundances_approx(atm, linelist, A_X, measured_EWs, ew_window_size=2.
                               blend_warn_threshold=blend_warn_threshold,
                               **synthesize_kwargs)
 
-    atoms = []
-    for line in lines:
-        Z = 1
-        if hasattr(line, "species") and hasattr(line.species, "formula"):
-            atom_list = line.species.formula.atoms
-            Z = next((int(a) for a in atom_list if a != 0), 1)
-        atoms.append(Z)
-    atoms = np.array(atoms)
+    atoms = np.array([_line_atomic_number(line) for line in lines])
 
     A0 = A_X[atoms - 1]
-    log_ratio = np.where(EWs_synth > 1e-10,
-                         np.log10(np.maximum(measured_EWs, 1e-10)) - np.log10(EWs_synth),
-                         0.0)
+    # Korg.jl computes `A0 + (log10(measured_EWs) - log10(EWs))` unguarded, so a
+    # non-positive EW yields a non-finite result (+Inf for a vanishing synthetic
+    # EW, -Inf for a vanishing measured one, NaN for a negative).  That is
+    # load-bearing: the callers
+    # (`_ews_stellar_param_residuals`) count non-finite entries to decide whether
+    # enough lines converged.  Substituting a finite value for a line that did
+    # not produce a measurable feature would silently defeat that check, so the
+    # non-finite result is propagated, with the warnings suppressed rather than
+    # the values.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_ratio = np.log10(measured_EWs) - np.log10(EWs_synth)
     return A0 + log_ratio
 
 
@@ -828,14 +1103,19 @@ def _ews_stellar_param_residuals(params, linelist, measured_EWs, abundance_adjus
     except Exception as e:
         raise ValueError(f"interpolate_marcs failed: {e}")
 
+    # Julia reaches the EW solvers through their `params` methods, which forward
+    # `vmic=vmic` to synthesize.  Dropping it makes the microturbulence residual
+    # independent of vmic, so the third column of the Newton Jacobian is
+    # identically zero and the 4x4 system is singular: the solver then cannot
+    # move any parameter, whatever the input.
     if approx:
         A = ews_to_abundances_approx(atm, linelist, A_X, measured_EWs,
                                      blend_warn_threshold=np.inf,
-                                     **synthesize_kwargs)
+                                     vmic=vmic, **synthesize_kwargs)
     else:
         A, _ = ews_to_abundances(atm, linelist, A_X, measured_EWs,
                                  blend_warn_threshold=1.0,  # suppress warnings
-                                 **synthesize_kwargs)
+                                 vmic=vmic, **synthesize_kwargs)
 
     A = A + np.asarray(abundance_adjustments)
 
@@ -857,9 +1137,11 @@ def _ews_stellar_param_residuals(params, linelist, measured_EWs, abundance_adjus
 
     vmic_res = _get_slope(REWs[neutral_finite], A[neutral_finite])
 
-    Z = 1
-    atoms_list = linelist[0].species.formula.atoms if hasattr(linelist[0].species, "formula") else [1]
-    Z = atoms_list[0] if atoms_list else 1
+    # Julia: `Z = Korg.get_atoms(linelist[1].species)[1]`.  `formula.atoms` is a
+    # fixed-width tuple zero-padded on the left, so `atoms[0]` is the padding,
+    # not the element: taking it would evaluate the [m/H] residual against
+    # solar_abundances[-1] (uranium) for every atomic linelist.
+    Z = _line_atomic_number(linelist[0])
     feh_res = float(np.mean(A[finite]) - (M_H + solar_abundances[Z - 1]))
 
     residuals = np.array([teff_res, logg_res, vmic_res, feh_res])
@@ -996,6 +1278,14 @@ def ews_to_stellar_parameters(linelist, measured_EWs,
     """
     from .abundances import get_solar_abundances
 
+    # Julia raises the same ArgumentError: vmic is a fitted parameter here, and
+    # it is forwarded to synthesize internally, so a caller-supplied vmic would
+    # both be ignored and collide with that keyword.
+    if "vmic" in synthesize_kwargs:
+        raise ValueError(
+            "vmic must not be specified, because it is a parameter fit by "
+            "ews_to_stellar_parameters. Did you mean vmic0, the starting value?")
+
     if solar_abundances is None:
         solar_abundances = get_solar_abundances()
     if tolerances is None:
@@ -1017,8 +1307,11 @@ def ews_to_stellar_parameters(linelist, measured_EWs,
     # Validate inputs
     if len(lines) != len(measured_EWs):
         raise ValueError("linelist and measured_EWs must have the same length")
-    if any(hasattr(l, "species") and hasattr(l.species, "formula")
-           and len(l.species.formula.atoms) > 1 for l in lines):
+    # Julia: `if Korg.ismolecule(linelist[1].species) throw(...)`.  `formula.atoms`
+    # is a fixed-width tuple zero-padded on the left, so `len(atoms) > 1` is true
+    # for *every* species, atomic or not; counting the non-zero entries is what
+    # distinguishes a molecule.
+    if any(_line_is_molecule(l) for l in lines):
         raise ValueError("All lines must be atomic (no molecules).")
     neutrals = np.array([l.species.charge == 0 for l in lines])
     if neutrals.sum() < 3 or (~neutrals).sum() < 1:
@@ -1100,7 +1393,8 @@ def ews_to_stellar_parameters(linelist, measured_EWs,
     try:
         atm_final = interpolate_marcs(float(params[0]), float(params[1]), A_X)
         A_final, _ = ews_to_abundances(atm_final, lines, A_X, measured_EWs,
-                                       blend_warn_threshold=1.0, **synthesize_kwargs)
+                                       blend_warn_threshold=1.0,
+                                       vmic=float(params[2]), **synthesize_kwargs)
         A_final = A_final + abundance_adjustments
         finite = np.isfinite(A_final)
         neutral_finite = neutrals & finite
