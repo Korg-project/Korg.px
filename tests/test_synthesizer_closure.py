@@ -515,3 +515,72 @@ class TestPhotosphereRadius:
         g = float(jax.grad(lambda L: jnp.sum(
             (lambda fc: fc[0] / fc[1])(sph(4500.0, L, M_H))))(2.0))
         assert np.isfinite(g) and g != 0.0, "d/dlogg must see the radius"
+# Staged for tests/test_synthesizer_closure.py once full6 clears.
+# Appended to the FUNCTIONAL tier.
+
+class TestLinelistFiltering:
+    """``prepare_synthesis`` trims the linelist to the synthesis range.
+
+    It knows the wavelength grid, so making the caller pre-filter was a trap
+    rather than a design: the full 41,861-line VALD list against a 5 A window
+    is 166 useful lines, and every one of the other 41,695 was bucketed and
+    evaluated. Korg.jl's ``synthesize`` applies ``line_buffer`` (10 A) for the
+    same reason.
+    """
+
+    def test_out_of_range_lines_are_dropped(self, wavelengths, linelist):
+        from korg.synthesis import filter_linelist
+        expected = len(filter_linelist(list(linelist), np.asarray(wavelengths),
+                                       10.0e-8, warn_empty=False))
+        s = prepare_synthesis(wavelengths, linelist, geometry="planar")
+        assert s.n_lines == expected
+        assert s.n_lines < len(linelist), "the fixture must have out-of-range lines"
+
+    def test_line_buffer_none_keeps_every_line(self, wavelengths, linelist):
+        s = prepare_synthesis(wavelengths, linelist, geometry="planar",
+                              line_buffer_cm=None)
+        assert s.n_lines == len(linelist)
+
+    def test_a_tighter_buffer_keeps_fewer_lines(self, wavelengths, linelist):
+        wide = prepare_synthesis(wavelengths, linelist, geometry="planar",
+                                 line_buffer_cm=10.0e-8)
+        tight = prepare_synthesis(wavelengths, linelist, geometry="planar",
+                                  line_buffer_cm=0.5e-8)
+        assert tight.n_lines < wide.n_lines
+
+    def test_filtering_does_not_change_the_spectrum(self, wavelengths, linelist):
+        """The dropped lines are the ones that could not reach the grid.
+
+        This is the assertion that makes the filter safe to apply by default:
+        pre-filtering by hand and letting the plan do it must give the same
+        spectrum. Both plans hold the identical 386 lines in the identical
+        order, so the only thing separating them is floating-point.
+
+        Not ``assert_array_equal``. This was written as a bitwise check, passed
+        every targeted run under ``JAX_PLATFORMS=cpu``, and then failed the full
+        suite on the default backend — which on this machine is CUDA — by
+        5.2e-14 relative on 33 of 200 pixels. GPU reductions do not fix their
+        summation order, so identical inputs through an identical program need
+        not give identical bits. That is the same lesson three earlier tests in
+        this repository already record; 1e-12 is 20x the observed spread.
+        """
+        from korg.synthesis import filter_linelist
+        pre = filter_linelist(list(linelist), np.asarray(wavelengths), 10.0e-8,
+                              warn_empty=False)
+        auto = prepare_synthesis(wavelengths, linelist, geometry="planar")
+        manual = prepare_synthesis(wavelengths, pre, geometry="planar",
+                                   line_buffer_cm=None)
+        assert auto.n_lines == manual.n_lines, "the two plans must hold the same lines"
+        fa, ca = auto(TEFF, LOGG, M_H)
+        fm, cm = manual(TEFF, LOGG, M_H)
+        np.testing.assert_allclose(np.asarray(fa), np.asarray(fm), rtol=1e-12)
+        np.testing.assert_allclose(np.asarray(ca), np.asarray(cm), rtol=1e-12)
+
+    def test_preprocessed_linelistdata_is_passed_through(self, wavelengths, linelist):
+        """A LinelistData has already been bucketed; there is nothing to filter."""
+        from korg.synthesis import preprocess_linelist, load_synthesis_data
+        d = load_synthesis_data()
+        pre = preprocess_linelist(list(linelist), d.chem_eq_data,
+                                  np.asarray(wavelengths))
+        s = prepare_synthesis(wavelengths, pre, data=d, geometry="planar")
+        assert s.n_lines == int(np.shape(pre.wl)[0])

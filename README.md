@@ -20,7 +20,6 @@ This is a research project in development that has used large language models. N
 import numpy as np
 import korg
 from korg.synthesis_plan import synthesize
-from korg.synthesis import filter_linelist
 
 # Wavelengths are an explicit array in Angstroms, not a (start, stop) tuple
 wavelengths = np.arange(5000.0, 5100.0, 0.01)
@@ -31,10 +30,9 @@ A_X = korg.format_A_X()
 # Interpolate a solar-like atmosphere
 atm = korg.interpolate_marcs(5777.0, 4.44, A_X)
 
-# Get a linelist, and trim it to the synthesis range -- unlike Korg.jl,
-# Korg.px does not discard out-of-range lines for you
-linelist = filter_linelist(korg.get_VALD_solar_linelist(),
-                           wavelengths * 1e-8, 10.0 * 1e-8)
+# Get a linelist. It is trimmed to the synthesis range for you, as in
+# Korg.jl -- pass line_buffer=None to keep every line.
+linelist = korg.get_VALD_solar_linelist()
 
 # Synthesize spectrum
 flux, continuum = synthesize(atm, linelist, wavelengths, A_X)

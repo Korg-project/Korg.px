@@ -120,21 +120,13 @@ unlike Korg.jl.
 
 Each entry is a `korg.Line`; you rarely need to look inside one.
 
-!!! warning "You must trim the linelist yourself"
-    Korg.jl's `synthesize` discards lines more than `line_buffer` (10 Å by default) outside the
-    synthesis window. Korg.px's synthesis path does **not**: every line you hand it is bucketed
-    and evaluated, whether or not it can reach the grid. Passing the full 41861-line VALD list
-    for a 5 Å window was measured at 56 GB resident and had not finished building the plan after
-    fifteen minutes.
+You can hand a full linelist straight to the synthesis functions. Both trim it to the synthesis
+range first, as Korg.jl does: `line_buffer` is 10 Å by default, and lines further than that outside
+the grid are discarded before anything else happens. For 5000–5005 Å that is 166 lines out of the
+VALD solar list's 41861.
 
-    Trim it first:
-
-    ```python
-    from korg.synthesis import filter_linelist
-    lines = filter_linelist(linelist, wavelengths_cm, line_buffer_cm=10.0 * 1e-8)
-    ```
-
-    For 5000–5005 Å that leaves 166 lines out of 41861.
+Pass `line_buffer=None` (or `line_buffer_cm=None` to `prepare_synthesis`) to keep every line.
+`korg.synthesis.filter_linelist` is still public if you want to trim explicitly.
 
 `korg.prune_linelist` and `korg.merge_close_lines` are also available, as in Korg.jl.
 
@@ -165,12 +157,11 @@ Wavelengths are *in vacuo*, as in Korg.jl. Convert with `korg.air_to_vacuum` and
 ```python
 import numpy as np, korg
 from korg.synthesis_plan import synthesize
-from korg.synthesis import filter_linelist
 
 wavelengths = np.arange(5000.0, 5005.0, 0.01)                 # Angstroms
 A_X = korg.format_A_X()
 atm = korg.interpolate_marcs(5777.0, 4.44, A_X)
-lines = filter_linelist(korg.get_VALD_solar_linelist(), wavelengths * 1e-8, 10.0 * 1e-8)
+lines = korg.get_VALD_solar_linelist()
 
 flux, continuum = synthesize(atm, lines, wavelengths, A_X, vmic=1.0)
 ```

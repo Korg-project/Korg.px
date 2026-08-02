@@ -5,10 +5,9 @@ This is the part of Korg.px that has no counterpart in Korg.jl.
 ```python
 import numpy as np, korg
 from korg.synthesis_plan import prepare_synthesis
-from korg.synthesis import filter_linelist
 
 wavelengths_cm = np.arange(5000.0, 5002.0, 0.01) * 1e-8
-linelist = filter_linelist(korg.get_VALD_solar_linelist(), wavelengths_cm, 10.0 * 1e-8)
+linelist = korg.get_VALD_solar_linelist()
 
 synth = prepare_synthesis(wavelengths_cm, linelist, geometry="plane-parallel")
 flux, continuum = synth(5777.0, 4.44, 0.0)
@@ -58,9 +57,11 @@ prepare_synthesis(wavelengths_cm, linelist, data=None, *,
 
 - **`wavelengths_cm`** — the synthesis grid, in **centimetres**, as a concrete 1-D array. This is
   host code, so it may not be a tracer. At least two points are required.
-- **`linelist`** — a list of `korg.Line`, or an already-preprocessed `LinelistData`. Trim it to
-  the synthesis range yourself; see
-  [Getting started](getting-started.md#linelists).
+- **`linelist`** — a list of `korg.Line`, or an already-preprocessed `LinelistData`. A list is
+  trimmed to the synthesis range using `line_buffer_cm`; a `LinelistData` is used as-is, since its
+  extent was fixed when it was built.
+- **`line_buffer_cm`** — discard lines further than this outside the grid, in cm. Default
+  `10.0e-8` (10 Å), matching Korg.jl's `line_buffer`. `None` keeps every line.
 - **`data`** — a `SynthesisData`; loaded from disk if omitted. Pass one you already have to avoid
   re-reading the tables when building many plans.
 - **`geometry`** — `None`, `'spherical'`, or `'plane-parallel'` (also spelled `'planar'`,
@@ -321,10 +322,9 @@ converge in ten steps at these step sizes; it is here to show the mechanics of b
 ```python
 import numpy as np, korg, jax, jax.numpy as jnp
 from korg.synthesis_plan import prepare_synthesis
-from korg.synthesis import filter_linelist
 
 wavelengths_cm = np.arange(5000.0, 5002.0, 0.01) * 1e-8
-lines = filter_linelist(korg.get_VALD_solar_linelist(), wavelengths_cm, 10.0 * 1e-8)
+lines = korg.get_VALD_solar_linelist()
 synth = prepare_synthesis(wavelengths_cm, lines, geometry="plane-parallel",
                           reference=(5750.0, 4.4, 0.0))
 

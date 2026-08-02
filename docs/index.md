@@ -44,10 +44,9 @@ The MARCS model atmosphere grid (~380 MB) is downloaded on first use of
 ```python
 import numpy as np, korg
 from korg.synthesis_plan import prepare_synthesis
-from korg.synthesis import filter_linelist
 
 wavelengths_cm = np.arange(5000.0, 5005.0, 0.01) * 1e-8          # note: cm, not Å
-linelist = filter_linelist(korg.get_VALD_solar_linelist(), wavelengths_cm, 10.0 * 1e-8)
+linelist = korg.get_VALD_solar_linelist()
 synth = prepare_synthesis(wavelengths_cm, linelist, geometry="plane-parallel")
 flux, continuum = synth(5777.0, 4.44, 0.0)                       # Teff, log g, [M/H]
 ```
@@ -56,9 +55,9 @@ flux, continuum = synth(5777.0, 4.44, 0.0)                       # Teff, log g, 
 rebuilding anything, and that `jax.jit`, `jax.vmap` and `jax.grad` all accept. Building the plan
 is the expensive step; calling it is not.
 
-The `filter_linelist` call is not optional: unlike Korg.jl, Korg.px does not discard lines that
-cannot reach the synthesis window, and passing the full 41861-line VALD list for a 5 Å window
-costs tens of gigabytes. See [Getting started](getting-started.md#linelists).
+`prepare_synthesis` trims the linelist to the synthesis range for you, as Korg.jl does — the
+`line_buffer_cm` keyword is 10 Å by default. The full 41861-line VALD list is 166 lines against a
+5 Å window. See [Getting started](getting-started.md#linelists).
 
 ## Where to go next
 

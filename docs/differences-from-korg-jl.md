@@ -160,7 +160,7 @@ Korg.jl's `synthesize` keyword arguments and their status in Korg.px's traced pa
 | Korg.jl | Korg.px traced path |
 |---|---|
 | `vmic` | `vmic` (km/s) on `synthesize`, `vmic_cm_s` on the closure; scalar only |
-| `line_buffer` | **not implemented** — trim the linelist yourself with `filter_linelist` |
+| `line_buffer` | `line_buffer` (Å) on `synthesize`, `line_buffer_cm` (cm) on `prepare_synthesis`; same 10 Å default. `None` disables it |
 | `cntm_step` | `cntm_step_cm` on `prepare_synthesis` (cm, default 1e-8 = 1 Å) |
 | `hydrogen_lines` | **not implemented** — hydrogen lines are always on |
 | `use_MHD_for_hydrogen_lines` | **not implemented** — MHD occupation probabilities are always used. Korg.jl defaults this to *off* above 13 000 Å, so infrared syntheses will differ |

@@ -63,6 +63,22 @@ LAMBDA_REF_CM = 5e-5      # 5000 A, the MARCS reference wavelength
 N_MARCS_LAYERS = 56
 
 
+def _trim_linelist(linelist, wl_np, line_buffer_cm):
+    """Drop lines that cannot reach the synthesis grid.
+
+    ``filter_linelist`` bisects, so it needs a sorted list; ``synthesize_spectrum``
+    sorts first for the same reason and this mirrors it. The sortedness check is
+    a linear scan, which is cheaper than sorting a list that is already in order
+    — the readers all return one.
+    """
+    from .synthesis import filter_linelist
+
+    if not all(linelist[i].wl <= linelist[i + 1].wl
+               for i in range(len(linelist) - 1)):
+        linelist = sorted(linelist, key=lambda l: l.wl)
+    return filter_linelist(linelist, wl_np, line_buffer_cm)
+
+
 def _normalise_geometry(geometry):
     """Accept Korg's vocabulary and settle on one spelling.
 
@@ -232,6 +248,7 @@ def prepare_synthesis(
     *,
     geometry: Optional[str] = None,
     cntm_step_cm: float = 1e-8,
+    line_buffer_cm: Optional[float] = 10.0e-8,
     window_safety: float = 2.0,
     reference: Tuple[float, float, float] = (5777.0, 4.44, 0.0),
     n_layers: int = N_MARCS_LAYERS,
@@ -252,6 +269,18 @@ def prepare_synthesis(
         neither pays for the other's branches.
     cntm_step_cm : float
         Spacing of the coarse grid the continuum is evaluated on.
+    line_buffer_cm : float or None
+        Lines further than this outside the synthesis grid are discarded before
+        anything else happens, as in Korg.jl's ``line_buffer`` (10 Å, the default
+        here too). The plan knows the wavelength range, so requiring the caller
+        to pre-filter was a trap rather than a design: the shipped VALD solar
+        list is 41,861 lines, of which 166 are within range of a 5 Å window, and
+        the rest would each be bucketed and evaluated.
+
+        ``None`` disables filtering and synthesizes every line handed over. Use
+        it when the list is already trimmed and the linear scan is not worth
+        paying for. A ``LinelistData`` is passed through untouched either way —
+        it has already been preprocessed, and its extent was fixed then.
     window_safety : float
         Headroom on each line's pixel window. The windows are *measured* at the
         reference parameters below rather than guessed, so this is only for how
@@ -288,8 +317,14 @@ def prepare_synthesis(
     if data is None:
         data = load_synthesis_data()
 
-    linelist_data = (linelist if hasattr(linelist, "wl")
-                     else preprocess_linelist(linelist, data.chem_eq_data, wl_np))
+    if hasattr(linelist, "wl"):
+        # Already preprocessed: its extent was fixed when it was built, and it
+        # carries no Line objects to filter.
+        linelist_data = linelist
+    else:
+        if line_buffer_cm is not None and len(linelist):
+            linelist = _trim_linelist(linelist, wl_np, float(line_buffer_cm))
+        linelist_data = preprocess_linelist(linelist, data.chem_eq_data, wl_np)
 
     cntm_wl = np.arange(wl_min_cm - cntm_step_cm,
                         wl_max_cm + 2 * cntm_step_cm, cntm_step_cm)
@@ -348,7 +383,8 @@ def prepare_synthesis(
 
 
 def synthesize(atmosphere, linelist, wavelengths_angstrom, A_X, *,
-               vmic=1.0, geometry=None, return_cntm=True, **plan_kwargs):
+               vmic=1.0, line_buffer=10.0, geometry=None, return_cntm=True,
+               **plan_kwargs):
     """Korg.jl-compatible one-shot synthesis.
 
     Matches Korg.jl's ``synthesize(atm, linelist, A_X, wavelengths)`` ordering and
@@ -372,6 +408,9 @@ def synthesize(atmosphere, linelist, wavelengths_angstrom, A_X, *,
         Abundances as A(X) = log10(N_X/N_H) + 12.
     vmic : float
         Microturbulence in km/s (Korg's unit), converted to cm/s internally.
+    line_buffer : float
+        Discard lines further than this outside the grid, in Å (Korg's unit),
+        as in Korg.jl. ``None`` keeps every line.
     geometry : None, 'spherical' or 'plane-parallel'
         ``None`` follows the atmosphere type: a ShellAtmosphere is spherical.
     return_cntm : bool
@@ -394,7 +433,10 @@ def synthesize(atmosphere, linelist, wavelengths_angstrom, A_X, *,
         geometry = "spherical" if hasattr(atmosphere, "R_photosphere") else "plane-parallel"
 
     synth = prepare_synthesis(wl_cm, linelist, geometry=geometry,
-                              n_layers=n_layers, **plan_kwargs)
+                              n_layers=n_layers,
+                              line_buffer_cm=(None if line_buffer is None
+                                              else line_buffer * 1e-8),
+                              **plan_kwargs)
 
     T = jnp.asarray([l.temperature for l in layers])
     n_total = jnp.asarray([l.number_density for l in layers])

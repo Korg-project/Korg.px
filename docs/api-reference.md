@@ -109,7 +109,9 @@ way to do that.
 korg.synthesis.filter_linelist(linelist, wavelengths_cm, line_buffer_cm, warn_empty=True) -> list
 ```
 
-Korg.jl's `line_buffer` as an explicit step. The synthesis path does not apply it for you.
+Trims a linelist to a wavelength range. The synthesis path applies this for you — see
+`line_buffer_cm` on `prepare_synthesis` and `line_buffer` on `synthesize` — so reach for it
+directly only when you want a trimmed list in hand.
 
 ### `blackbody`
 
