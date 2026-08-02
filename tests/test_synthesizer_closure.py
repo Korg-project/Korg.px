@@ -159,6 +159,61 @@ class TestSynthesis:
         # assumed -- an earlier 1e-8 here failed by a factor of 1.3.
         np.testing.assert_allclose(direct, viaparams, rtol=1e-7)
 
+    def test_traced_log_tau_ref_is_base_10(self, synth):
+        """The transfer kernels take log_tau_ref in base 10, not base e.
+
+        ``_compute_tau_anchored_planar`` does ``tau_ref = 10 ** log_tau_ref`` and
+        scales its steps by ``ln 10``, matching ``Atmosphere.log_tau_ref``, which
+        is ``np.log10``. The traced interpolation used a natural log, so transfer
+        integrated against ``tau_ref ** ln(10)`` and made lines about 2.2x too
+        shallow (deepest rectified point 0.352 against 0.161).
+
+        This pins the unit directly, cheaply, and without a synthesis: the two
+        end-to-end tests below would also catch it, but they would not say why.
+        """
+        from korg.traced_synthesis import _interpolate_marcs_traced
+        from korg.marcs_interpolation import interpolate_marcs
+
+        _, _, _, _, lt, _ = _interpolate_marcs_traced(synth, TEFF, LOGG, 0.0, 0.0, 0.0)
+        expected = interpolate_marcs(TEFF, LOGG, M_H).log_tau_ref
+        np.testing.assert_allclose(np.asarray(lt), expected, rtol=1e-10)
+
+
+class TestAgreementWithTheValidatedPath:
+    """The traced path against the NumPy path that was validated against Korg.jl.
+
+    Every other agreement test in this file compares the traced path against
+    itself, so a units error shared by all its entry points stayed invisible.
+    These compare absolute flux against ``synthesize_spectrum``, which is the
+    code the Korg.jl reference tests exercise.
+    """
+
+    @pytest.fixture(scope="class")
+    def validated_rectified(self, wavelengths, linelist):
+        from korg.synthesis import synthesize_spectrum
+        from korg.marcs_interpolation import interpolate_marcs
+        atm = interpolate_marcs(TEFF, LOGG, M_H)
+        res = synthesize_spectrum(atm, linelist, np.asarray(wavelengths) * 1e8,
+                                  format_A_X(), verbose=False)
+        return np.asarray(res.flux) / np.asarray(res.cntm)
+
+    def test_closure_matches_the_validated_path(self, synth, validated_rectified):
+        f, c = synth(TEFF, LOGG, M_H)
+        rectified = np.asarray(f) / np.asarray(c)
+        # 2.4e-4 measured. The two paths bucket lines and size windows
+        # differently, so this is an agreement bound, not a precision floor.
+        np.testing.assert_allclose(rectified, validated_rectified, atol=1e-3)
+
+    def test_korg_compatible_wrapper_matches_the_validated_path(
+            self, wavelengths, linelist, validated_rectified):
+        """`synthesize` reads log_tau_ref off the atmosphere object."""
+        from korg.synthesis_plan import synthesize
+        from korg.marcs_interpolation import interpolate_marcs
+        atm = interpolate_marcs(TEFF, LOGG, M_H)
+        f, c = synthesize(atm, linelist, np.asarray(wavelengths) * 1e8, format_A_X())
+        np.testing.assert_allclose(np.asarray(f) / np.asarray(c),
+                                   validated_rectified, atol=1e-3)
+
 
 # ===========================================================================
 # 3. AUTODIFF — the point of the exercise

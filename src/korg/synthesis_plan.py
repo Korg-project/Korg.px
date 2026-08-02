@@ -45,9 +45,10 @@ point, instead of being frozen at plan-time conditions.  That is a correctness
 property, not a gradient one.
 
 The one approximation: if a traced window grows past its bucket's ``W``, the
-profile truncates early.  The synthesizer returns ``max_needed_px`` so that can
-be asserted outside ``jit`` rather than being silent, and ``window_safety``
-buys headroom.
+profile truncates early, and **this is currently silent**.  The traced pass
+computes ``max_needed_px`` but discards it rather than returning it, so there is
+no way for a caller to check.  Until that is surfaced, ``window_safety`` is the
+only guard: it buys headroom at plan time.
 """
 
 from typing import Optional, Tuple
@@ -180,6 +181,11 @@ class Synthesizer:
 
         Use this when the atmosphere does not come from the MARCS grid — a model
         read from a file, or one produced by something else entirely.
+
+        ``log_tau_ref`` is **base-10**, matching ``Atmosphere.log_tau_ref``, so
+        for an atmosphere object pass ``atm.log_tau_ref`` directly. Passing a
+        natural log integrates the transfer against ``tau_ref ** ln(10)`` and
+        yields lines roughly twice too shallow.
         """
         from .traced_synthesis import _synthesize_traced
         return _synthesize_traced(self, T, n_total, ne, z, log_tau_ref,
@@ -250,8 +256,10 @@ def prepare_synthesis(
         Headroom on each line's pixel window. The windows are *measured* at the
         reference parameters below rather than guessed, so this is only for how
         far the plan must stay valid: windows grow with abundance and with
-        pressure broadening, and 2.0 covers roughly a dex. Check
-        ``max_needed_px`` from a call to be sure.
+        pressure broadening, and 2.0 covers roughly a dex. Overrunning a window
+        truncates the profile silently — the traced pass computes
+        ``max_needed_px`` but does not return it, so there is nothing to check
+        against yet.
     reference : (Teff, logg, [M/H])
         Where the window sizes are measured. Pick something near the middle of
         the range you intend to explore.
@@ -299,7 +307,7 @@ def prepare_synthesis(
     nt_r = jnp.asarray([l.number_density for l in atm_r.layers])
     ne_r = jnp.asarray([l.electron_number_density for l in atm_r.layers])
     z_r = jnp.asarray([l.z for l in atm_r.layers])
-    lt_r = jnp.log(jnp.asarray([l.tau_ref for l in atm_r.layers]))
+    lt_r = jnp.log10(jnp.asarray([l.tau_ref for l in atm_r.layers]))
 
     pre_r = precompute_atmosphere(jnp.asarray(wl_np), T_r, nt_r, ne_r, z_r, lt_r,
                                   ab_r, 1e5, data, linelist_data)
@@ -392,7 +400,7 @@ def synthesize(atmosphere, linelist, wavelengths_angstrom, A_X, *,
     n_total = jnp.asarray([l.number_density for l in layers])
     ne = jnp.asarray([l.electron_number_density for l in layers])
     z = jnp.asarray([l.z for l in layers])
-    log_tau = jnp.log(jnp.asarray([l.tau_ref for l in layers]))
+    log_tau = jnp.asarray(atmosphere.log_tau_ref)  # base-10, as the RT kernels expect
     abundances = jnp.asarray(A_X_to_absolute(np.asarray(A_X)))
 
     R = getattr(atmosphere, "R_photosphere", None)

@@ -71,13 +71,17 @@ def _interpolate_marcs_traced(synth, Teff, logg, m_H, alpha_m, C_m):
     n_total = jnp.exp(q[:, 2])
     tau_ref = q[:, 3]
     z = jnp.sinh(q[:, 4])
-    # log of the anchored optical depth. tau_ref is positive throughout a valid
-    # model; the floor keeps log finite if an interpolation strays, and the
-    # `where` keeps its derivative from being infinite there rather than merely
-    # masking the value.
+    # log10 of the anchored optical depth. The base matters: the transfer
+    # kernels take log_tau_ref as base-10 (`tau_ref = 10 ** log_tau_ref`, and
+    # step sizes scaled by ln 10), matching `Atmosphere.log_tau_ref`. Passing a
+    # natural log here integrates against tau_ref ** ln(10) and makes lines
+    # about twice too shallow.
+    # tau_ref is positive throughout a valid model; the `where` keeps the
+    # derivative finite if an interpolation strays, rather than merely masking
+    # the value.
     positive = tau_ref > 0.0
     log_tau_ref = jnp.where(positive,
-                            jnp.log(jnp.where(positive, tau_ref, 1.0)),
+                            jnp.log10(jnp.where(positive, tau_ref, 1.0)),
                             -jnp.inf)
     return T, n_total, ne, z, log_tau_ref, photosphere_radius(logg)
 

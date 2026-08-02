@@ -17,7 +17,13 @@ This is a research project in development that has used large language models. N
 ## Quick Start
 
 ```python
+import numpy as np
 import korg
+from korg.synthesis_plan import synthesize
+from korg.synthesis import filter_linelist
+
+# Wavelengths are an explicit array in Angstroms, not a (start, stop) tuple
+wavelengths = np.arange(5000.0, 5100.0, 0.01)
 
 # Get solar abundances
 A_X = korg.format_A_X()
@@ -25,21 +31,30 @@ A_X = korg.format_A_X()
 # Interpolate a solar-like atmosphere
 atm = korg.interpolate_marcs(5777.0, 4.44, A_X)
 
-# Get a linelist
-linelist = korg.get_VALD_solar_linelist()
+# Get a linelist, and trim it to the synthesis range -- unlike Korg.jl,
+# Korg.px does not discard out-of-range lines for you
+linelist = filter_linelist(korg.get_VALD_solar_linelist(),
+                           wavelengths * 1e-8, 10.0 * 1e-8)
 
 # Synthesize spectrum
-wavelengths, flux, continuum = korg.synthesize(
-    atm, linelist, A_X, (5000.0, 5100.0)
-)
+flux, continuum = synthesize(atm, linelist, wavelengths, A_X)
 
 # Plot
 import matplotlib.pyplot as plt
 plt.figure(figsize=(12, 4))
-plt.plot(wavelengths, flux, 'k-')
+plt.plot(wavelengths, flux / continuum, 'k-')
 plt.xlabel(r'$\lambda$ [Å]')
 plt.ylabel('continuum-normalized flux')
 plt.show()
+```
+
+Synthesizing more than once? Build a plan and reuse it — see
+[docs/the-synthesizer-closure.md](docs/the-synthesizer-closure.md).
+
+```python
+from korg.synthesis_plan import prepare_synthesis
+synth = prepare_synthesis(wavelengths * 1e-8, linelist, geometry="plane-parallel")
+flux, continuum = synth(5777.0, 4.44, 0.0)     # jit-able, differentiable
 ```
 
 ## Abundances
