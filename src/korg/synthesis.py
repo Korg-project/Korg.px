@@ -862,40 +862,10 @@ def synthesize_spectrum(
     )
 
 
-def synthesize_continuum(
-    atmosphere,
-    wavelengths_angstrom,
-    abundances,
-):
-    """
-    Compute continuum spectrum (without lines).
-
-    This is a convenience wrapper that calls synthesize_spectrum with no linelist.
-
-    Parameters
-    ----------
-    atmosphere : PlanarAtmosphere or ShellAtmosphere
-        Model atmosphere structure
-    wavelengths_angstrom : array
-        Wavelength grid [Å]
-    abundances : array, shape (92,)
-        Absolute abundances (N_X/N_total) for elements 1-92
-
-    Returns
-    -------
-    flux : array
-        Continuum flux at each wavelength [erg cm⁻² s⁻¹ Å⁻¹]
-    """
-    result = synthesize_spectrum(
-        atmosphere,
-        linelist=[],
-        wavelengths_angstrom=wavelengths_angstrom,
-        abundances=abundances,
-        hydrogen_lines=False,
-        return_continuum=False,
-        verbose=True
-    )
-    return result.flux
+# ``synthesize_continuum`` stood here. It was ``synthesize_spectrum`` called with an
+# empty linelist and nothing in src/ used it; only one test did. With the traced
+# closure, `prepare_synthesis(wls, [])` expresses the same thing and stays
+# differentiable, so a second entry point earns nothing.
 
 
 def synthesize(
@@ -2592,34 +2562,11 @@ def _compute_line_params_table_jit(
 _voigt_profile_jax_jit = jax.jit(_voigt_profile_jax)
 
 
-@functools.partial(jax.jit, static_argnames=('W', 'n_wl_s', 'n_layers_s'))
-def _voigt_bucket_jit(
-    amp, sigma_D, gamma_L,
-    i_lo_jax, max_wins_jax, wls_jax, wl_jax,
-    *,
-    W: int, n_wl_s: int, n_layers_s: int,
-):
-    """JIT Voigt + scatter for one bucket of lines.
-
-    Parameters already sliced to this bucket; window geometry (i_lo, max_wins)
-    is precomputed at precompute_atmosphere time and passed as JAX arrays.
-
-    amp, sigma_D, gamma_L : (n_b, n_layers)
-    i_lo_jax              : (n_b,) int32  — centered window start pixels
-    max_wins_jax          : (n_b,) float  — half-width in cm per line
-    wls_jax               : (n_b,) float  — line centers [cm]
-    wl_jax                : (n_wl,) float — synthesis wavelength grid [cm]
-    """
-    pix_idx  = i_lo_jax[:, None] + jnp.arange(W)[None, :]          # (n_b, W)
-    delta    = wl_jax[pix_idx] - wls_jax[:, None]                   # (n_b, W)
-    mask     = jnp.abs(delta) <= max_wins_jax[:, None]              # (n_b, W)
-    profiles = _voigt_profile_jax(
-        delta[:, None, :], sigma_D[:, :, None], gamma_L[:, :, None]
-    )  # (n_b, n_layers, W)
-    contrib      = mask[:, None, :] * amp[:, :, None] * profiles    # (n_b, n_layers, W)
-    flat_pix     = pix_idx.ravel()                                    # (n_b * W,)
-    flat_contrib = contrib.transpose(1, 0, 2).reshape(n_layers_s, -1)  # (n_layers, n_b*W)
-    return jax.vmap(lambda c: jnp.zeros(n_wl_s).at[flat_pix].add(c))(flat_contrib)
+# ``_voigt_bucket_jit`` stood here: a single-bucket Voigt-and-scatter kernel with no
+# callers anywhere in src/ or tests/. ``_all_buckets_jit`` below fuses every bucket
+# into one XLA program and superseded it; the traced path in traced_lines.py has
+# since superseded that in turn. Deleted rather than kept: an uncalled kernel is how
+# this package accumulated seven pieces of code that could never have worked.
 
 
 @functools.partial(jax.jit, static_argnames=('bucket_Ws', 'bucket_n_bs', 'n_wl_s', 'n_layers_s'))

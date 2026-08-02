@@ -2,7 +2,7 @@
 Functional, precision, autodiff and jit tests for ``korg.synthesis``.
 
 Scope: the Python-orchestrated synthesis entry points (``synthesize_spectrum``,
-``synthesize``, ``synth``, ``synthesize_continuum``) and the module-level
+``synthesize``, ``synth``) and the module-level
 helpers (``planck_function``, ``blackbody``, ``filter_linelist``,
 ``get_reference_wavelength_linelist``, ``compute_continuum_absorption``),
 including the spherical (``ShellAtmosphere``) path.  The JIT pipeline
@@ -44,7 +44,6 @@ from korg.synthesis import (
     planck_function,
     synth,
     synthesize,
-    synthesize_continuum,
     synthesize_spectrum,
 )
 
@@ -768,14 +767,24 @@ class TestPublicWrappers:
         np.testing.assert_array_equal(flux, baseline.flux)
         np.testing.assert_array_equal(cont, baseline.continuum)
 
-    def test_synthesize_continuum_returns_the_line_free_flux(
-            self, baseline, tiny_atm, tiny_wls, A_X, capsys):
-        """This wrapper had no caller and no test anywhere in the package."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            flux = synthesize_continuum(tiny_atm, tiny_wls, A_X)
-        capsys.readouterr()   # it is unconditionally verbose
-        np.testing.assert_allclose(flux, baseline.continuum, rtol=1e-14)
+    def test_a_line_free_plan_returns_the_continuum(self, tiny_atm, tiny_wls, A_X):
+        """Replaces test_synthesize_continuum_returns_the_line_free_flux.
+
+        ``synthesize_continuum`` was ``synthesize_spectrum`` with an empty
+        linelist, used by nothing in src/. ``prepare_synthesis(wls, [])`` says
+        the same thing and stays traceable.
+        """
+        from korg.synthesis_plan import prepare_synthesis
+        # No n_layers override: calling with stellar parameters goes through the
+        # MARCS interpolation, which always yields 56 layers regardless of what
+        # tiny_atm has.
+        _s = prepare_synthesis(np.asarray(tiny_wls) * 1e-8, [])
+        flux, cntm = _s(5777.0, 4.44, 0.0)
+        flux, cntm = np.asarray(flux), np.asarray(cntm)
+        assert np.all(np.isfinite(flux)) and np.all(flux > 0)
+        # With no atomic lines the only opacity above the continuum is hydrogen,
+        # so the two agree to the H-wing depth rather than exactly.
+        np.testing.assert_allclose(flux, cntm, rtol=1e-3)
 
 
 # ===========================================================================
