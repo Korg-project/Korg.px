@@ -337,3 +337,65 @@ def prepare_synthesis(
         metal_mask=metal_mask,
         n_mu=n_mu,
     )
+
+
+def synthesize(atmosphere, linelist, wavelengths_angstrom, A_X, *,
+               vmic=1.0, geometry=None, return_cntm=True, **plan_kwargs):
+    """Korg.jl-compatible one-shot synthesis.
+
+    Matches Korg.jl's ``synthesize(atm, linelist, A_X, wavelengths)`` ordering and
+    semantics so ported scripts read the same. It builds a
+    :class:`Synthesizer` and calls it once.
+
+    **Prefer** :func:`prepare_synthesis` whenever you synthesize more than once.
+    The plan is the expensive half --- filtering the linelist, sizing the line
+    windows, selecting the hydrogen transitions --- and this function throws it
+    away after a single call. Two syntheses through ``prepare_synthesis`` cost
+    roughly what one costs here; a thousand cost barely more.
+
+    Parameters
+    ----------
+    atmosphere : PlanarAtmosphere or ShellAtmosphere
+        Model atmosphere. Its layers supply T, n, n_e, z and tau_ref.
+    linelist : list of Line
+    wavelengths_angstrom : (n_wl,) array
+        Synthesis grid in Angstroms.
+    A_X : (92,) array
+        Abundances as A(X) = log10(N_X/N_H) + 12.
+    vmic : float
+        Microturbulence in km/s (Korg's unit), converted to cm/s internally.
+    geometry : None, 'spherical' or 'plane-parallel'
+        ``None`` follows the atmosphere type: a ShellAtmosphere is spherical.
+    return_cntm : bool
+        Return ``(flux, continuum)`` if True, else just ``flux``.
+
+    Returns
+    -------
+    flux, continuum : (n_wl,) arrays, or flux alone if ``return_cntm`` is False.
+    """
+    from .abundances import A_X_to_absolute
+
+    wl_cm = np.asarray(wavelengths_angstrom, dtype=np.float64) * 1e-8
+    layers = atmosphere.layers
+    n_layers = len(layers)
+
+    if geometry is None:
+        # Follow the atmosphere the caller actually handed us rather than
+        # guessing from log g -- they have already made the choice by building a
+        # ShellAtmosphere or a PlanarAtmosphere.
+        geometry = "spherical" if hasattr(atmosphere, "R_photosphere") else "plane-parallel"
+
+    synth = prepare_synthesis(wl_cm, linelist, geometry=geometry,
+                              n_layers=n_layers, **plan_kwargs)
+
+    T = jnp.asarray([l.temperature for l in layers])
+    n_total = jnp.asarray([l.number_density for l in layers])
+    ne = jnp.asarray([l.electron_number_density for l in layers])
+    z = jnp.asarray([l.z for l in layers])
+    log_tau = jnp.log(jnp.asarray([l.tau_ref for l in layers]))
+    abundances = jnp.asarray(A_X_to_absolute(np.asarray(A_X)))
+
+    R = getattr(atmosphere, "R_photosphere", None)
+    flux, cntm = synth.from_atmosphere(T, n_total, ne, z, log_tau, abundances,
+                                       vmic_cm_s=vmic * 1e5, R_photosphere=R)
+    return (flux, cntm) if return_cntm else flux
