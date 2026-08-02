@@ -143,8 +143,8 @@ class TestSynthesis:
 
     def test_metal_poor_lines_are_weaker(self, synth):
         """A physical check that [M/H] reaches the line opacity."""
-        solar = np.asarray(np.divide(*synth(TEFF, LOGG, 0.0)))
-        poor = np.asarray(np.divide(*synth(TEFF, LOGG, -2.0)))
+        solar = (lambda fc: np.asarray(fc[0] / fc[1]))(synth(TEFF, LOGG, 0.0))
+        poor = (lambda fc: np.asarray(fc[0] / fc[1]))(synth(TEFF, LOGG, -2.0))
         assert poor.min() > solar.min()
 
     def test_from_atmosphere_matches_the_stellar_parameter_path(self, synth, abundances):
@@ -297,3 +297,72 @@ class TestTracing:
         g = float(jax.jit(jax.grad(
             lambda t: jnp.sum(synth(t, LOGG, M_H)[0])))(TEFF))
         assert np.isfinite(g)
+
+
+# ===========================================================================
+# SPHERICAL GEOMETRY
+# ===========================================================================
+
+class TestSphericalGeometry:
+    """The spherical branch, across all four tiers.
+
+    This branch was unreachable when written: ``traced_synthesis`` imported
+    ``radiative_transfer_spherical_jit``, a name that does not exist, so
+    ``geometry='spherical'`` raised ImportError on first call. Nothing caught it
+    because nothing had ever executed it. These tests exist so that cannot recur.
+    """
+
+    @pytest.fixture(scope="class")
+    def sph(self, wavelengths, linelist):
+        return prepare_synthesis(wavelengths, linelist, geometry="spherical")
+
+    def test_runs_and_returns_finite_flux(self, sph):
+        flux, cntm = np.asarray(sph(TEFF, LOGG, M_H)[0]), np.asarray(sph(TEFF, LOGG, M_H)[1])
+        assert flux.shape == (sph.n_wl,)
+        assert np.all(np.isfinite(flux)) and np.all(flux > 0)
+        assert np.all(flux <= cntm * (1.0 + 1e-8))
+
+    def test_close_to_planar_for_a_thin_solar_shell(self, sph, synth):
+        """A geometrically thin shell must nearly reproduce plane-parallel.
+
+        The solar atmosphere spans ~1e8 cm against R = 7e10 cm, so the two
+        geometries agree to well under a percent. Measured: 5.9e-4. A large
+        divergence here means the ray geometry is wrong, not that spherical
+        transfer is doing something subtle.
+        """
+        planar = np.asarray(synth(TEFF, LOGG, M_H)[0])
+        spherical = np.asarray(sph(TEFF, LOGG, M_H)[0])
+        rel = np.abs(spherical - planar) / planar
+        assert rel.max() < 5e-3, f"max relative difference {rel.max():.2e}"
+        assert rel.max() > 0.0, "spherical is bit-identical to planar -- flag ignored?"
+
+    def test_gradients_are_finite(self, sph):
+        g = float(jax.grad(lambda t: (lambda fc: jnp.sum(fc[0] / fc[1]))(sph(t, LOGG, M_H)))(TEFF))
+        assert np.isfinite(g) and g != 0.0
+
+    def test_gradient_tracks_the_planar_one(self, sph, synth):
+        """Same physics, thin shell: the derivatives should agree closely too."""
+        gs = float(jax.grad(lambda t: (lambda fc: jnp.sum(fc[0] / fc[1]))(sph(t, LOGG, M_H)))(TEFF))
+        gp = float(jax.grad(lambda t: (lambda fc: jnp.sum(fc[0] / fc[1]))(synth(t, LOGG, M_H)))(TEFF))
+        assert np.sign(gs) == np.sign(gp)
+        assert abs(gs - gp) / abs(gp) < 0.05
+
+    def test_abundance_gradient_is_finite(self, sph, abundances):
+        g = np.asarray(jax.grad(
+            lambda a: (lambda fc: jnp.sum(fc[0] / fc[1]))(sph(TEFF, LOGG, abundances=a)))(abundances))
+        assert np.all(np.isfinite(g))
+
+    def test_jit_and_vmap(self, sph):
+        jitted = np.asarray(jax.jit(lambda t: sph(t, LOGG, M_H)[0])(TEFF))
+        assert np.all(np.isfinite(jitted))
+        out = np.asarray(jax.vmap(lambda t: sph(t, LOGG, M_H)[0])(
+            jnp.array([5600.0, 5900.0])))
+        assert out.shape == (2, sph.n_wl) and np.all(np.isfinite(out))
+
+    def test_photosphere_radius_follows_logg(self, wavelengths, linelist):
+        """R = sqrt(G M_sun / g), so higher gravity means a smaller star."""
+        dwarf = prepare_synthesis(wavelengths, linelist, geometry="spherical",
+                                  reference=(5777.0, 4.44, 0.0))
+        giant = prepare_synthesis(wavelengths, linelist, geometry="spherical",
+                                  reference=(4500.0, 2.0, 0.0))
+        assert giant.R_photosphere > dwarf.R_photosphere
