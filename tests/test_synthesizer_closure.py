@@ -84,7 +84,7 @@ class TestPlanConstruction:
         assert len(seen) == len(set(seen.tolist())), "a line is in two buckets"
 
     def test_rejects_unknown_geometry(self, wavelengths, linelist):
-        with pytest.raises(ValueError, match="planar.*spherical"):
+        with pytest.raises(ValueError, match="spherical.*plane-parallel"):
             prepare_synthesis(wavelengths, linelist, geometry="toroidal")
 
     def test_rejects_a_degenerate_wavelength_grid(self, linelist):
@@ -149,8 +149,9 @@ class TestSynthesis:
 
     def test_from_atmosphere_matches_the_stellar_parameter_path(self, synth, abundances):
         from korg.traced_synthesis import _interpolate_marcs_traced
-        T, nt, ne, z, lt = _interpolate_marcs_traced(synth, TEFF, LOGG, 0.0, 0.0, 0.0)
-        direct = np.asarray(synth.from_atmosphere(T, nt, ne, z, lt, abundances)[0])
+        T, nt, ne, z, lt, R = _interpolate_marcs_traced(synth, TEFF, LOGG, 0.0, 0.0, 0.0)
+        direct = np.asarray(synth.from_atmosphere(T, nt, ne, z, lt, abundances,
+                                                  R_photosphere=R, logg=LOGG)[0])
         viaparams = np.asarray(synth(TEFF, LOGG, abundances=abundances)[0])
         # 1.3e-8 on 2 of 200 pixels. Same floor as test_jit_matches_the_eager_result:
         # the bucketed Voigt runs in float32, and the two routes to the same
@@ -359,10 +360,103 @@ class TestSphericalGeometry:
             jnp.array([5600.0, 5900.0])))
         assert out.shape == (2, sph.n_wl) and np.all(np.isfinite(out))
 
-    def test_photosphere_radius_follows_logg(self, wavelengths, linelist):
-        """R = sqrt(G M_sun / g), so higher gravity means a smaller star."""
-        dwarf = prepare_synthesis(wavelengths, linelist, geometry="spherical",
-                                  reference=(5777.0, 4.44, 0.0))
-        giant = prepare_synthesis(wavelengths, linelist, geometry="spherical",
-                                  reference=(4500.0, 2.0, 0.0))
-        assert giant.R_photosphere > dwarf.R_photosphere
+    def test_radius_is_not_a_plan_attribute(self, sph):
+        """R belongs to the call, not the plan.
+
+        This test used to assert that two *plans* built at different reference
+        log g carried different radii -- which was true, and was exactly the bug:
+        a single plan then applied its reference radius to every star it was
+        called with. See TestPhotosphereRadius for what replaced it.
+        """
+        assert not hasattr(sph, "R_photosphere")
+
+
+# ===========================================================================
+# GEOMETRY SELECTION
+# ===========================================================================
+
+class TestGeometrySelection:
+    """`geometry=None` picks per-call from log g, as Korg.jl does."""
+
+    @pytest.fixture(scope="class")
+    def auto(self, wavelengths, linelist):
+        return prepare_synthesis(wavelengths, linelist, geometry=None)
+
+    def test_spellings_normalise(self, wavelengths, linelist):
+        for name in ("planar", "plane-parallel", "pp", "PLANE_PARALLEL"):
+            s = prepare_synthesis(wavelengths, linelist, geometry=name)
+            assert s.geometry == "plane-parallel", name
+        assert prepare_synthesis(wavelengths, linelist,
+                                 geometry="spherical").geometry == "spherical"
+        assert prepare_synthesis(wavelengths, linelist, geometry=None).geometry is None
+
+    def test_rejects_nonsense(self, wavelengths, linelist):
+        with pytest.raises(ValueError, match="spherical.*plane-parallel"):
+            prepare_synthesis(wavelengths, linelist, geometry="toroidal")
+
+    def test_dwarf_takes_the_plane_parallel_branch(self, auto, wavelengths, linelist):
+        pp = prepare_synthesis(wavelengths, linelist, geometry="plane-parallel")
+        a = np.asarray(auto(TEFF, 4.44, M_H)[0])
+        b = np.asarray(pp(TEFF, 4.44, M_H)[0])
+        # 4.8e-8: the float32 Voigt floor, not a different branch. lax.cond
+        # changes how XLA fuses the line kernel.
+        np.testing.assert_allclose(a, b, rtol=1e-6)
+
+    def test_giant_takes_the_spherical_branch(self, auto, wavelengths, linelist):
+        sph = prepare_synthesis(wavelengths, linelist, geometry="spherical")
+        a = np.asarray(auto(4500.0, 2.0, M_H)[0])
+        b = np.asarray(sph(4500.0, 2.0, M_H)[0])
+        np.testing.assert_allclose(a, b, rtol=1e-6)
+
+    def test_the_two_branches_actually_differ_for_a_giant(self, wavelengths, linelist):
+        """If they agreed, the dispatch would be untestable and pointless."""
+        pp = prepare_synthesis(wavelengths, linelist, geometry="plane-parallel")
+        sph = prepare_synthesis(wavelengths, linelist, geometry="spherical")
+        a = np.asarray(pp(4500.0, 2.0, M_H)[0])
+        b = np.asarray(sph(4500.0, 2.0, M_H)[0])
+        assert np.max(np.abs(a - b) / a) > 1e-4
+
+    def test_jit_and_gradients_through_the_dispatch(self, auto):
+        assert np.all(np.isfinite(np.asarray(
+            jax.jit(lambda t: auto(t, LOGG, M_H)[0])(TEFF))))
+        g = float(jax.grad(lambda t: jnp.sum(
+            (lambda fc: fc[0] / fc[1])(auto(t, LOGG, M_H))))(TEFF))
+        assert np.isfinite(g)
+
+    def test_from_atmosphere_demands_logg_when_geometry_is_None(self, auto, abundances):
+        from korg.traced_synthesis import _interpolate_marcs_traced
+        T, nt, ne, z, lt, _ = _interpolate_marcs_traced(auto, TEFF, LOGG, 0.0, 0.0, 0.0)
+        with pytest.raises(ValueError, match="needs logg"):
+            auto.from_atmosphere(T, nt, ne, z, lt, abundances)
+
+
+class TestPhotosphereRadius:
+    """R = sqrt(G M_sun / g), computed from the *called* log g.
+
+    It used to be frozen into the plan at the reference log g, so a solar-built
+    plan gave a giant the solar radius -- 6.9e10 cm instead of 1.2e12, a factor
+    of 17 -- and d/dlogg missed the radius dependence entirely. Every spherical
+    test synthesized at the reference parameters, where frozen and live coincide,
+    so none of them caught it.
+    """
+
+    def test_radius_tracks_logg(self):
+        from korg.traced_synthesis import photosphere_radius
+        assert float(photosphere_radius(4.44)) == pytest.approx(6.942e10, rel=1e-3)
+        assert float(photosphere_radius(2.0)) == pytest.approx(1.152e12, rel=1e-3)
+        assert float(photosphere_radius(2.0)) > 10 * float(photosphere_radius(4.44))
+
+    def test_radius_is_differentiable(self):
+        from korg.traced_synthesis import photosphere_radius
+        g = float(jax.grad(photosphere_radius)(4.44))
+        assert np.isfinite(g) and g < 0.0, "higher gravity means a smaller star"
+
+    def test_a_solar_plan_gives_a_giant_the_giant_radius(self, wavelengths, linelist):
+        """The regression this class exists for: one plan, two very different stars."""
+        sph = prepare_synthesis(wavelengths, linelist, geometry="spherical",
+                                reference=(5777.0, 4.44, 0.0))
+        flux = np.asarray(sph(4500.0, 2.0, M_H)[0])
+        assert np.all(np.isfinite(flux)) and np.all(flux > 0)
+        g = float(jax.grad(lambda L: jnp.sum(
+            (lambda fc: fc[0] / fc[1])(sph(4500.0, L, M_H))))(2.0))
+        assert np.isfinite(g) and g != 0.0, "d/dlogg must see the radius"

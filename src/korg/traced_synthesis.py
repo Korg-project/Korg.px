@@ -18,6 +18,22 @@ from .constants import c_cgs
 from .traced_lines import line_alpha_traced, hydrogen_alpha_traced
 
 LAMBDA_REF_CM = 5e-5
+G_CGS = 6.67430e-8
+M_SUN_CGS = 1.9885e33
+SPHERICAL_LOGG_THRESHOLD = 3.5   # Korg.jl marcs_interpolation.py:524
+
+
+def photosphere_radius(logg):
+    """R = sqrt(G M_sun / g), Korg.jl's convention.
+
+    A smooth function of a traced scalar, so it belongs inside the traced region.
+    It used to be frozen into the plan at the *reference* log g, which meant a
+    plan built for the Sun computed giant ray geometry with the solar radius --
+    7e10 cm instead of 3e12 cm, a factor of 40 -- and d/dlogg missed the radius
+    dependence entirely. Nothing about R determines a shape, so nothing required
+    it to be static.
+    """
+    return jnp.sqrt(G_CGS * M_SUN_CGS / 10.0 ** jnp.asarray(logg, dtype=jnp.float64))
 
 
 def _interpolate_marcs_traced(synth, Teff, logg, m_H, alpha_m, C_m):
@@ -63,11 +79,12 @@ def _interpolate_marcs_traced(synth, Teff, logg, m_H, alpha_m, C_m):
     log_tau_ref = jnp.where(positive,
                             jnp.log(jnp.where(positive, tau_ref, 1.0)),
                             -jnp.inf)
-    return T, n_total, ne, z, log_tau_ref
+    return T, n_total, ne, z, log_tau_ref, photosphere_radius(logg)
 
 
 def _synthesize_traced(synth, T_layers, n_total_layers, ne_layers, z_layers,
-                       log_tau_ref, abundances, vmic_cm_s):
+                       log_tau_ref, abundances, vmic_cm_s,
+                       R_photosphere=None, logg=None):
     """One traced pass: chemistry, continuum, lines, hydrogen, transfer.
 
     Returns ``(flux, continuum)`` in erg cm^-2 s^-1 A^-1.
@@ -175,27 +192,49 @@ def _synthesize_traced(synth, T_layers, n_total_layers, ne_layers, z_layers,
         alpha_ref_all = (alpha_cntm_all + line_alpha)[:, synth.ref_pixel]
 
     # -- radiative transfer ---------------------------------------------------
-    if synth.geometry == "planar":
+    def _planar():
         from .radiative_transfer import radiative_transfer_jit as rt
-        flux, _ = rt(alpha_total.T, S_all.T, z_layers, log_tau_ref, alpha_ref_all)
-        flux_cntm, _ = rt(alpha_cntm_all.T, S_all.T, z_layers, log_tau_ref, alpha_ref_all)
-    else:
-        # Spherical rays need a *radius*, not a height. z_layers is measured from
-        # the photosphere and is negative in the deepest layers, so the caller
-        # passes R_photosphere through the plan and r = R + z is formed here.
+        f, _ = rt(alpha_total.T, S_all.T, z_layers, log_tau_ref, alpha_ref_all)
+        fc, _ = rt(alpha_cntm_all.T, S_all.T, z_layers, log_tau_ref, alpha_ref_all)
+        return f, fc
+
+    def _spherical():
         from .radiative_transfer.spherical import spherical_ray_flux
         from .radiative_transfer import generate_mu_grid
         mu, mu_w = generate_mu_grid(synth.n_mu)
-        radii = synth.R_photosphere + z_layers
+        R = R_photosphere if R_photosphere is not None else photosphere_radius(logg)
+        radii = R + z_layers
         out = spherical_ray_flux(alpha_total.T, S_all.T, radii, log_tau_ref,
                                  alpha_ref_all, mu, mu_w)
         out_c = spherical_ray_flux(alpha_cntm_all.T, S_all.T, radii, log_tau_ref,
                                    alpha_ref_all, mu, mu_w)
-        flux = out[0] if isinstance(out, tuple) else out
-        flux_cntm = out_c[0] if isinstance(out_c, tuple) else out_c
+        f = out[0] if isinstance(out, tuple) else out
+        fc = out_c[0] if isinstance(out_c, tuple) else out_c
         # Korg quotes the flux at the photospheric radius, not the outermost one.
-        correction = (radii[0] / synth.R_photosphere) ** 2
-        flux = flux * correction
-        flux_cntm = flux_cntm * correction
+        corr = (radii[0] / R) ** 2
+        return f * corr, fc * corr
+
+    if synth.geometry == "plane-parallel":
+        flux, flux_cntm = _planar()
+    elif synth.geometry == "spherical":
+        flux, flux_cntm = _spherical()
+    else:
+        # geometry=None: choose the way Korg.jl does, from log g, inside the
+        # traced region. lax.cond keeps this one program: under plain jit only
+        # the selected branch runs; under vmap JAX converts it to a select and
+        # evaluates both, which is a cost, not a correctness problem.
+        #
+        # The derivative is the *selected* branch's. The switch contributes
+        # nothing, and cannot: log g = 3.5 is a discontinuous change of model,
+        # not a smooth transition, so d(flux)/d(logg) genuinely does not exist
+        # there. Differentiating or vmapping across it is the caller's to avoid.
+        if logg is None:
+            raise ValueError(
+                "geometry=None resolves the geometry from log g, so from_atmosphere() "
+                "needs logg=... . Pass it, or build the plan with "
+                "geometry='spherical' or 'plane-parallel'.")
+        flux, flux_cntm = jax.lax.cond(
+            jnp.asarray(logg) < SPHERICAL_LOGG_THRESHOLD,
+            lambda: _spherical(), lambda: _planar())
 
     return flux * 1e-8, flux_cntm * 1e-8

@@ -62,6 +62,25 @@ LAMBDA_REF_CM = 5e-5      # 5000 A, the MARCS reference wavelength
 N_MARCS_LAYERS = 56
 
 
+def _normalise_geometry(geometry):
+    """Accept Korg's vocabulary and settle on one spelling.
+
+    ``None`` means "decide from log g at call time, as Korg.jl does" --- one
+    plan for dwarfs and giants alike, at the cost of compiling both branches and
+    of being non-differentiable across log g = 3.5, which is a discontinuous
+    change of model rather than a smooth transition.
+    """
+    if geometry is None:
+        return None
+    g = str(geometry).lower().replace("_", "-")
+    if g in ("planar", "plane-parallel", "pp"):
+        return "plane-parallel"
+    if g == "spherical":
+        return "spherical"
+    raise ValueError(
+        f"geometry must be None, 'spherical' or 'plane-parallel', got {geometry!r}")
+
+
 def _stark_transitions_in_range(wl_min_cm: float, wl_max_cm: float) -> Tuple:
     """Which Stehle Stark transitions can touch this wavelength window."""
     from .hydrogen_line_absorption import hline_stark_profiles
@@ -131,7 +150,7 @@ class Synthesizer:
                  bucket_line_idx, bucket_widths, stark_keys, brackett_in_range,
                  ref_pixel, geometry, wl_spacing, n_layers, marcs_arrays,
                  solar_A_X, alpha_mask, c_mask, metal_mask,
-                 R_photosphere=6.957e10, n_mu=20):
+                 n_mu=20):
         self.wavelengths_cm = wavelengths_cm
         self.cntm_wl_cm = cntm_wl_cm
         self.linelist_data = linelist_data
@@ -151,16 +170,12 @@ class Synthesizer:
         self._alpha_mask = alpha_mask
         self._c_mask = c_mask
         self._metal_mask = metal_mask
-        # Spherical geometry only. R = sqrt(G M_sun / g) is the Korg.jl
-        # convention; it is a host constant because the ray *count* depends on
-        # it only through n_layers, not through its value.
-        self.R_photosphere = R_photosphere
         self.n_mu = n_mu
 
     # -- the traced entry points ------------------------------------------------
 
     def from_atmosphere(self, T, n_total, ne, z, log_tau_ref, abundances,
-                        vmic_cm_s=1e5):
+                        vmic_cm_s=1e5, R_photosphere=None, logg=None):
         """Synthesize from atmosphere arrays. Traced; differentiable in all six.
 
         Use this when the atmosphere does not come from the MARCS grid — a model
@@ -168,7 +183,8 @@ class Synthesizer:
         """
         from .traced_synthesis import _synthesize_traced
         return _synthesize_traced(self, T, n_total, ne, z, log_tau_ref,
-                                  abundances, vmic_cm_s)
+                                  abundances, vmic_cm_s,
+                                  R_photosphere=R_photosphere, logg=logg)
 
     def __call__(self, Teff, logg, m_H=0.0, alpha_m=0.0, C_m=0.0,
                  abundances=None, vmic_cm_s=1e5):
@@ -191,10 +207,11 @@ class Synthesizer:
                                      self._metal_mask)
             abundances = _A_X_to_absolute_traced(A_X)
 
-        T, n_total, ne, z, log_tau_ref = _interpolate_marcs_traced(
+        T, n_total, ne, z, log_tau_ref, R_phot = _interpolate_marcs_traced(
             self, Teff, logg, m_H, alpha_m, C_m)
         return _synthesize_traced(self, T, n_total, ne, z, log_tau_ref,
-                                  abundances, vmic_cm_s)
+                                  abundances, vmic_cm_s,
+                                  R_photosphere=R_phot, logg=logg)
 
     def __repr__(self):
         return (f"Synthesizer(n_wl={self.n_wl}, n_layers={self.n_layers}, "
@@ -207,7 +224,7 @@ def prepare_synthesis(
     linelist,
     data=None,
     *,
-    geometry: str = "planar",
+    geometry: Optional[str] = None,
     cntm_step_cm: float = 1e-8,
     window_safety: float = 2.0,
     reference: Tuple[float, float, float] = (5777.0, 4.44, 0.0),
@@ -246,8 +263,7 @@ def prepare_synthesis(
     -------
     Synthesizer
     """
-    if geometry not in ("planar", "spherical"):
-        raise ValueError(f"geometry must be 'planar' or 'spherical', got {geometry!r}")
+    geometry = _normalise_geometry(geometry)
 
     from .synthesis import load_synthesis_data, preprocess_linelist, precompute_atmosphere
     from .marcs_interpolation import _get_marcs_jit_data
@@ -319,6 +335,5 @@ def prepare_synthesis(
         alpha_mask=alpha_mask,
         c_mask=c_mask,
         metal_mask=metal_mask,
-        R_photosphere=float(np.sqrt(6.67430e-8 * 1.9885e33 / 10.0 ** logg_r)),
         n_mu=n_mu,
     )
