@@ -2415,13 +2415,30 @@ def _pf_orig_eval(log_T, t_arr, u_arr, h_arr, z_arr, n_knots):
     t_arr/u_arr/h_arr/z_arr are padded to 201 entries (inf in tail of t_arr).
     n_knots is the number of valid (unpadded) knots — may be a traced JAX integer.
     """
-    t_max = t_arr[n_knots - 1]
-    log_T_c = jnp.clip(log_T, t_arr[0], t_max)
-    i = jnp.clip(jnp.searchsorted(t_arr, log_T_c, side='right') - 1, 0, n_knots - 2)
-    ti  = t_arr[i];   ti1 = t_arr[i + 1]
+    # A species with a single tabulated knot -- H III, which does not exist --
+    # makes `n_knots - 2` equal -1. jnp.clip(x, 0, -1) returns -1, so `t_arr[i]`
+    # wraps to the last element, which is the *inf padding*, and `h_arr[i + 1]`
+    # becomes a zero divisor. The value is masked downstream but the cotangent is
+    # not, and inf/0 partials meeting a zero cotangent give NaN.
+    #
+    # This is the same degeneracy that was fixed in the table *builder*; the
+    # shipped table predates that fix and still contains it (201 non-finite knot
+    # entries against 199 in a freshly computed one). Guarding here means the
+    # evaluator is correct for both, rather than depending on which table a
+    # caller happens to load -- which is what made a verified-this-morning
+    # gradient come back NaN in production.
+    n_eff = jnp.maximum(n_knots, 2)
+    t_safe = jnp.where(jnp.isfinite(t_arr), t_arr, jnp.finfo(jnp.float64).max)
+    t_max = t_safe[n_eff - 1]
+    log_T_c = jnp.clip(log_T, t_safe[0], t_max)
+    i = jnp.clip(jnp.searchsorted(t_safe, log_T_c, side='right') - 1, 0, n_eff - 2)
+    ti  = t_safe[i];  ti1 = t_safe[i + 1]
     ui  = u_arr[i];   ui1 = u_arr[i + 1]
     zi  = z_arr[i];   zi1 = z_arr[i + 1]
     hi1 = h_arr[i + 1]
+    # Strictly positive substitute, not a clamp to zero: 1/h and h both appear,
+    # so a zero divisor is infinite either way.
+    hi1 = jnp.where(hi1 != 0.0, hi1, 1.0)
     return (zi  * (ti1 - log_T_c)**3 / (6.0 * hi1)
             + zi1 * (log_T_c - ti )**3 / (6.0 * hi1)
             + (ui1 / hi1 - zi1 * hi1 / 6.0) * (log_T_c - ti )

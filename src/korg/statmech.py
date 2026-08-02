@@ -669,11 +669,23 @@ def _compute_saha_weights_jit(T, ne, data):
         # Saha equation for first ionization
         wII = 2.0 / ne_clipped * (UII / jnp.clip(UI, 1e-99, jnp.inf)) * transU * jnp.exp(-χI / (kboltz_eV * T))
 
-        # Second ionization
-        wIII = wII * 2.0 / ne_clipped * (UIII / jnp.clip(UII, 1e-99, jnp.inf)) * transU * jnp.exp(-χII / (kboltz_eV * T))
-
-        # Handle hydrogen (Z=1, cannot be doubly ionized)
-        wIII = jnp.where(Z_minus_1 == 0, 0.0, wIII)
+        # Second ionization. Hydrogen has no doubly ionized state, and the table
+        # entries that would describe one (χII, UIII, and a UII that is clipped
+        # up from zero) are placeholders. Masking the *result* for Z = 1 leaves
+        # the placeholder arithmetic in the graph, and reverse mode still walks
+        # it: the zero cotangent the mask hands back meets the infinite partials
+        # of a 1e-99-clipped division, and 0 x inf = NaN.
+        #
+        # Substituting strictly benign values into the dead branch first means no
+        # infinite partial is ever formed. The selected value is unchanged for
+        # every element, hydrogen included.
+        is_H = Z_minus_1 == 0
+        UII_safe = jnp.where(is_H, 1.0, jnp.clip(UII, 1e-99, jnp.inf))
+        UIII_safe = jnp.where(is_H, 1.0, UIII)
+        χII_safe = jnp.where(is_H, 1.0, χII)
+        wIII = (wII * 2.0 / ne_clipped * (UIII_safe / UII_safe) * transU
+                * jnp.exp(-χII_safe / (kboltz_eV * T)))
+        wIII = jnp.where(is_H, 0.0, wIII)
 
         return wII, wIII
 
@@ -688,13 +700,26 @@ def _eval_atomic_pf_jit(log_T, t_arr, u_arr, h_arr, z_arr, n_knots):
 
     Matches Julia's CubicSpline evaluation exactly. Uses original non-uniform knots.
     """
-    t_max = t_arr[n_knots - 1]
-    log_T_c = jnp.clip(log_T, t_arr[0], t_max)
-    i = jnp.clip(jnp.searchsorted(t_arr, log_T_c, side='right') - 1, 0, n_knots - 2)
-    ti  = t_arr[i];   ti1 = t_arr[i + 1]
+    # Byte-identical twin of ``synthesis._pf_orig_eval``, and this is the copy on
+    # the chemical-equilibrium hot path -- the other one is only reached for the
+    # H I / He I partition functions used by the continuum. Guarding one and not
+    # the other is why fixing ``_pf_orig_eval`` made the ``pf`` stage finite
+    # while every chemistry gradient stayed NaN.
+    #
+    # A species with a single tabulated knot -- H III, which does not exist --
+    # makes ``n_knots - 2`` equal -1, and ``jnp.clip(x, 0, -1)`` returns -1, so
+    # ``t_arr[i]`` wraps to the inf padding and ``h_arr[i + 1]`` is a zero
+    # divisor. The value is masked downstream; the cotangent is not.
+    n_eff = jnp.maximum(n_knots, 2)
+    t_safe = jnp.where(jnp.isfinite(t_arr), t_arr, jnp.finfo(jnp.float64).max)
+    t_max = t_safe[n_eff - 1]
+    log_T_c = jnp.clip(log_T, t_safe[0], t_max)
+    i = jnp.clip(jnp.searchsorted(t_safe, log_T_c, side='right') - 1, 0, n_eff - 2)
+    ti  = t_safe[i];  ti1 = t_safe[i + 1]
     ui  = u_arr[i];   ui1 = u_arr[i + 1]
     zi  = z_arr[i];   zi1 = z_arr[i + 1]
     hi1 = h_arr[i + 1]
+    hi1 = jnp.where(hi1 != 0.0, hi1, 1.0)
     return (zi  * (ti1 - log_T_c)**3 / (6.0 * hi1)
             + zi1 * (log_T_c - ti )**3 / (6.0 * hi1)
             + (ui1 / hi1 - zi1 * hi1 / 6.0) * (log_T_c - ti )
