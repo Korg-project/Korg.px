@@ -31,19 +31,26 @@ def leggauss(n):
     -------
     nodes : array, shape (n_mu, )
     weights : array, shape (n_mu, )
+
+    Notes
+    -----
+    Computed on the host with NumPy rather than in JAX. ``n`` sets an array
+    shape, so it can never be a traced value, and nothing differentiates with
+    respect to quadrature nodes — so there was nothing to gain from tracing this,
+    and something to lose. The previous implementation used Golub–Welsch
+    (``jnp.linalg.eigh`` of the Jacobi matrix), whose nodes come out ~4.5e-15
+    apart on LAPACK and cuSOLVER. That is unremarkable for a symmetric
+    eigensolver, but ``generate_mu_grid`` then forms ``0.5 * (x + 1)``, and for
+    the node nearest −1 that cancellation turns 4.5e-15 absolute into ~4e-13
+    relative — enough to make the grid disagree with Korg.jl by more than the
+    reference test's 1e-13 on GPU while passing on CPU.
+
+    ``np.polynomial.legendre.leggauss`` is backend-independent and agrees with
+    Korg.jl's ``FastGaussQuadrature.gausslegendre`` to 1.6e-14 on the
+    transformed grid.
     """
-    # Companion matrix for Legendre polynomials
-    i = jnp.arange(1, n)
-    beta = i / jnp.sqrt(4 * i**2 - 1)
-
-    # Symmetric tridiagonal matrix
-    T = jnp.diag(beta, -1) + jnp.diag(beta, 1)
-
-    # Eigenvalues are nodes, eigenvectors give weights
-    nodes, V = jnp.linalg.eigh(T)
-    weights = 2 * V[0, :]**2
-
-    return nodes, weights
+    nodes, weights = np.polynomial.legendre.leggauss(n)
+    return jnp.asarray(nodes), jnp.asarray(weights)
 
 
 def generate_mu_grid(n_mu=5):

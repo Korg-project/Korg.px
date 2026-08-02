@@ -562,16 +562,27 @@ class TestExponentialIntegral2Gradients:
         expected = np.log(x) + 0.5772156649015329
         np.testing.assert_allclose(g, expected, rtol=1e-6)
 
-    def test_denormal_arguments_are_out_of_reach(self):
+    def test_denormal_arguments_stay_finite(self):
         """
-        Below the smallest normal float the gradient silently flattens to zero.
+        A denormal argument must not produce a NaN or infinite gradient.
 
-        ``_expint_small`` differentiates ``x * log(x)`` as ``log(x) + x * (1/x)``
-        and ``1/x`` overflows once x is denormal, so the ``x * (1/x)`` term is
-        lost. Recorded rather than fixed: no optical depth in a stellar
-        atmosphere is 1e-320, and the alternative is rewriting the fit.
+        ``_expint_small`` differentiates ``x * log(x)`` as ``log(x) + x * (1/x)``,
+        and ``1/x`` overflows once x is denormal.  What happens next is
+        *backend-dependent*, so only finiteness is asserted:
+
+        - CPU: ``x * (1/x)`` is lost to flush-to-zero and the gradient is 0.0.
+        - CUDA: denormals survive the multiply and the gradient is
+          -736.25, which is the correct asymptote log(x) + gamma.
+
+        This previously asserted ``== 0.0``, which pinned the CPU behaviour and
+        failed on the GPU backend this package is meant to run on.  Neither
+        outcome is a defect worth fixing --- no optical depth in a stellar
+        atmosphere is 1e-320 --- but a NaN here would be, and that is what is
+        guarded.
         """
-        assert float(jax.grad(exponential_integral_2)(np.float64(1e-320))) == 0.0
+        g = float(jax.grad(exponential_integral_2)(np.float64(1e-320)))
+        assert np.isfinite(g), f"dE2/dx is {g} at a denormal argument"
+        assert g <= 0.0
 
     def test_nan_input_still_propagates(self):
         """

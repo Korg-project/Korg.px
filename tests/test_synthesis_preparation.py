@@ -304,6 +304,37 @@ class TestVdWToSigmaAlpha:
         assert sigma == pytest.approx(0.0)
         assert alpha == pytest.approx(-1.0)
 
+    def test_a_small_positive_scalar_is_taken_as_a_direct_coefficient(self):
+        """A positive scalar is a fudge factor, not a log; it passes through."""
+        sigma, alpha = _vdW_to_sigma_alpha(1.5e-31)
+        assert sigma == pytest.approx(1.5e-31, rel=0)
+        assert alpha == pytest.approx(-1.0)
+
+    def test_a_list_is_accepted_like_a_tuple(self):
+        sigma, alpha = _vdW_to_sigma_alpha([0.278, 0.227])
+        assert sigma == pytest.approx(0.278)
+        assert alpha == pytest.approx(0.227)
+
+
+class TestPrepareWavelengthGridUnreachableGuard:
+    """``prepare_wavelength_grid`` has a guard that cannot fire.
+
+    ``wl_start < wl_end`` is validated first, and both the ``n_points`` branch
+    (``n_points >= 2``) and the ``np.arange`` branch then always produce at
+    least one sample — so the ``"Grid is empty"`` ``ValueError`` is dead code.
+    Recorded here rather than left as an unexplained coverage hole.
+    """
+
+    @pytest.mark.parametrize("kwargs", [
+        {"wl_step": 1e6},          # step far wider than the range
+        {"n_points": 2},
+        {"wl_step": 1e-6},
+    ])
+    def test_the_grid_is_never_empty(self, kwargs):
+        ang, cm = prepare_wavelength_grid(5000.0, 5000.001, **kwargs)
+        assert len(ang) >= 1
+        np.testing.assert_allclose(cm, ang * 1e-8, rtol=1e-15)
+
 
 # ---------------------------------------------------------------------------
 # prepare_atmosphere

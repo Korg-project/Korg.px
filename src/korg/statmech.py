@@ -115,19 +115,33 @@ def hummer_mihalas_w(T, n_eff, nH, nHe, ne, use_hubeny_generalization=False):
     e = electron_charge_cgs
 
     if use_hubeny_generalization:
-        # Straight port from HBOP - not default
-        def hubeny_term(ne, T):
-            A = 0.09 * jnp.exp(0.16667 * jnp.log(ne)) / jnp.sqrt(T)
-            X = jnp.exp(3.15 * jnp.log(1.0 + A))
-            BETAC = 8.3e14 * jnp.exp(-0.66667 * jnp.log(ne)) * K / n_eff**4
-            F = 0.1402 * X * BETAC**3 / (1.0 + 0.1285 * X * BETAC * jnp.sqrt(BETAC))
-            return jnp.log(F / (1.0 + F)) / (-4.0 * jnp.pi / 3.0)
+        # Straight port from HBOP - not default.
+        #
+        # ``jnp.where`` masks the *value* of the discarded branch but not its
+        # cotangent, so anything non-finite computed in here leaks a NaN into the
+        # gradient even when the guard selects 0.0.  The reachable hazards are
+        # ``log(ne)`` at ne <= 0, ``1/sqrt(T)`` at T <= 0, ``BETAC**3`` overflowing
+        # to inf for absurdly small ne (giving inf/inf == NaN), and ``log(F)`` at
+        # F == 0 when ``BETAC**3`` underflows for absurdly large ne or n_eff.
+        # Feeding the block *strictly positive* stand-ins whenever its result is
+        # discarded removes all of them at once — clamping to zero would not, since
+        # log(0) and 1/sqrt(0) are still infinite.  Where the result *is* used the
+        # stand-ins are the real arguments, so no selected value changes.
+        # This is the same fix already applied to the sibling implementation in
+        # hydrogen_line_absorption.hummer_mihalas_w.
+        hubeny_live = (ne > 10) & (T > 10)
+        ne_h = jnp.where(hubeny_live, ne, 1e14)
+        T_h = jnp.where(hubeny_live, T, 1e4)
+        n_eff_h = jnp.where(hubeny_live, n_eff, 1.0)
+        K_h = jnp.where(hubeny_live, K, 1.0)
 
-        charged_term = jnp.where(
-            (ne > 10) & (T > 10),
-            hubeny_term(ne, T),
-            0.0
-        )
+        A = 0.09 * jnp.exp(0.16667 * jnp.log(ne_h)) / jnp.sqrt(T_h)
+        X = jnp.exp(3.15 * jnp.log(1.0 + A))
+        BETAC = 8.3e14 * jnp.exp(-0.66667 * jnp.log(ne_h)) * K_h / n_eff_h**4
+        F = 0.1402 * X * BETAC**3 / (1.0 + 0.1285 * X * BETAC * jnp.sqrt(BETAC))
+        hubeny_term = jnp.log(F / (1.0 + F)) / (-4.0 * jnp.pi / 3.0)
+
+        charged_term = jnp.where(hubeny_live, hubeny_term, 0.0)
     else:
         charged_term = 16.0 * ((e**2) / (χ * jnp.sqrt(K)))**3 * ne
 
@@ -613,8 +627,18 @@ def precompute_chemical_equilibrium_data(ionization_energies, partition_funcs,
 
 
 def _interp_partition_func(log_T, Z, charge, data):
-    """Interpolate partition function value at given log(T)."""
-    return jnp.interp(log_T, data.log_T_grid, data.partition_func_values[Z, charge])
+    """Interpolate the partition function of element ``Z`` at ``log_T``.
+
+    ``Z`` is the atomic number (1-based), so the row index is ``Z - 1``; every
+    other consumer of ``partition_func_values`` uses that convention (see
+    ``precompute_chemical_equilibrium_data``, which fills
+    ``pf_values[Z-1, charge, :]``, and ``_compute_saha_weights_jit``, whose
+    outputs are documented as ``wII[Z-1]``).  This function indexed ``[Z, charge]``
+    and therefore returned the partition function of element ``Z + 1`` — U(Co I)
+    when asked for U(Fe I).  It has no callers anywhere in the package, which is
+    why nothing caught it.
+    """
+    return jnp.interp(log_T, data.log_T_grid, data.partition_func_values[Z - 1, charge])
 
 
 @jax.jit
@@ -1094,8 +1118,22 @@ def _chem_eq_log_terms(y, T, n_total, abundances, data, log_xi):
     log_n_I = y[:MAX_ATOMIC_NUMBER]
 
     wII_ne1, wIII_ne1 = _compute_saha_weights_jit(T, 1.0, data)
-    log_wII = jnp.log10(jnp.maximum(wII_ne1, 1e-320))
-    log_wIII = jnp.log10(jnp.maximum(wIII_ne1, 1e-320))
+    # Hydrogen has no doubly ionized state, so wIII[0] is exactly zero and log10 of it is
+    # -Inf with a 1/0 = Inf derivative. The 1e-320 floor this used to carry never took
+    # effect: it is subnormal, and XLA flushes subnormals to zero, so the maximum was
+    # max(0, 0). The -Inf is harmless in the forward pass (_pow10 clips it back to a
+    # 1e-300 density) but its derivative met a zero tangent, and 0 x Inf is NaN --- which
+    # is why forward mode through the solver returned NaN in row 0 (hydrogen's nucleus
+    # balance) and row 92 (charge balance), the only two rows n_III[0] enters.
+    # The inner `where` keeps a strictly positive value out of log10 so no infinite
+    # derivative is formed at all; the outer one restores the -Inf, so the primal is
+    # bitwise what it was.
+    def _safe_log10(w):
+        positive = w > 0.0
+        return jnp.where(positive, jnp.log10(jnp.where(positive, w, 1.0)), -jnp.inf)
+
+    log_wII = _safe_log10(wII_ne1)
+    log_wIII = _safe_log10(wIII_ne1)
 
     n_I = _pow10(log_n_I)
     n_II = _pow10(log_n_I + log_wII - log_ne)
@@ -1108,10 +1146,17 @@ def _chem_eq_log_terms(y, T, n_total, abundances, data, log_xi):
     is_charged = (data.mol_charges != 0).astype(jnp.float64)
     first_atom = jnp.maximum(data.mol_atoms_array[:, 0], 0)
 
-    log_n_mol = (C @ log_n_I - log_nK + log_xi
+    log_nK_finite = jnp.isfinite(log_nK)
+    # Substitute a finite exponent *before* _pow10 for the molecules we are about to
+    # discard.  _pow10 clips its argument, but jnp.clip propagates NaN, so 10**NaN is
+    # NaN and the outer jnp.where would mask that value while still pushing a NaN
+    # cotangent back through the selected branch.  0.0 is a safe exponent here (it is
+    # an *exponent*, not a density: 10**0 == 1), so no log/sqrt singularity is created.
+    log_nK_safe = jnp.where(log_nK_finite, log_nK, 0.0)
+    log_n_mol = (C @ log_n_I - log_nK_safe + log_xi
                  + is_charged * (log_wII[first_atom] - log_ne))
     # Molecules whose equilibrium constant is undefined at this T contribute nothing.
-    n_mol = jnp.where(jnp.isfinite(log_nK), _pow10(log_n_mol), 0.0)
+    n_mol = jnp.where(log_nK_finite, _pow10(log_n_mol), 0.0)
 
     n_Hminus = _pow10(jnp.log10(Hminus_nK(T)) + log_n_I[0] + log_ne + log_xi)
 

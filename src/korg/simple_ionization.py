@@ -42,10 +42,12 @@ def compute_ionization_states(
     total_number_densities : array, shape (n_layers,)
         Total particle number density at each layer in cm⁻³
     abundances_A_X : array, shape (n_elements,)
-        Elemental abundances in A(X) = log10(N_X/N_H) + 12 format
-        Index 0 is empty, index 1 is H, index 2 is He, etc.
+        Elemental abundances in A(X) = log10(N_X/N_H) + 12 format, indexed by
+        Z - 1 (index 0 is H, index 1 is He, ...), i.e. exactly what
+        :func:`korg.abundances.format_A_X` returns.
     atomic_symbols : list
-        List of atomic symbols (e.g., ['', 'H', 'He', 'Li', ...])
+        List of atomic symbols indexed by Z - 1, i.e.
+        ``korg.atomic_data.atomic_symbols`` (``['H', 'He', 'Li', ...]``).
     ionization_energies : dict
         Dictionary mapping atomic number to [χ_I, χ_II, χ_III] in eV
     partition_functions : dict
@@ -93,13 +95,14 @@ def compute_ionization_states(
 
     number_densities = {}
 
-    # Process each element
+    # Process each element. ``atomic_symbols`` and ``abundances_A_X`` are both
+    # indexed by Z - 1, so the atomic number is i + 1.
     for i, symbol in enumerate(atomic_symbols):
-        if i == 0 or i >= len(abundances_fractional):
-            # Skip index 0 (empty) and indices beyond abundance array
+        if i >= len(abundances_fractional):
+            # Skip indices beyond the supplied abundance array
             continue
 
-        atom_number = i  # Atomic number (1=H, 2=He, etc.)
+        atom_number = i + 1  # Atomic number (1=H, 2=He, etc.)
 
         # Total elemental abundance at each layer
         n_element_total = total_number_densities * abundances_fractional[i]

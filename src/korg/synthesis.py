@@ -23,12 +23,13 @@ from .statmech import (chemical_equilibrium_fast, chemical_equilibrium_all_layer
 from .data_loader import (ionization_energies, default_partition_funcs,
                           default_log_equilibrium_constants,
                           default_chem_eq_data, default_mol_species)
-from .continuum import (prepare_continuum_batch, prepare_continuum_batch_fast, batch_continuum_absorption,
+from .continuum import (prepare_continuum_batch_fast, batch_continuum_absorption,
                         Hminus_bf, Hminus_ff)
 from .constants import (electron_mass_cgs, electron_charge_cgs, c_cgs,
                         kboltz_eV, hplanck_eV, hplanck_cgs, kboltz_cgs,
                         bohr_radius_cgs)
-from .radiative_transfer import radiative_transfer, radiative_transfer_jit
+from .radiative_transfer import (radiative_transfer, radiative_transfer_jit,
+                                 radiative_transfer_spherical)
 from .linelist import Line
 from .species import Species
 from .line_absorption import line_absorption, _vdW_to_tuple, _voigt_profile_jax
@@ -277,22 +278,41 @@ def get_reference_wavelength_linelist(linelist: List[Line],
     buffer_cm = 21e-8  # 21 Å in cm
     filtered = filter_linelist(linelist, window_cm, buffer_cm, warn_empty=False)
 
-    if reference_wavelength_cm != 5e-5 and len(filtered) == 0:
-        raise ValueError(
-            f"The provided linelist contains no lines near the reference wavelength "
-            f"{reference_wavelength_cm * 1e8:.1f} Å. Korg has a built-in fallback "
-            f"only for 5000 Å (the MARCS default)."
-        )
-
-    if len(filtered) > 0 and filtered[0].wl <= reference_wavelength_cm <= filtered[-1].wl:
+    if reference_wavelength_cm != 5e-5:
+        if len(filtered) == 0:
+            raise ValueError(
+                f"The provided linelist contains no lines near the reference wavelength "
+                f"{reference_wavelength_cm * 1e8:.1f} Å. Korg has a built-in fallback "
+                f"only for 5000 Å (the MARCS default)."
+            )
+        # Korg.jl evaluates `filtered_linelist` here without returning it, so it
+        # falls through into the 5000 Å merge below even for a non-5000 Å
+        # reference.  That is an upstream slip (merging a 5000 Å fallback list
+        # into a, say, 8000 Å reference is meaningless), so it is not
+        # replicated: the user's lines are returned as-is.
         return filtered
 
-    # Filter lines below the reference wavelength that aren't already covered
-    if len(filtered) > 0 and filtered[0].wl > reference_wavelength_cm:
-        return filtered
-    if len(filtered) > 0 and filtered[-1].wl < reference_wavelength_cm:
-        return filtered
+    # 5000 Å reference with the internal list disabled.  Korg.jl still uses the
+    # built-in list to fill in wherever the user's lines do not reach across
+    # 5000 Å, so that alpha_5000 is never computed from a one-sided linelist.
+    def _default_5000_linelist():
+        from .data_loader import load_default_linelist
+        try:
+            return load_default_linelist(5e-5)
+        except Exception:
+            return []
 
+    if len(filtered) == 0:
+        return _default_5000_linelist()
+    if filtered[0].wl > 5e-5:
+        # user lines all sit redward of 5000 Å: prepend the built-in lines below them
+        return [l for l in _default_5000_linelist()
+                if l.wl < filtered[0].wl] + list(filtered)
+    if filtered[-1].wl < 5e-5:
+        # user lines all sit blueward of 5000 Å: append the built-in lines above them
+        return list(filtered) + [l for l in _default_5000_linelist()
+                                 if l.wl > filtered[-1].wl]
+    # the user's lines span 5000 Å: they are sufficient on their own
     return filtered
 
 
@@ -308,6 +328,7 @@ def synthesize_spectrum(
     hydrogen_line_window_size: float = 150.0,
     line_cutoff_threshold: float = 3e-4,
     return_continuum: bool = True,
+    mu_values: int = 20,
     partition_funcs: Optional[Dict] = None,
     ionization_energies_dict: Optional[Dict] = None,
     log_equilibrium_constants: Optional[Dict] = None,
@@ -351,6 +372,12 @@ def synthesize_spectrum(
         Line cutoff as fraction of continuum (default: 3e-4)
     return_continuum : bool, optional
         Whether to compute continuum spectrum (default: True)
+    mu_values : int, optional
+        Number of Gauss-Legendre μ quadrature points used for the surface flux
+        integral in *spherical* geometry (default: 20, matching Korg.jl's
+        ``mu_values``).  Ignored for plane-parallel atmospheres, where the
+        anchored/``linear_flux_only`` combination uses the exponential-integral
+        shortcut and needs no μ grid — exactly as in Korg.jl.
     partition_funcs : dict, optional
         Partition functions (default: use built-in)
     ionization_energies_dict : dict, optional
@@ -378,6 +405,40 @@ def synthesize_spectrum(
     timings = {} if profile else None
     t_start = time.time() if profile else None
 
+    # ── Input validation (ports the argument checks in Korg.jl's synthesize) ──
+    wavelengths_angstrom = np.asarray(wavelengths_angstrom, dtype=np.float64)
+    if wavelengths_angstrom.ndim != 1 or wavelengths_angstrom.size == 0:
+        raise ValueError(
+            "wavelengths_angstrom must be a non-empty 1-D array, got shape "
+            f"{wavelengths_angstrom.shape}"
+        )
+    # Korg.jl: the Rayleigh scattering cross-sections are not valid below 1300 Å.
+    if wavelengths_angstrom[0] < 1300.0:
+        raise ValueError(
+            f"Requested wavelength range starts at {wavelengths_angstrom[0]:.1f} Å, "
+            "blueward of 1300 Å, the lowest allowed wavelength (a limitation of the "
+            "Rayleigh scattering calculation)."
+        )
+
+    abundances = np.asarray(abundances, dtype=np.float64)
+    if abundances.ndim != 1 or abundances.shape[0] != 92:
+        raise ValueError(
+            "abundances must be a 92-element 1-D array (one entry per element "
+            f"H..U), got shape {abundances.shape}"
+        )
+    # Korg.jl: "A(H) must be a 92-element vector with A[1] == 12."  Absolute
+    # number fractions (which sum to 1) are also accepted here and are
+    # distinguished by A(H) <= 1.
+    if abundances[0] > 1.0 and abundances[0] != 12.0:
+        raise ValueError(
+            "abundances look like A(X) = log10(N_X/N_H) + 12 but A(H) is "
+            f"{abundances[0]}, not 12.0. Pass either a 92-element A(X) vector "
+            "with A(H) == 12, or absolute number fractions summing to 1."
+        )
+
+    if len(atmosphere) == 0:
+        raise ValueError("atmosphere has no layers")
+
     using_defaults = (partition_funcs is None and ionization_energies_dict is None
                       and log_equilibrium_constants is None)
     if partition_funcs is None:
@@ -404,11 +465,46 @@ def synthesize_spectrum(
     log_tau_ref = atmosphere.log_tau_ref
 
     if isinstance(atmosphere, ShellAtmosphere):
+        # Korg.jl: radii = [atm.R + l.z for l in atm.layers]
         spatial_coord = atmosphere.r
         spherical = True
+        R_photosphere = atmosphere.R_photosphere
     else:
         spatial_coord = atmosphere.z
         spherical = False
+        R_photosphere = None
+
+    def _solve_rt(alpha_layers_wl):
+        """
+        Emergent flux for an (n_layers, n_wl) opacity grid.
+
+        Mirrors Korg.jl's dispatch in ``RadiativeTransfer.radiative_transfer``:
+        plane-parallel + anchored τ + ``linear_flux_only`` takes the
+        exponential-integral shortcut; a shell atmosphere goes through the ray
+        solver and has its flux rescaled from the outermost radius to the
+        photospheric radius by ``(r[1]/R)²``.
+        """
+        if spherical:
+            flux, _ = radiative_transfer_spherical(
+                alpha_layers_wl.T, source_function, spatial_coord, log_tau_ref,
+                alpha_ref, n_mu=mu_values,
+                tau_scheme="anchored", intensity_scheme="linear_flux_only",
+                R_photosphere=R_photosphere,
+            )
+            return flux
+        if using_defaults:
+            flux, _ = radiative_transfer_jit(
+                jnp.asarray(alpha_layers_wl.T), jnp.asarray(source_function),
+                jnp.asarray(spatial_coord), jnp.asarray(log_tau_ref),
+                jnp.asarray(alpha_ref)
+            )
+            return flux
+        flux, _ = radiative_transfer(
+            alpha_layers_wl.T, source_function, spatial_coord, log_tau_ref,
+            alpha_ref=alpha_ref, spherical=False,
+            intensity_scheme="linear_flux_only", use_expint_flux=True
+        )
+        return flux
 
     # Sort linelist by wavelength if needed
     if linelist and not all(linelist[i].wl <= linelist[i+1].wl
@@ -497,6 +593,13 @@ def synthesize_spectrum(
     # Pass 2: continuum absorption — batch all layers at once
     if profile:
         t0 = time.time()
+    # alpha_ref is the continuum opacity *at* the reference wavelength.  Korg.jl
+    # evaluates it directly there:
+    #   α_ref[i] = total_continuum_absorption([c/λ_ref], layer.temp, nₑ, ...)
+    # It must NOT be obtained by extrapolating the synthesis window's coarse
+    # continuum grid: for any window that does not contain 5000 Å, a linear
+    # extrapolation over tens or hundreds of Å drives the opacity negative,
+    # which makes the anchored optical depth negative and the flux NaN.
     if using_defaults:
         # Fast path: vmapped JIT continuum over all layers
         cntm_frequencies = c_cgs / cntm_wavelengths_cm
@@ -507,12 +610,17 @@ def synthesize_spectrum(
             jnp.asarray(electron_densities, dtype=np.float64),
             batch
         ))
+        alpha_ref[:] = np.array(batch_continuum_absorption(
+            jnp.asarray(np.array([c_cgs / lambda_ref_cm])),
+            jnp.asarray(T, dtype=np.float64),
+            jnp.asarray(electron_densities, dtype=np.float64),
+            batch
+        ))[:, 0]
         for i in range(n_layers):
             alpha_cntm_interp = interp1d(cntm_wavelengths_cm, alpha_cntm_all[i],
                                           kind='linear', fill_value='extrapolate')
             alpha_cntm_interps.append(alpha_cntm_interp)
             alpha[i, :] = alpha_cntm_interp(wavelengths_cm)
-            alpha_ref[i] = alpha_cntm_interp(lambda_ref_cm)
     else:
         for i in range(n_layers):
             alpha_cntm_coarse = compute_continuum_absorption(
@@ -523,7 +631,10 @@ def synthesize_spectrum(
                                           kind='linear', fill_value='extrapolate')
             alpha_cntm_interps.append(alpha_cntm_interp)
             alpha[i, :] = alpha_cntm_interp(wavelengths_cm)
-            alpha_ref[i] = alpha_cntm_interp(lambda_ref_cm)
+            alpha_ref[i] = compute_continuum_absorption(
+                np.array([lambda_ref_cm]), T[i], electron_densities[i],
+                number_densities_list[i], partition_funcs
+            )[0]
     if profile:
         t_cntm_abs = time.time() - t0
 
@@ -560,9 +671,15 @@ def synthesize_spectrum(
     # for the total opacity that determines the MARCS depth scale.
     ref_ll_for_ref = get_reference_wavelength_linelist(linelist, lambda_ref_cm)
     if ref_ll_for_ref:
+        # Korg.jl: `α_cntm_ref = [_ -> a for a in copy(α_ref)]`, i.e. a constant
+        # function per layer returning the continuum opacity already computed at
+        # the reference wavelength.  Re-interpolating the synthesis window's grid
+        # here would reintroduce the extrapolation problem fixed above.
+        _alpha_ref_cntm = alpha_ref.copy()
+
         def _cntm_at_ref_wl(wl_cm):
-            wl_arr = np.atleast_1d(wl_cm)
-            result = np.stack([alpha_cntm_interps[i](wl_arr) for i in range(n_layers)], axis=-1)
+            n_out = np.size(wl_cm)
+            result = np.repeat(_alpha_ref_cntm[None, :], n_out, axis=0)  # (n_wl, n_layers)
             return result if np.ndim(wl_cm) > 0 else result[0]
         line_at_ref = line_absorption(
             ref_ll_for_ref, np.array([lambda_ref_cm]),
@@ -604,13 +721,14 @@ def synthesize_spectrum(
                 <= wl_max_cm + h_line_window_cm)
         }
 
-        # Batch-precompute occupation probabilities for all layers (much faster than per-layer)
-        if raw_arrays_list:
-            nH_I_arr = np.array([ra['neutral_dens'][0] for ra in raw_arrays_list])
-            nHe_I_arr = np.array([ra['neutral_dens'][1] for ra in raw_arrays_list])
-        else:
-            nH_I_arr = np.array([nd.get(Species("H_I"), 0.0) for nd in number_densities_list])
-            nHe_I_arr = np.array([nd.get(Species("He_I"), 0.0) for nd in number_densities_list])
+        # Batch-precompute occupation probabilities for all layers (much faster
+        # than per-layer).  chemical_equilibrium_all_layers always returns one
+        # raw-array dict per layer, and an atmosphere with zero layers is
+        # rejected above, so this list is never empty.  (The dead `else` branch
+        # that used to stand here read `number_densities_list`, which is None on
+        # the default-data path, so it would have raised had it ever run.)
+        nH_I_arr = np.array([ra['neutral_dens'][0] for ra in raw_arrays_list])
+        nHe_I_arr = np.array([ra['neutral_dens'][1] for ra in raw_arrays_list])
         ws_all = precompute_hummer_ws(T, nH_I_arr, nHe_I_arr, electron_densities)
 
         pf_H_I = partition_funcs[Species("H_I")]
@@ -638,11 +756,15 @@ def synthesize_spectrum(
             for m in range(5, 31)
         )
         if brackett_in_range:
+            # Korg.jl: use_MHD_for_hydrogen_lines defaults to wls[end] < 13,000 Å.
+            # The MHD occupation-probability formalism is not applied to the
+            # infrared series, which is exactly the regime this branch covers.
+            use_MHD = wl_max_cm < 13_000e-8
             for i in range(n_layers):
                 alpha_H = hydrogen_line_absorption(
                     wavelengths_cm, T[i], electron_densities[i], nH_I_arr[i], nHe_I_arr[i],
                     float(U_H_I_arr[i]), vmic_cm_s,
-                    h_line_window_cm, use_MHD=True, ws=ws_all[i],
+                    h_line_window_cm, use_MHD=use_MHD, ws=ws_all[i],
                     stark_profiles={}   # Stark already handled above
                 )
                 alpha[i, :] += alpha_H
@@ -689,18 +811,7 @@ def synthesize_spectrum(
             print(f"Computing continuum spectrum...")
         if profile:
             t_cntm_rt = time.time()
-        if using_defaults and not spherical:
-            flux_cntm, _ = radiative_transfer_jit(
-                jnp.asarray(alpha_cntm_only.T), jnp.asarray(source_function),
-                jnp.asarray(spatial_coord), jnp.asarray(log_tau_ref),
-                jnp.asarray(alpha_ref)
-            )
-        else:
-            flux_cntm, _ = radiative_transfer(
-                alpha_cntm_only.T, source_function, spatial_coord, log_tau_ref,
-                alpha_ref=alpha_ref, spherical=spherical,
-                intensity_scheme="linear_flux_only", use_expint_flux=True
-            )
+        flux_cntm = _solve_rt(alpha_cntm_only)
         continuum_flux = flux_cntm * 1e-8
         if profile:
             timings['continuum_rt'] = time.time() - t_cntm_rt
@@ -711,18 +822,7 @@ def synthesize_spectrum(
     if profile:
         t_rt_start = time.time()
 
-    if using_defaults and not spherical:
-        flux_nu, _ = radiative_transfer_jit(
-            jnp.asarray(alpha.T), jnp.asarray(source_function),
-            jnp.asarray(spatial_coord), jnp.asarray(log_tau_ref),
-            jnp.asarray(alpha_ref)
-        )
-    else:
-        flux_nu, _ = radiative_transfer(
-            alpha.T, source_function, spatial_coord, log_tau_ref,
-            alpha_ref=alpha_ref, spherical=spherical,
-            intensity_scheme="linear_flux_only", use_expint_flux=True
-        )
+    flux_nu = _solve_rt(alpha)
 
     # Convert from erg/s/cm^5 (per cm wavelength) to erg/s/cm^4/Å (per Angstrom)
     # Since we use B_λ (wavelength-based Planck), we just multiply by 1e-8
@@ -809,6 +909,7 @@ def synthesize(
     hydrogen_line_window_size: float = 150.0,
     line_cutoff_threshold: float = 3e-4,
     return_cntm: bool = True,
+    mu_values: int = 20,
     verbose: bool = True,
     profile: bool = False,
     **kwargs
@@ -842,6 +943,9 @@ def synthesize(
         Line cutoff as fraction of continuum (default: 3e-4)
     return_cntm : bool, optional
         Whether to compute continuum spectrum (default: True)
+    mu_values : int, optional
+        Number of μ quadrature points for the spherical surface-flux integral
+        (default: 20, matching Korg.jl).  Unused for planar atmospheres.
     verbose : bool, optional
         Print progress messages (default: True)
     profile : bool, optional
@@ -906,6 +1010,7 @@ def synthesize(
         hydrogen_line_window_size=hydrogen_line_window_size,
         line_cutoff_threshold=line_cutoff_threshold,
         return_continuum=return_cntm,
+        mu_values=mu_values,
         verbose=verbose,
         profile=profile,
         **kwargs
@@ -1172,9 +1277,12 @@ def precompute_synthesis_data(
         T_min=T_min, T_max=T_max, n_temps=n_temps
     )
 
-    # Load Gaunt factor table for free-free absorption
-    from .continuum_absorption.hydrogenic_bf_ff import _load_gauntff_table
+    # Load Gaunt factor table for free-free absorption.  The import belongs
+    # inside the try: the fallback below exists precisely for the case where
+    # the tabulated data cannot be obtained, and an ImportError is one way for
+    # that to happen.
     try:
+        from .continuum_absorption.hydrogenic_bf_ff import _load_gauntff_table
         gaunt_table, log_gamma2_grid, log_u_grid = _load_gauntff_table()
         gaunt_table = jnp.array(gaunt_table)
         gaunt_log_u_grid = jnp.array(log_u_grid)
@@ -1369,9 +1477,17 @@ def precompute_atmosphere(
         lambda row: jnp.interp(wavelengths_cm, cntm_wl_jnp, row)
     )(alpha_cntm_coarse)  # (n_layers, n_wl)
 
-    alpha_ref_all = jax.vmap(
-        lambda row: jnp.interp(jnp.array([lambda_ref_cm]), cntm_wl_jnp, row)[0]
-    )(alpha_cntm_coarse)  # (n_layers,)
+    # Continuum opacity *at* the reference wavelength.  Korg.jl evaluates it
+    # directly there rather than reading it off the synthesis window's coarse
+    # grid; `jnp.interp` clamps outside the grid, so for any window that does
+    # not contain 5000 Å the old expression returned the continuum at the edge
+    # of the window instead, silently rescaling the whole optical-depth scale.
+    alpha_ref_all = _batch_continuum_vmap(
+        jnp.array([c_cgs_float / lambda_ref_cm]), T_layers, ne_all,
+        U_H_I_all, U_He_I_all, nH_I_all, nH_II_all, nHe_I_all, nH2_all,
+        n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
+        data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
+    )[:, 0]  # (n_layers,)
 
     # Add line absorption at reference wavelength
     from .data_loader import load_default_linelist as _load_ref_ll
@@ -1389,10 +1505,12 @@ def precompute_atmosphere(
         _mol_np = np.asarray(mol_dens)
         for _i, _mol_sp in enumerate(default_mol_species):
             _nd_ref[_mol_sp] = _mol_np[:, _i]
-        _cntm_coarse_np = np.asarray(alpha_cntm_coarse)
+        # Korg.jl passes a constant-per-layer continuum here: the alpha_ref just
+        # computed.  See the note above about interpolating off-grid.
+        _alpha_ref_cntm_np = np.asarray(alpha_ref_all)
         def _cntm_at_ref_fn(wl_cm):
-            wl_arr = np.atleast_1d(wl_cm)
-            result = np.stack([np.interp(wl_arr, cntm_wl_np_cached, _cntm_coarse_np[i]) for i in range(n_layers)], axis=-1)
+            n_out = np.size(wl_cm)
+            result = np.repeat(_alpha_ref_cntm_np[None, :], n_out, axis=0)
             return result if np.ndim(wl_cm) > 0 else result[0]
         _line_at_ref = line_absorption(
             _ref_ll, np.array([lambda_ref_cm]),
@@ -2022,9 +2140,18 @@ def _hminus_bf_jit(nu, T, nH_I_div_U, ne):
     a = jnp.array([1.99654, -1.18267e-1, 2.64243e-2,
                    -4.40524e-3, 3.23992e-4, -1.39568e-5, 2.78701e-7])
 
-    x = wavelength_um
+    in_range = (wavelength_um > 0.125) & (wavelength_um < 1.6419)
+    # (x - 0.125)**1.5 is complex for x < 0.125 and its derivative is infinite
+    # at x == 0.125.  jnp.where selects the 0.0 branch, but it does not stop the
+    # *unselected* branch from being evaluated: below 0.125 um the whole
+    # expression came back complex (so the function returned a complex zero),
+    # and jax.grad returned NaN.  Substituting a wavelength strictly inside the
+    # fit's validity range makes the unselected branch real and smooth.  0.5 um
+    # is used rather than clamping to 0.125, because (x - 0.125)**1.5 has an
+    # infinite derivative exactly at the endpoint.
+    x = jnp.where(in_range, wavelength_um, 0.5)
     sigma = jnp.where(
-        (wavelength_um > 0.125) & (wavelength_um < 1.6419),
+        in_range,
         1e-18 * (a[0] + a[1]*x + a[2]*x**2 + a[3]*x**3 +
                  a[4]*x**4 + a[5]*x**5 + a[6]*x**6) * (x - 0.125)**1.5 / x**3,
         0.0
@@ -2146,6 +2273,20 @@ def _continuum_absorption_jit(wavelength_cm, T, ne, nH_I, nH_II, nHe_I, nH2, U_H
     return alpha_rayleigh + alpha_electron + alpha_H_ff + alpha_Hminus_bf + alpha_Hminus_ff
 
 
+def _dawson_ratio(v):
+    """
+    ``(1 - exp(-v²)) / v``, finite in value *and* gradient at ``v == 0``.
+
+    The limit is 0, and the derivative there is 0 as well.  Evaluating the
+    ratio at a substituted non-zero ``v`` keeps the unselected branch of the
+    surrounding ``jnp.where`` free of the 0/0 that otherwise poisons the
+    reverse-mode cotangent.
+    """
+    tiny = jnp.abs(v) < 1e-6
+    v_safe = jnp.where(tiny, 1.0, v)      # strictly non-zero substitute
+    return jnp.where(tiny, 1.0, (1 - jnp.exp(-v_safe**2)) / v_safe)
+
+
 def _voigt_jit(a, v):
     """
     Voigt-Hjerting function H(a, v) (JIT-compatible approximation).
@@ -2169,9 +2310,14 @@ def _voigt_jit(a, v):
             # Medium |z|
             a / jnp.pi * (1 / (v**2 + a**2) +
                          1.5 / (v**2 + a**2 + 1.5)),
-            # Small |z|: more accurate approximation
+            # Small |z|: more accurate approximation.
+            # (1 - exp(-v^2))/v is 0/0 at v == 0.  jnp.where picks the 1.0
+            # branch there, but the unselected branch is still differentiated
+            # and its NaN cotangent survives the multiply-by-zero, so dH/dv was
+            # NaN at exactly v == 0.  Feeding the ratio a strictly non-zero v
+            # removes the singularity without touching any selected value.
             jnp.exp(-v**2) * (1 - a * 2 / jnp.sqrt(jnp.pi) *
-                              jnp.where(jnp.abs(v) < 1e-6, 1.0, (1 - jnp.exp(-v**2)) / v))
+                              _dawson_ratio(v))
         )
     )
 
@@ -2694,10 +2840,16 @@ def synthesize_jit(
             lambda row: jnp.interp(wavelengths_cm, cntm_wl_jnp, row)
         )(alpha_cntm_coarse)  # (n_layers, n_wl)
 
-        # Reference opacity at lambda_ref from coarse grid (matches synthesize's alpha_cntm_interp(lambda_ref))
-        alpha_ref_all = jax.vmap(
-            lambda row: jnp.interp(jnp.array([lambda_ref_cm]), cntm_wl_jnp, row)[0]
-        )(alpha_cntm_coarse)  # (n_layers,)
+        # Reference opacity: evaluate the continuum *at* lambda_ref, as Korg.jl
+        # does.  Reading it off the synthesis window's coarse grid returns the
+        # clamped edge value whenever the window excludes 5000 Å, which
+        # rescales the entire anchored optical-depth scale.
+        alpha_ref_all = _batch_continuum_vmap(
+            jnp.array([c_cgs_float / lambda_ref_cm]), T_layers, ne_all,
+            U_H_I_all, U_He_I_all, nH_I_all, nH_II_all, nHe_I_all, nH2_all,
+            n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
+            data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
+        )[:, 0]  # (n_layers,)
 
         # Add line absorption at reference wavelength to alpha_ref_all (matching Julia).
         # Julia's alpha_ref = continuum + lines at 5000 Å.
@@ -2718,10 +2870,11 @@ def synthesize_jit(
             _mol_np = np.asarray(mol_dens)
             for _i, _mol_sp in enumerate(default_mol_species):
                 _nd_ref[_mol_sp] = _mol_np[:, _i]
-            _cntm_coarse_np = np.asarray(alpha_cntm_coarse)
+            # Korg.jl: a constant per-layer continuum equal to alpha_ref.
+            _alpha_ref_cntm_np = np.asarray(alpha_ref_all)
             def _cntm_at_ref_jit_fn(wl_cm):
-                wl_arr = np.atleast_1d(wl_cm)
-                result = np.stack([np.interp(wl_arr, cntm_wl_np_cached, _cntm_coarse_np[i]) for i in range(n_layers)], axis=-1)
+                n_out = np.size(wl_cm)
+                result = np.repeat(_alpha_ref_cntm_np[None, :], n_out, axis=0)
                 return result if np.ndim(wl_cm) > 0 else result[0]
             _line_at_ref = line_absorption(
                 _ref_ll, np.array([lambda_ref_cm]),
