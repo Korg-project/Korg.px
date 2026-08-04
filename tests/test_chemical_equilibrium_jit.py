@@ -154,22 +154,48 @@ class TestBatchedSolution:
         assert np.all(np.diff(fraction) > 0), f"ne/n_total not monotonic: {fraction}"
 
 
+class _LayerSolver:
+    """The single-layer solve and its two gradients, compiled once for the class.
+
+    Everything that varies between cases -- T, the total density, the Picard initial
+    guess -- is an *argument* rather than a value closed over. That matters for the
+    clock: a fresh closure carrying fresh constants hashes to a fresh HLO module, so
+    building one lambda per case made every case pay the full reverse-mode compile of
+    the Newton solver (~80 s each, four times over). As arguments they are one
+    executable that all the cases share.
+    """
+
+    def __init__(self, abundances, data):
+        from korg.statmech import (_chem_eq_newton_layer_jit,
+                                   _picard_chemical_equilibrium_guess_batch)
+
+        self._guess_batch = _picard_chemical_equilibrium_guess_batch
+        self._abundances = abundances
+        self._data = data
+
+        def solve(T, n_total, ne_init, nf_init):
+            return _chem_eq_newton_layer_jit(T, n_total, ne_init, nf_init,
+                                             abundances, data)[0]
+
+        self.ne = jax.jit(solve)
+        self.d_ne_dT = jax.jit(jax.grad(solve, argnums=0))
+        self.d_ne_dn = jax.jit(jax.grad(solve, argnums=1))
+
+    def guess(self, T0, n_total, ne_model):
+        """The Picard starting point for one layer, as ``(ne_init, nf_init)``."""
+        ne_init, nf_init = self._guess_batch(
+            jnp.array([T0]), jnp.array([n_total]), jnp.array([ne_model]),
+            self._abundances, self._data,
+        )
+        return ne_init[0], nf_init[0]
+
+
 class TestJitAndDifferentiability:
     """Jittability and reverse-mode gradients are requirements, not nice-to-haves."""
 
     @pytest.fixture(scope="class")
     def layer_solver(self, setup):
-        from korg.statmech import _chem_eq_newton_layer_jit, _picard_chemical_equilibrium_guess_batch
-
-        def make(T0, n_total, ne_model):
-            ne_init, nf_init = _picard_chemical_equilibrium_guess_batch(
-                jnp.array([T0]), jnp.array([n_total]), jnp.array([ne_model]),
-                setup["abundances"], setup["data"]
-            )
-            return lambda T: _chem_eq_newton_layer_jit(
-                T, n_total, ne_init[0], nf_init[0], setup["abundances"], setup["data"]
-            )[0]
-        return make
+        return _LayerSolver(setup["abundances"], setup["data"])
 
     @pytest.mark.parametrize("T0,n_total,ne_model", [
         (5778.0, 1e17, 1e14),
@@ -178,29 +204,33 @@ class TestJitAndDifferentiability:
     ])
     def test_reverse_mode_grad_matches_finite_difference(self, layer_solver,
                                                          T0, n_total, ne_model):
-        f = layer_solver(T0, n_total, ne_model)
-        grad = float(jax.grad(f)(jnp.float64(T0)))
-        fd = (float(f(T0 * 1.00005)) - float(f(T0 * 0.99995))) / (0.0001 * T0)
+        ne_init, nf_init = layer_solver.guess(T0, n_total, ne_model)
+        # jnp.float64 throughout: a Python float is weakly typed and would trace a
+        # second time, which is the recompile this class exists to avoid.
+        rest = (jnp.float64(n_total), ne_init, nf_init)
+
+        grad = float(layer_solver.d_ne_dT(jnp.float64(T0), *rest))
+        fd = (float(layer_solver.ne(jnp.float64(T0 * 1.00005), *rest))
+              - float(layer_solver.ne(jnp.float64(T0 * 0.99995), *rest))) / (0.0001 * T0)
         assert np.isfinite(grad), "d(ne)/dT is not finite"
         assert np.isclose(grad, fd, rtol=1e-5), f"grad {grad:.6e} vs finite diff {fd:.6e}"
 
     def test_jit_compiles(self, layer_solver):
-        f = layer_solver(5778.0, 1e17, 1e14)
-        assert np.isfinite(float(jax.jit(f)(jnp.float64(5778.0))))
+        ne_init, nf_init = layer_solver.guess(5778.0, 1e17, 1e14)
+        ne = layer_solver.ne(jnp.float64(5778.0), jnp.float64(1e17), ne_init, nf_init)
+        assert np.isfinite(float(ne))
 
-    def test_grad_wrt_total_density(self, setup, layer_solver):
-        from korg.statmech import _chem_eq_newton_layer_jit, _picard_chemical_equilibrium_guess_batch
-
+    def test_grad_wrt_total_density(self, layer_solver):
         T0, n_total, ne_model = 5778.0, 1e17, 1e14
-        ne_init, nf_init = _picard_chemical_equilibrium_guess_batch(
-            jnp.array([T0]), jnp.array([n_total]), jnp.array([ne_model]),
-            setup["abundances"], setup["data"]
-        )
-        g = lambda n: _chem_eq_newton_layer_jit(
-            T0, n, ne_init[0], nf_init[0], setup["abundances"], setup["data"]
-        )[0]
-        grad = float(jax.grad(g)(jnp.float64(n_total)))
-        fd = (float(g(n_total * 1.00005)) - float(g(n_total * 0.99995))) / (0.0001 * n_total)
+        ne_init, nf_init = layer_solver.guess(T0, n_total, ne_model)
+
+        def ne_at(n):
+            return float(layer_solver.ne(jnp.float64(T0), jnp.float64(n),
+                                         ne_init, nf_init))
+
+        grad = float(layer_solver.d_ne_dn(jnp.float64(T0), jnp.float64(n_total),
+                                          ne_init, nf_init))
+        fd = (ne_at(n_total * 1.00005) - ne_at(n_total * 0.99995)) / (0.0001 * n_total)
         assert np.isclose(grad, fd, rtol=1e-5)
 
     def test_saha_weights_grad_is_finite(self, setup):

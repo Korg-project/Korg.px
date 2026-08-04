@@ -32,18 +32,17 @@ from korg.fit import (
 )
 from korg.linelist import create_line
 from tests.fit_test_support import (
+    FakeMarcs, FakeSynthesizer, gaussian_spectrum, patch_synthesis,
+)
 
 # Fitting is out of scope for now, so this module is skipped rather than deleted.
-# Remove this block to bring it back; nothing else about the file has changed.
+# Remove this line to bring it back; nothing else about the file has changed.
 #
 # Why it is off: the `synthesize_spectrum` removal changed `synthesize` from a
 # SynthesisResult to a (flux, continuum) tuple, and these modules mock or consume
 # the old shape. Left enabled they report failures that are about the migration
 # rather than about fitting.
 pytestmark = pytest.mark.skip(reason="fitting is out of scope for now")
-
-    FakeMarcs, FakeSynthesizer, gaussian_spectrum, patch_synthesis,
-)
 
 
 # ---------------------------------------------------------------------------

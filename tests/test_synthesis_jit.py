@@ -4,6 +4,8 @@ Tests for JIT-compatible spectral synthesis.
 Tests synthesize_jit function with both continuum-only and line synthesis.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import numpy as np
 import jax
@@ -29,12 +31,24 @@ from korg.abundances import format_A_X
 class TestSynthesisJIT:
     """Test JIT-compatible synthesis."""
 
-    @pytest.fixture
+    @pytest.fixture(scope="class")
     def solar_atmosphere(self):
-        """Create a solar test atmosphere."""
-        return create_solar_test_atmosphere()
+        """An 8-layer sub-sample of the 56-layer solar test atmosphere.
 
-    @pytest.fixture
+        Every assertion in this class is about shape, finiteness, positivity or the
+        sign of an effect, none of which needs the full stratification. Layers are
+        the expensive axis twice over: the synthesis costs ~0.12 s per layer, and a
+        layer count not already compiled costs a fresh ~70 s build of the
+        chemical-equilibrium kernel. 8 is what ``test_synthesis_functional`` uses,
+        so the two files share one compilation.
+        """
+        atm = create_solar_test_atmosphere()
+        return SimpleNamespace(
+            T=atm.T[::7], n_total=atm.n_total[::7], ne=atm.ne[::7],
+            z=atm.z[::7], log_tau_ref=atm.log_tau_ref[::7],
+        )
+
+    @pytest.fixture(scope="class")
     def solar_abundances(self):
         """Solar abundances (N_X/N_total)."""
         A_X = format_A_X(default_metals_H=0.0, default_alpha_H=0.0)  # Solar
@@ -42,9 +56,13 @@ class TestSynthesisJIT:
         abundances /= abundances.sum()
         return abundances
 
-    @pytest.fixture
+    @pytest.fixture(scope="class")
     def synthesis_data(self):
-        """Pre-computed synthesis data."""
+        """Pre-computed synthesis data.
+
+        Class-scoped: rebuilding the partition-function tables per test was pure
+        repetition, and nothing here mutates them.
+        """
         # Use fewer temperature points for faster testing
         return precompute_synthesis_data(
             ionization_energies,
@@ -55,7 +73,7 @@ class TestSynthesisJIT:
             n_temps=50  # Reduced from default 500
         )
 
-    @pytest.fixture
+    @pytest.fixture(scope="class")
     def narrow_wavelengths(self):
         """Narrow wavelength range for testing (5 Å)."""
         return np.linspace(5000.0, 5005.0, 50)  # Å

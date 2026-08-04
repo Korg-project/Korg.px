@@ -238,7 +238,17 @@ def synthesize_spectrum(julia_ref):
     }
 
 
-def test_solar_synthesis_continuum_normalized(julia_reference):
+@pytest.fixture(scope="module")
+def python_result(julia_reference):
+    """The one synthesis every test in this file compares against Julia.
+
+    Module-scoped because it is the same spectrum four times over: called per
+    test it cost 18-26 s apiece.
+    """
+    return synthesize_spectrum(julia_reference)
+
+
+def test_solar_synthesis_continuum_normalized(julia_reference, python_result):
     """
     Test that Python synthesis matches Julia reference for continuum-normalized spectrum.
 
@@ -246,7 +256,6 @@ def test_solar_synthesis_continuum_normalized(julia_reference):
     match well because it's independent of the absolute flux calibration.
     """
     # Synthesize with Python
-    python_result = synthesize_spectrum(julia_reference)
 
     # Get Julia reference
     julia_cnorm = julia_reference['continuum_normalized_flux']
@@ -314,13 +323,12 @@ def test_solar_synthesis_continuum_normalized(julia_reference):
     print(f"{'='*70}\n")
 
 
-def test_solar_synthesis_continuum_flux(julia_reference):
+def test_solar_synthesis_continuum_flux(julia_reference, python_result):
     """
     Test that continuum flux matches Julia reference.
 
     This tests that the continuum opacity and radiative transfer are correct.
     """
-    python_result = synthesize_spectrum(julia_reference)
 
     julia_continuum = julia_reference['continuum']
     python_continuum = python_result['continuum']
@@ -346,13 +354,12 @@ def test_solar_synthesis_continuum_flux(julia_reference):
     print("  ✓ Continuum flux matches Julia reference")
 
 
-def test_solar_synthesis_line_depth_range(julia_reference):
+def test_solar_synthesis_line_depth_range(julia_reference, python_result):
     """
     Test that line depth is in the expected range.
 
     This is a sanity check that the line is neither too weak nor too strong.
     """
-    python_result = synthesize_spectrum(julia_reference)
 
     python_cnorm = python_result['continuum_normalized_flux']
     i_center = np.argmin(python_cnorm)
@@ -370,13 +377,12 @@ def test_solar_synthesis_line_depth_range(julia_reference):
     print(f"  ✓ Line depth is within expected range [40%, 70%]")
 
 
-def test_solar_synthesis_spectrum_shape(julia_reference):
+def test_solar_synthesis_spectrum_shape(julia_reference, python_result):
     """
     Test that the spectrum has the expected shape.
 
     This checks that the continuum normalization works properly.
     """
-    python_result = synthesize_spectrum(julia_reference)
 
     python_cnorm = python_result['continuum_normalized_flux']
     wavelengths = julia_reference['wavelengths']

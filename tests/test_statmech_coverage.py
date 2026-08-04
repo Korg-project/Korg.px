@@ -88,6 +88,37 @@ def abundances():
     return jnp.asarray(A_X_to_absolute(format_A_X()))
 
 
+class _LayerKernels:
+    """The single-layer solve and its derivatives, compiled once for the module.
+
+    The autodiff tests below all differentiate the same solve at the same point.
+    Written as a local ``def f(t)`` in each test they were four distinct closures
+    over four distinct sets of baked-in constants, so each one hashed to its own HLO
+    module and paid the reverse-mode compile of the Newton solver again. Passing the
+    constants as arguments makes them one executable per derivative.
+    """
+
+    def __init__(self, eq_data):
+        def solve(T, n_total, ne_guess, nf_guess, ab):
+            return S._chem_eq_newton_layer_jit(T, n_total, ne_guess, nf_guess,
+                                               ab, eq_data)[0]
+
+        self.ne = jax.jit(solve)
+        self.d_ne_dT = jax.jit(jax.grad(solve, argnums=0))
+        self.d_ne_dab = jax.jit(jax.grad(solve, argnums=4))
+        self.jacfwd_T = jax.jit(jax.jacfwd(solve, argnums=0))
+
+    def at(self, T, n_total, ne_guess, nf_guess, ab):
+        """``ne`` as a plain float, for finite differencing."""
+        return float(self.ne(jnp.float64(T), jnp.float64(n_total),
+                             ne_guess, nf_guess, ab))
+
+
+@pytest.fixture(scope="module")
+def layer_kernels(eq_data):
+    return _LayerKernels(eq_data)
+
+
 def _central_difference(f, x, rel_step=1e-6):
     h = abs(x) * rel_step
     return (f(x + h) - f(x - h)) / (2 * h)
@@ -728,38 +759,38 @@ class TestAutodiff:
         fd = _central_difference(lambda t: float(S.Hminus_nK(t)), 5778.0)
         assert g == pytest.approx(fd, rel=1e-6)
 
-    def test_newton_layer_reverse_mode_wrt_abundances(self, eq_data, abundances):
+    def test_newton_layer_reverse_mode_wrt_abundances(self, eq_data, abundances,
+                                                      layer_kernels):
         """The batched solver is reverse-mode differentiable via the
         implicit-function-theorem ``custom_jvp`` on ``_chem_eq_solve_log``."""
         T, nt = 5778.0, 1e17
         ne_g, nf_g = S.picard_chemical_equilibrium_guess(T, nt, 1e14, abundances,
                                                         eq_data)
 
-        def f(ab):
-            return S._chem_eq_newton_layer_jit(T, nt, ne_g, nf_g, ab, eq_data)[0]
-
-        g = np.asarray(jax.grad(f)(abundances))
+        g = np.asarray(layer_kernels.d_ne_dab(jnp.float64(T), jnp.float64(nt),
+                                              ne_g, nf_g, abundances))
         assert g.shape == (S.MAX_ATOMIC_NUMBER,)
         assert np.all(np.isfinite(g))
         assert np.linalg.norm(g) > 0
 
     def test_newton_layer_reverse_mode_matches_central_difference(self, eq_data,
-                                                                  abundances):
+                                                                  abundances,
+                                                                  layer_kernels):
         T, nt = 5778.0, 1e17
         ne_g, nf_g = S.picard_chemical_equilibrium_guess(T, nt, 1e14, abundances,
                                                         eq_data)
 
-        def f(t):
-            return S._chem_eq_newton_layer_jit(t, nt, ne_g, nf_g, abundances,
-                                               eq_data)[0]
-
-        rev = float(jax.grad(f)(T))
+        rev = float(layer_kernels.d_ne_dT(jnp.float64(T), jnp.float64(nt),
+                                          ne_g, nf_g, abundances))
         assert np.isfinite(rev) and rev != 0.0
-        assert rev == pytest.approx(_central_difference(lambda t: float(f(t)), T),
-                                    rel=1e-5)
+        assert rev == pytest.approx(
+            _central_difference(lambda t: layer_kernels.at(t, nt, ne_g, nf_g,
+                                                           abundances), T),
+            rel=1e-5)
 
     def test_forward_and_reverse_mode_through_the_solver_agree(self, eq_data,
-                                                               abundances):
+                                                               abundances,
+                                                               layer_kernels):
         """Both modes work and give the same answer.
 
         ``_chem_eq_solve_log`` carries a ``custom_jvp`` whose rule is
@@ -777,16 +808,16 @@ class TestAutodiff:
         T, nt = 5778.0, 1e17
         ne_g, nf_g = S.picard_chemical_equilibrium_guess(T, nt, 1e14, abundances,
                                                         eq_data)
+        args = (jnp.float64(nt), ne_g, nf_g, abundances)
 
-        def f(t):
-            return S._chem_eq_newton_layer_jit(t, nt, ne_g, nf_g, abundances,
-                                               eq_data)[0]
-
-        rev = float(jax.grad(f)(T))
-        fwd = float(jax.jacfwd(f)(T))
+        rev = float(layer_kernels.d_ne_dT(jnp.float64(T), *args))
+        fwd = float(layer_kernels.jacfwd_T(jnp.float64(T), *args))
         assert np.isfinite(rev) and np.isfinite(fwd)
         assert fwd == pytest.approx(rev, rel=1e-12)
-        assert fwd == pytest.approx(_central_difference(f, T), rel=1e-5)
+        assert fwd == pytest.approx(
+            _central_difference(lambda t: layer_kernels.at(t, nt, ne_g, nf_g,
+                                                           abundances), T),
+            rel=1e-5)
 
     def test_custom_jvp_rule_is_the_implicit_function_theorem(self, eq_data,
                                                               abundances):
