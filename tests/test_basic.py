@@ -45,11 +45,16 @@ def test_synthesis_basic():
     if korg.synthesize is None or korg.interpolate_marcs is None:
         pytest.skip("Synthesis functions not available (missing data files)")
 
-    # Check if MARCS atmosphere grid is available
+    # Check if MARCS atmosphere grid is available. Under CI a 0-byte placeholder
+    # makes get_marcs_grid_path return None rather than raise, and
+    # load_marcs_grid then hands back a single-point dummy grid at Teff=5000 --
+    # so testing for None matters as much as catching the exception.
     from korg.marcs_interpolation import get_marcs_grid_path
     try:
         marcs_file = get_marcs_grid_path(auto_download=False)
     except Exception:
+        marcs_file = None
+    if marcs_file is None or not marcs_file.exists():
         pytest.skip("MARCS atmosphere grid not available (run: python -c \"from korg.marcs_interpolation import get_marcs_grid_path; get_marcs_grid_path(auto_download=True)\")")
 
     # Get solar abundances

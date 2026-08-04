@@ -224,10 +224,15 @@ class TestFitSpectrum:
     """Fit a noiseless synthetic spectrum and recover the input parameters."""
 
     @pytest.fixture(scope="class")
-    def fit_result(self, solar_atm, solar_A_X):
+    def fit_result(self, marcs_grid, solar_atm, solar_A_X):
         """
         Synthesise a 2-line spectrum at known parameters, then fit for Teff and vmic.
         Uses a very narrow window and high R to keep runtime under 30s.
+
+        ``marcs_grid`` skips this under a CI placeholder. ``solar_atm`` comes
+        from the committed ``sun.mod``, so the synthesis above works either way,
+        but the fit itself varies Teff and so interpolates the MARCS grid --
+        against a dummy grid that yields a non-finite best-fit flux.
         """
         from korg.linelist import create_line
         from korg.fit import fit_spectrum

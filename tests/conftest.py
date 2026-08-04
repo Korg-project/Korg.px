@@ -52,6 +52,38 @@ import korg  # noqa: E402, F401
 
 import functools  # noqa: E402
 import numpy as np  # noqa: E402
+import pytest  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# MARCS grid availability
+# ---------------------------------------------------------------------------
+# CI runs ``.github/scripts/setup_ci_artifacts.py``, which touches 0-byte
+# placeholders in place of the MARCS grids. ``get_marcs_grid_path`` returns
+# ``None`` for a placeholder under CI rather than raising, so a bare
+# ``try/except`` around it does *not* detect the case: the caller sails on and
+# ``load_marcs_grid`` hands back a single-point dummy grid at Teff=5000
+# (``marcs_interpolation.py``). Anything that then interpolates away from that
+# point fails with a confusing out-of-bounds error instead of skipping.
+#
+# Check for ``None`` as well as for the exception, which is what
+# ``test_interpolate_marcs_jit`` already does.
+
+def marcs_grid_available() -> bool:
+    """True if the real MARCS HDF5 grid is on disk, not a CI placeholder."""
+    try:
+        from korg.marcs_interpolation import get_marcs_grid_path
+        path = get_marcs_grid_path(auto_download=False)
+        return path is not None and path.exists()
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="session")
+def marcs_grid():
+    """Skip the requesting test unless the real MARCS grid is available."""
+    if not marcs_grid_available():
+        pytest.skip("MARCS grid not available (CI placeholder or not downloaded)")
 
 
 # ---------------------------------------------------------------------------
