@@ -29,13 +29,19 @@ _metal_bf_data: Optional[Dict] = None
 
 
 def _get_data_path() -> str:
-    """Get path to the data directory."""
-    # Path relative to the Korg.jl package root
-    # This assumes the package structure: Korg.jl/python_src/korg/continuum_absorption/
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    # Go up 3 levels to reach Korg.jl root, then into data
-    korg_root = os.path.dirname(os.path.dirname(os.path.dirname(this_dir)))
-    return os.path.join(korg_root, 'data', 'bf_cross-sections', 'bf_cross-sections.h5')
+    """Path to the metal bound-free cross-section table, inside the package.
+
+    This used to walk three directories up from here -- to the *repository*
+    root -- and read a second, byte-identical 28 MB copy of the table kept at
+    ``data/``. That was a leftover from a ``python_src/korg/`` layout the
+    comment still described and the tree no longer had. Only a source checkout
+    has a repository root: the wheel ships ``src/korg/data`` and nothing else,
+    so an installed copy would have raised here. Resolve against the package,
+    the way ``data_loader._DATA_DIR`` already does.
+    """
+    package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(package_dir, 'data', 'bf_cross-sections',
+                        'bf_cross-sections.h5')
 
 
 def _bilinear_interp_2d(table, x_grid, y_grid, x, y):

@@ -53,17 +53,19 @@ Documentation = "https://ajwheeler.github.io/Korg.jl/"
 Repository = "https://github.com/ajwheeler/Korg.jl"
 Issues = "https://github.com/ajwheeler/Korg.jl/issues"
 
+# src-layout. hatchling maps src/korg -> korg in the wheel on its own; it does
+# not need a `[tool.hatch.build] sources` entry, and must not have one. That
+# key rewrote paths in the *sdist* so the package landed at korg/ rather than
+# src/korg/, after which this target's `packages` matched nothing and a wheel
+# built from the sdist -- which is what `pip install` does from PyPI -- came
+# out containing only dist-info metadata. There was also a force-include of
+# src/korg/data on top of `packages`, which already covers it; that collided
+# with itself and made the wheel fail to build outright.
 [tool.hatch.build.targets.wheel]
 packages = ["src/korg"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/korg/data" = "korg/data"
-
 [tool.hatch.build.targets.sdist]
-include = ["src/korg/**/*.py", "src/korg/data/**"]
-
-[tool.hatch.build]
-sources = ["src"]
+include = ["src/korg/**", "tests/**", "pyproject.toml", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
