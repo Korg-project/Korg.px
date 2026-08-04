@@ -14,12 +14,13 @@ from jax import jit
 from .intensity import fritsch_butland_C
 
 
-def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, alpha_ref, spherical=False):
+def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, alpha_ref, spherical=False,
+                         dsdz=None, mask=None):
     """
     Compute optical depth using the anchored scheme.
 
     The anchored scheme computes τ(λ) by integrating:
-    dτ/d(log τ_ref) = α(λ) / α(λ_ref) * τ_ref
+    dτ/d(log τ_ref) = α(λ) / α(λ_ref) * τ_ref * ds/dz
 
     This is more stable than direct spatial integration, especially in
     spherical geometry or with steep opacity gradients.
@@ -38,30 +39,52 @@ def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, alpha_ref, spherical
         Absorption coefficient at reference wavelength [cm⁻¹]
         Required for computing the opacity ratio
     spherical : bool, optional
-        If True, use spherical geometry correction factor
-        Default: False (planar geometry)
+        Geometry flag.  The geometry enters this function *only* through
+        *dsdz* and *mask*, which a caller obtains from
+        :func:`~korg.radiative_transfer.rays.calculate_rays`; passing
+        ``spherical=True`` without them is an error rather than a silent
+        plane-parallel result.  Default: False (planar geometry).
+    dsdz : array, shape (n_layers,), optional
+        ``ds/dz`` along the ray: Korg.jl's ``dsdz``, i.e. ``1/μ`` for a
+        plane-parallel ray and ``r/s`` for a spherical one.  ``None`` (the
+        default) means the vertical plane-parallel ray, ``ds/dz = 1``.
+    mask : array of bool, shape (n_layers,), optional
+        Layers the ray intersects.  Segments with a masked endpoint
+        contribute nothing.  ``None`` (the default) means every layer.
 
     Returns
     -------
     tau : array, shape (n_layers,)
         Optical depth at each layer, anchored to reference wavelength
 
+    Raises
+    ------
+    ValueError
+        If ``spherical=True`` but no *dsdz* is supplied.
+
     Notes
     -----
     The integration is performed using trapezoidal rule:
     τ[i+1] = τ[i] + 0.5 * (integrand[i+1] + integrand[i]) * Δ(log τ_ref)
 
-    where integrand = α(λ) / α(λ_ref) * τ_ref
+    where integrand = α(λ) / α(λ_ref) * τ_ref * ds/dz
 
-    For spherical geometry, the integrand includes a factor accounting for
-    the changing ray path length through shells.
+    In spherical geometry the path-length coordinate along a ray is *not* the
+    vertical coordinate divided by μ, so ``ds/dz = r/s`` varies from layer to
+    layer and must be supplied per ray.  The high-level entry point
+    :func:`~korg.radiative_transfer.core.radiative_transfer` does this for
+    you; see :mod:`korg.radiative_transfer.spherical`.
 
     The first layer (typically top of atmosphere) has τ = 0 by definition.
 
     Reference: Korg.jl compute_tau_anchored! function
     """
-    n_layers = len(alpha)
-    tau = jnp.zeros(n_layers)
+    if spherical and dsdz is None:
+        raise ValueError(
+            "spherical=True requires dsdz (and normally mask) from calculate_rays; "
+            "use korg.radiative_transfer.radiative_transfer(..., spherical=True) "
+            "for the full spherical solver"
+        )
 
     # Convert log reference optical depth to linear
     tau_ref = 10.0 ** log_tau_ref
@@ -70,6 +93,8 @@ def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, alpha_ref, spherical
     # Handle division by zero by using a small epsilon
     alpha_ref_safe = jnp.where(jnp.abs(alpha_ref) > 1e-30, alpha_ref, 1e-30)
     integrand = alpha / alpha_ref_safe * tau_ref
+    if dsdz is not None:
+        integrand = integrand * dsdz
 
     # Trapezoidal integration over log(τ_ref)
     # tau[0] = 0 (top of atmosphere)
@@ -80,6 +105,9 @@ def compute_tau_anchored(alpha, spatial_coord, log_tau_ref, alpha_ref, spherical
     integrand_avg = 0.5 * (integrand[:-1] + integrand[1:])  # Average of adjacent layers
     # d(tau_ref) = tau_ref * ln(10) * d(log10_tau_ref), so multiply by ln(10)
     dtau = integrand_avg * delta_log_tau * jnp.log(10.0)
+
+    if mask is not None:
+        dtau = jnp.where(mask[:-1] & mask[1:], dtau, 0.0)
 
     # Cumulative sum to get tau at each layer
     # tau[0] = 0, tau[i] = sum(dtau[0:i]) for i >= 1

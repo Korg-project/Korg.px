@@ -167,7 +167,11 @@ def format_A_X(
                 raise ValueError(f"The abundance of {el} was specified by both "
                                f"atomic number and atomic symbol.")
             clean_abundances[Z] = abund
-        elif isinstance(el, int):
+        elif isinstance(el, (int, np.integer)):
+            # np.integer is accepted too: Julia's check is `el isa Integer`, and
+            # a numpy scalar out of e.g. `np.arange` would otherwise be rejected
+            # as "not a valid element".
+            el = int(el)
             if not (1 <= el <= MAX_ATOMIC_NUMBER):
                 raise ValueError(f"Z = {el} is not a supported atomic number.")
             clean_abundances[el] = abund
@@ -242,9 +246,9 @@ def get_metals_H(
         Default: BERGEMANN_2025_SOLAR_ABUNDANCES
     ignore_alpha : bool, optional
         Whether to ignore the alpha elements when calculating [metals/H].
-        If True, [metals/H] is calculated using all elements heavier than He
-        except carbon and the alpha elements. If False, all metals are used.
-        Default: True
+        If True (default), [metals/H] is calculated from every element heavier
+        than He except the alpha elements. If False, all elements with Z >= 3
+        are used. This matches Korg.jl 1.2.1's ``get_metals_H``.
     alpha_elements : list, optional
         List of atomic numbers of the alpha elements.
         Default: [8, 10, 12, 14, 16, 18, 20, 22]
@@ -261,9 +265,11 @@ def get_metals_H(
         alpha_elements = DEFAULT_ALPHA_ELEMENTS
 
     if ignore_alpha:
-        # Exclude alpha elements and carbon (Z=6)
+        # Korg.jl 1.2.1: [Z for Z in 3:MAX_ATOMIC_NUMBER if !(Z in alpha_elements)]
+        # Carbon is *not* excluded (the Korg.jl docstring says otherwise, but the
+        # implementation -- which is what we port -- keeps it).
         els = [Z for Z in range(3, MAX_ATOMIC_NUMBER + 1)
-               if Z not in alpha_elements and Z != 6]
+               if Z not in alpha_elements]
     else:
         els = list(range(3, MAX_ATOMIC_NUMBER + 1))
 

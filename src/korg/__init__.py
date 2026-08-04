@@ -35,7 +35,11 @@ from .artifacts import (
 
 # These imports may fail if data files are not available
 try:
-    from .synthesis import synthesize, load_synthesis_data, save_synthesis_data
+    from .synthesis import load_synthesis_data, save_synthesis_data
+    # The one public synthesis entry point: traced, differentiable, Korg.jl's
+    # argument order. ``prepare_synthesis`` is the form to reach for whenever a
+    # spectrum is computed more than once.
+    from .synthesis_plan import synthesize, synth, prepare_synthesis
     from .marcs_interpolation import interpolate_marcs
     from .synthesis_preparation import (
         prepare_wavelength_grid,
@@ -48,6 +52,8 @@ except (ImportError, FileNotFoundError) as e:
     import warnings
     warnings.warn(f"Could not import synthesis functions: {e}")
     synthesize = None
+    synth = None
+    prepare_synthesis = None
     load_synthesis_data = None
     save_synthesis_data = None
     interpolate_marcs = None
@@ -101,6 +107,8 @@ __all__ = [
     "format_A_X",
     "get_solar_abundances",
     "synthesize",
+    "synth",
+    "prepare_synthesis",
     "load_synthesis_data",
     "save_synthesis_data",
     "interpolate_marcs",

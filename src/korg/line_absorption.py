@@ -58,9 +58,16 @@ def inverse_gaussian_density(rho: float, sigma: float) -> float:
     """
     max_density = 1.0 / (jnp.sqrt(2 * jnp.pi) * sigma)
 
-    # JAX-compatible: use jnp.where instead of if/else
-    result = sigma * jnp.sqrt(-2 * jnp.log(jnp.sqrt(2 * jnp.pi) * sigma * rho))
-    return jnp.where(rho > max_density, 0.0, result)
+    # JAX-compatible: use jnp.where instead of if/else. The radicand is negative
+    # exactly when rho > max_density; a bare jnp.where masks the NaN value but
+    # not the NaN cotangent, so substitute a harmless radicand before the sqrt
+    # ("double where"). It has to be strictly positive -- sqrt(0) has an
+    # infinite derivative and 0 * inf is NaN as well. Where this branch is
+    # selected the radicand is untouched, so values are unchanged.
+    too_dense = rho > max_density
+    radicand = -2 * jnp.log(jnp.sqrt(2 * jnp.pi) * sigma * rho)
+    result = sigma * jnp.sqrt(jnp.where(too_dense, 1.0, radicand))
+    return jnp.where(too_dense, 0.0, result)
 
 
 def inverse_lorentz_density(rho: float, gamma: float) -> float:
@@ -81,9 +88,13 @@ def inverse_lorentz_density(rho: float, gamma: float) -> float:
     """
     max_density = 1.0 / (jnp.pi * gamma)
 
-    # JAX-compatible: use jnp.where instead of if/else
-    result = jnp.sqrt(gamma / (jnp.pi * rho) - gamma**2)
-    return jnp.where(rho > max_density, 0.0, result)
+    # JAX-compatible: use jnp.where instead of if/else. As above, substitute a
+    # harmless radicand before the sqrt so the masked-out branch cannot poison
+    # the reverse-mode gradient with a NaN.
+    too_dense = rho > max_density
+    radicand = gamma / (jnp.pi * rho) - gamma**2
+    result = jnp.sqrt(jnp.where(too_dense, 1.0, radicand))
+    return jnp.where(too_dense, 0.0, result)
 
 
 def sigma_line(wavelength: float) -> float:

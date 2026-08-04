@@ -18,6 +18,10 @@ from .constants import (
     kboltz_cgs, kboltz_eV, bohr_radius_cgs, RydbergH_eV, Rydberg_eV
 )
 from .data_loader import ionization_energies
+# Single implementation of the Birch & Downs (1994) air/vacuum conversion, as
+# in Korg.jl's utils.jl. Re-exported here (and from ``korg``) so that
+# ``korg.linelist.air_to_vacuum`` keeps working.
+from .utils import air_to_vacuum, vacuum_to_air  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -236,43 +240,6 @@ def create_line(
         gamma_stark=float(gamma_stark),
         vdW=(float(vdW[0]), float(vdW[1]))
     )
-
-
-def air_to_vacuum(wl_air: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
-    """
-    Convert air wavelength to vacuum wavelength using the Edlén (1966) formula.
-
-    Args:
-        wl_air: Wavelength in air (Ångströms)
-
-    Returns:
-        Wavelength in vacuum (Ångströms)
-    """
-    # Edlén (1966) formula, standard conversion
-    # This is the IAU standard: https://www.iau.org/publications/proceedings_rules/units/
-    sigma2 = (1e4 / wl_air) ** 2  # (μm⁻¹)²
-    n = 1 + 0.00008336624212083 + 0.02408926 / (130.1065 - sigma2) + 0.0001599740 / (38.92568 - sigma2)
-    return wl_air * n
-
-
-def vacuum_to_air(wl_vac: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
-    """
-    Convert vacuum wavelength to air wavelength.
-
-    This uses an iterative approach to invert the air_to_vacuum formula.
-
-    Args:
-        wl_vac: Wavelength in vacuum (Ångströms)
-
-    Returns:
-        Wavelength in air (Ångströms)
-    """
-    # Start with vacuum wavelength as initial guess
-    wl_air = wl_vac
-    # Iterate to converge
-    for _ in range(5):
-        wl_air = wl_vac / (air_to_vacuum(wl_air) / wl_air)
-    return wl_air
 
 
 def read_vald_linelist(filename: str) -> list:
@@ -725,13 +692,20 @@ def parse_turbospectrum_linelist(fn: str, iso_abundances=None,
                 if gamma_rad_val in (0.0, 1.0):
                     gamma_rad_val = None
 
+                # Column 7 holds log10(γ_Stark).  Korg.jl feeds it through
+                # ``tentotheOrMissing`` (linelist.jl,
+                # parse_turbospectrum_linelist_transition), i.e. exactly 0 means
+                # "no data" and every other value is a base-10 logarithm.  If the
+                # column is not numeric it is the orbital angular momentum letter
+                # for the upper level, which also means "no data".
                 gamma_stark_val = None
                 if len(toks) > 6:
                     try:
                         gs = float(toks[6])
-                        gamma_stark_val = gs if gs not in (0.0, 1.0) else None
                     except ValueError:
                         pass
+                    else:
+                        gamma_stark_val = None if gs == 0.0 else 10.0 ** gs
 
                 line_obj = create_line(
                     wl_vac, log_gf, spec, E_lower,
@@ -765,15 +739,22 @@ def save_linelist(path: str, linelist: list) -> None:
         f.create_dataset('log_gf', data=np.array([l.log_gf for l in linelist]))
         f['log_gf'].attrs['description'] = 'Log of oscillator strength times statistical weight'
 
-        max_atoms = max((len([a for a in l.species.formula.atoms if a != 0])
-                         for l in linelist), default=1)
-        formula_arr = np.zeros((max_atoms, len(linelist)), dtype=np.uint8)
+        # Korg.jl writes ``reduce(hcat, [l.species.formula.atoms ...])``: a
+        # (MAX_ATOMS_PER_MOLECULE, n_lines) Julia matrix, which HDF5 stores — and
+        # h5py therefore sees — with shape (n_lines, MAX_ATOMS_PER_MOLECULE).
+        # Formula.atoms is zero-padded at the *front*, so each row is
+        # right-aligned. Matching this layout exactly is what makes the file
+        # readable by Korg.jl's read_korg_linelist (and vice versa).
+        from .species import MAX_ATOMS_PER_MOLECULE
+        formula_arr = np.zeros((len(linelist), MAX_ATOMS_PER_MOLECULE), dtype=np.uint8)
         for i, l in enumerate(linelist):
-            atoms = [int(a) for a in l.species.formula.atoms if a != 0]
-            for j, a in enumerate(atoms[:max_atoms]):
-                formula_arr[j, i] = a
+            formula_arr[i, :] = [int(a) for a in l.species.formula.atoms]
         f.create_dataset('formula', data=formula_arr)
-        f['formula'].attrs['description'] = 'Array of atomic numbers (rows) per line (cols)'
+        f['formula'].attrs['description'] = 'Array of atomic numbers representing molecular formula'
+
+        f.create_dataset('species',
+                         data=np.array([str(l.species) for l in linelist], dtype=h5py.special_dtype(vlen=str)))
+        f['species'].attrs['description'] = 'String representation of atomic/molecular species'
 
         f.create_dataset('charge',
                          data=np.array([l.species.charge for l in linelist], dtype=np.int32))
@@ -821,7 +802,9 @@ def read_korg_linelist(path: str) -> list:
 
     result = []
     for i in range(len(wls)):
-        atoms = [int(a) for a in formula_arr[:, i] if a != 0]
+        # Row i holds the (front-zero-padded) atomic numbers of line i; see
+        # save_linelist for why this matches Korg.jl's on-disk layout.
+        atoms = [int(a) for a in formula_arr[i] if a != 0]
         if not atoms:
             continue
         formula = Formula(atoms)

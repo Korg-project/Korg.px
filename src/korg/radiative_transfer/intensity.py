@@ -59,10 +59,25 @@ def fritsch_butland_C(x, y):
     # Handle division by zero case
     numerator = d[:-1] * d[1:]
     denominator = alpha * d[1:] + (1.0 - alpha) * d[:-1]
-    # Avoid division by zero - if denominator is zero, set yprime to zero
+    # Avoid division by zero - if denominator is zero, set yprime to zero.
+    #
+    # The mask must be applied to the *denominator* as well as to the result:
+    # jnp.where hides the value of the dead branch but not its cotangent, so
+    # reverse-mode AD still differentiates numerator/denominator at
+    # denominator == 0, where d(num/den)/d(den) = -num/den**2 is infinite, and
+    # the zero cotangent then gives 0 * inf = NaN. This is not exotic: the
+    # denominator vanishes identically whenever y is constant (an isothermal
+    # source function, or a flat opacity column) and at any local extremum with
+    # symmetric slopes, so without the double mask the Bezier tau and intensity
+    # schemes return finite fluxes with NaN gradients.
+    #
+    # Where the mask is true, safe_denominator is bitwise denominator, so the
+    # returned values are unchanged.
+    use_ratio = jnp.abs(denominator) > 1e-20
+    safe_denominator = jnp.where(use_ratio, denominator, 1.0)
     yprime = jnp.where(
-        jnp.abs(denominator) > 1e-20,
-        numerator / denominator,
+        use_ratio,
+        numerator / safe_denominator,
         0.0
     )
 

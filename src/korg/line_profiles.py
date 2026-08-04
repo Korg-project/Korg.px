@@ -56,10 +56,20 @@ def inverse_gaussian_density(rho, sigma):
         The x value corresponding to the density ρ, or 0 if ρ > max(PDF).
     """
     max_density = 1 / (jnp.sqrt(2 * jnp.pi) * sigma)
+    # ρ > max_density makes the log argument > 1 and hence the radicand
+    # negative. A bare jnp.where masks the resulting NaN *value*, but
+    # reverse-mode AD still pushes a cotangent through the dead branch and the
+    # gradient comes back NaN. Substitute a harmless radicand there before the
+    # sqrt ("double where"). Note we must swap in a strictly positive value, not
+    # merely clamp at 0: √0 has an infinite derivative, and 0 * inf is NaN too.
+    # Where the select keeps this branch the radicand is unmodified, so values
+    # are bit-for-bit unchanged.
+    too_dense = rho > max_density
+    radicand = -2 * jnp.log(jnp.sqrt(2 * jnp.pi) * sigma * rho)
     return jnp.where(
-        rho > max_density,
+        too_dense,
         0.0,
-        sigma * jnp.sqrt(-2 * jnp.log(jnp.sqrt(2 * jnp.pi) * sigma * rho))
+        sigma * jnp.sqrt(jnp.where(too_dense, 1.0, radicand))
     )
 
 @jax.jit
@@ -84,10 +94,16 @@ def inverse_lorentz_density(rho, gamma):
         The x value corresponding to the density ρ, or 0 if ρ > max(PDF).
     """
     max_density = 1 / (jnp.pi * gamma)
+    # See inverse_gaussian_density: ρ > max_density makes the radicand negative,
+    # and a bare jnp.where masks the NaN value but not the NaN cotangent.
+    # Substituting a harmless radicand before the sqrt leaves the selected
+    # values unchanged.
+    too_dense = rho > max_density
+    radicand = gamma / (jnp.pi * rho) - gamma**2
     return jnp.where(
-        rho > max_density,
+        too_dense,
         0.0,
-        jnp.sqrt(gamma / (jnp.pi * rho) - gamma**2)
+        jnp.sqrt(jnp.where(too_dense, 1.0, radicand))
     )
 
 @jax.jit
@@ -250,6 +266,14 @@ def voigt_hjerting(alpha, v):
 
     # Case 4: α > 1.4 or (α > 0.2 and α + v > 3.2)
     def case4(alpha, v, v2):
+        # This branch divides by α, so it evaluates to inf/NaN at α = 0 (a
+        # perfectly legitimate input: a line with no Lorentz broadening). The
+        # selects below never *return* this branch for α <= 0.2, but reverse-mode
+        # AD still propagates a cotangent through it, which would turn the whole
+        # gradient into NaN. Floor α before the division ("double where"). Since
+        # this branch is only selected when α > 0.2, the returned values are
+        # bit-for-bit unchanged.
+        alpha = jnp.where(alpha > 0.2, alpha, 1.0)
         r2 = v2 / (alpha * alpha)
         alpha_invu = 1 / jnp.sqrt(2) / ((r2 + 1) * alpha)
         alpha2_invu2 = alpha_invu * alpha_invu

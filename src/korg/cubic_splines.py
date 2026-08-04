@@ -5,11 +5,23 @@ This module contains functions for cubic spline interpolation, adapted from
 DataInterpolations.jl (MIT license). See source for full license details.
 """
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.scipy.linalg import solve
 from dataclasses import dataclass
 from typing import Optional
+
+
+def _is_jax(x):
+    """True for anything that must stay on the JAX path: tracers and device arrays.
+
+    A tracer is the case that matters — evaluating it with NumPy would raise
+    rather than silently mislead — but a concrete ``jax.Array`` is included too,
+    so a caller that has already moved data to the device is not silently pulled
+    back to the host.
+    """
+    return isinstance(x, (jax.core.Tracer, jax.Array))
 
 
 @dataclass
@@ -51,6 +63,22 @@ class CubicSpline:
         float or array
             Interpolated value(s).
         """
+        # Host inputs take the NumPy path.
+        #
+        # This spline is evaluated to *build* tables as well as inside kernels:
+        # `_precompute_chem_eq` at data_loader.py:805 runs at import and evaluates
+        # one partition function per constituent atom per molecule. Under `jnp`
+        # each of those is a separate eager XLA compilation on the CUDA backend --
+        # 212 of them, several seconds, and a wall of PTX warnings, all to produce
+        # constants. Dispatching on the argument keeps the traced path identical
+        # (a tracer still goes through `jnp`) while host callers pay nothing.
+        # The knots are usually concrete `jax.Array`s, which is not a reason to
+        # stay on the device: they can be copied to the host once and cached. Only
+        # a *tracer* genuinely forces the JAX path.
+        if not _is_jax(t_eval) and not any(isinstance(a, jax.core.Tracer) for a in
+                                           (self.t, self.u, self.h, self.z)):
+            return self.numpy_eval(t_eval)
+
         # Check bounds
         if not self.extrapolate:
             if jnp.any((t_eval < self.t[0]) | (t_eval > self.t[-1])):
@@ -80,11 +108,25 @@ class CubicSpline:
 
     def numpy_eval(self, t_eval):
         """Evaluate the spline using numpy (avoids JAX compilation overhead)."""
-        t = np.asarray(self.t)
-        u = np.asarray(self.u)
-        h = np.asarray(self.h)
-        z = np.asarray(self.z)
+        # Cache the host copies. Without this, routing table construction here
+        # trades one XLA compilation per call for four device-to-host transfers
+        # per call, which is not obviously better.
+        cached = getattr(self, "_np_knots", None)
+        if cached is None:
+            cached = (np.asarray(self.t), np.asarray(self.u),
+                      np.asarray(self.h), np.asarray(self.z))
+            object.__setattr__(self, "_np_knots", cached)
+        t, u, h, z = cached
         t_eval = np.asarray(t_eval)
+        # Same bounds contract as __call__. Without this, routing host callers
+        # here would quietly turn an out-of-bounds error into an extrapolated
+        # number, which is a behaviour change rather than an optimisation.
+        if not self.extrapolate:
+            if np.any((t_eval < t[0]) | (t_eval > t[-1])):
+                raise ValueError(
+                    f"Out-of-bounds value passed to interpolant. "
+                    f"Must be between {float(t[0])} and {float(t[-1])}"
+                )
         if self.extrapolate:
             t_eval = np.clip(t_eval, t[0], t[-1])
         i = np.searchsorted(t, t_eval, side='right') - 1

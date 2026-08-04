@@ -13,14 +13,21 @@ Main functions:
 from .expint import exponential_integral_2, exponential_integral_3
 from .optical_depth import compute_tau_anchored
 from .intensity import compute_I_linear_flux_only, compute_F_flux_only_expint
+from .rays import calculate_rays
+from .spherical import spherical_ray_flux
 from .core import (radiative_transfer, radiative_transfer_single_wavelength,
-                   radiative_transfer_jit, radiative_transfer_single_wavelength_jit)
+                   radiative_transfer_jit, radiative_transfer_single_wavelength_jit,
+                   radiative_transfer_spherical, generate_mu_grid)
 
 __all__ = [
     'radiative_transfer',
     'radiative_transfer_single_wavelength',
     'radiative_transfer_jit',
     'radiative_transfer_single_wavelength_jit',
+    'radiative_transfer_spherical',
+    'generate_mu_grid',
+    'calculate_rays',
+    'spherical_ray_flux',
     'exponential_integral_2',
     'exponential_integral_3',
     'compute_tau_anchored',

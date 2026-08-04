@@ -744,6 +744,137 @@ let
 end
 
 # =============================================================================
+# Shared (T, nₑ, composition) conditions for the continuum fixtures
+# =============================================================================
+# These three conditions are used both by the per-source continuum references and by the
+# total_continuum_absorption fixture, so that the sum is checked where different sources
+# dominate: H⁻ ff / metal bf matter most in the cool dense case, H⁻ bf in the solar case,
+# and H I bf / positive-ion ff / electron scattering in the hot case.
+#
+# Number densities are keyed by the same strings Korg.px uses internally ("Fe_I", "H2", …);
+# the Julia side converts them to `Korg.Species` below.
+continuum_conditions = [
+    ("cool_dense", 3500.0, 2.0e11,
+     Dict("H_I" => 1.0e17, "H_II" => 1.0e7, "He_I" => 8.5e15, "He_II" => 1.0e2,
+          "H2" => 1.0e13,
+          "C_I" => 3.0e13, "C_II" => 1.0e8,
+          "Na_I" => 2.0e11, "Na_II" => 1.0e9,
+          "Mg_I" => 3.0e12, "Mg_II" => 1.0e11,
+          "Al_I" => 2.0e11, "Al_II" => 1.0e9,
+          "Si_I" => 3.0e12, "Si_II" => 1.0e10,
+          "S_I" => 1.0e13, "S_II" => 1.0e7,
+          "Ca_I" => 2.0e11, "Ca_II" => 5.0e10,
+          "Fe_I" => 3.0e12, "Fe_II" => 1.0e11)),
+    ("solar", 5778.0, 1.5e14,
+     Dict("H_I" => 1.8e17, "H_II" => 1.0e11, "He_I" => 1.6e16, "He_II" => 1.0e9,
+          "H2" => 1.0e12,
+          "C_I" => 1.0e14, "C_II" => 1.0e10,
+          "Na_I" => 1.0e11, "Na_II" => 3.0e11,
+          "Mg_I" => 1.0e12, "Mg_II" => 6.0e12,
+          "Al_I" => 5.0e10, "Al_II" => 5.0e11,
+          "Si_I" => 1.0e12, "Si_II" => 6.0e12,
+          "S_I" => 5.0e12, "S_II" => 1.0e10,
+          "Ca_I" => 1.0e10, "Ca_II" => 4.0e11,
+          "Fe_I" => 5.0e11, "Fe_II" => 5.0e12)),
+    ("hot", 9000.0, 1.0e14,
+     Dict("H_I" => 1.0e16, "H_II" => 5.0e15, "He_I" => 1.0e15, "He_II" => 1.0e11,
+          "H2" => 1.0e6,
+          "C_I" => 1.0e10, "C_II" => 5.0e12,
+          "Na_I" => 1.0e8, "Na_II" => 2.0e10,
+          "Mg_I" => 1.0e9, "Mg_II" => 4.0e11,
+          "Al_I" => 1.0e8, "Al_II" => 3.0e10,
+          "Si_I" => 1.0e9, "Si_II" => 4.0e11,
+          "S_I" => 1.0e10, "S_II" => 2.0e11,
+          "Ca_I" => 1.0e7, "Ca_II" => 2.0e10,
+          "Fe_I" => 1.0e9, "Fe_II" => 3.0e11)),
+]
+
+continuum_wavelengths_A = [3000.0, 4000.0, 5000.0, 6000.0, 8000.0, 10000.0, 15000.0, 20000.0]
+
+# Convert a "Fe_I"-style key into a Korg.Species ("H2" stays "H2").
+continuum_species(k) = Korg.Species(replace(k, "_" => " "))
+
+# =============================================================================
+# Individual continuum sources
+# =============================================================================
+# Each of these is evaluated directly (not via total_continuum_absorption) so that a large
+# relative error in a sub-dominant source cannot hide inside the tolerance on the sum.
+println("  - continuum_sources...")
+let
+    src_data = Dict{String,Any}()
+
+    for (label, T, ne, nd_str) in continuum_conditions
+        nd = Dict(continuum_species(k) => v for (k, v) in nd_str)
+
+        U_H_I = Korg.default_partition_funcs[Korg.species"H I"](log(T))
+        U_He_I = Korg.default_partition_funcs[Korg.species"He I"](log(T))
+        nH_I_div_U = nd_str["H_I"] / U_H_I
+        nHe_I_div_U = nd_str["He_I"] / U_He_I
+
+        # --- H⁻ number density: a real API difference between Korg v1.1 and v1.2 ---
+        # Korg v1.2 carries H⁻ through chemical equilibrium and passes it to Hminus_bf as
+        #     n(H⁻) = Hminus_nK(T) * n(H I) * nₑ,
+        # i.e. in terms of the *total* neutral hydrogen density.  Korg.px still derives
+        # n(H⁻) inside Hminus_bf (the v1.1 behaviour) from the ground-state population,
+        #     n(H I, n=1) = 2 n(H I) / U(H I),
+        # which is the same expression with n(H I) → 2 n(H I)/U(H I).  Both are recorded:
+        #  * `nHminus_ground_state` is what `Hminus_bf` below is evaluated with, so that the
+        #    Python comparison is like-for-like and tests the cross-section + stimulated
+        #    emission factor rather than the density convention;
+        #  * `nHminus_korg_v1_2` quantifies the divergence (the ratio is exactly 2/U(H I)).
+        nHminus_gs = Korg.Hminus_nK(T) * (2 * nH_I_div_U) * ne
+        nHminus_korg = Korg.Hminus_nK(T) * nd_str["H_I"] * ne
+
+        outputs = Dict{String,Any}(src => Dict{String,Float64}()
+                                   for src in ("Hminus_bf", "Hminus_bf_unit_ndens", "Hminus_ff",
+                                               "Heminus_ff", "metal_bf", "positive_ion_ff"))
+
+        for wl_A in continuum_wavelengths_A
+            νs = [Korg.c_cgs / (wl_A * 1e-8)]
+            k = string(wl_A)
+
+            outputs["Hminus_bf"][k] = Float64(Korg.ContinuumAbsorption.Hminus_bf(νs, T,
+                                                                                nHminus_gs, ne)[1])
+            # α per H⁻ ion: isolates the McLaughlin+ 2017 cross section and the stimulated
+            # emission factor from the n(H⁻) convention, which differs between v1.1 and v1.2.
+            outputs["Hminus_bf_unit_ndens"][k] = Float64(Korg.ContinuumAbsorption.Hminus_bf(νs, T,
+                                                                                           1.0,
+                                                                                           ne)[1])
+            outputs["Hminus_ff"][k] = Float64(Korg.ContinuumAbsorption.Hminus_ff(νs, T,
+                                                                                nH_I_div_U, ne)[1])
+            outputs["Heminus_ff"][k] = Float64(Korg.ContinuumAbsorption.Heminus_ff(νs, T,
+                                                                                  nHe_I_div_U,
+                                                                                  ne)[1])
+
+            α_metal = zeros(1)
+            Korg.ContinuumAbsorption.metal_bf_absorption!(α_metal, νs, T, nd)
+            outputs["metal_bf"][k] = Float64(α_metal[1])
+
+            α_ff = zeros(1)
+            Korg.ContinuumAbsorption.positive_ion_ff_absorption!(α_ff, νs, T, nd, ne)
+            outputs["positive_ion_ff"][k] = Float64(α_ff[1])
+        end
+
+        src_data[label] = Dict(
+            "T" => T,
+            "ne" => ne,
+            "number_densities" => nd_str,
+            "U_H_I" => U_H_I,
+            "U_He_I" => U_He_I,
+            "nH_I_div_U" => nH_I_div_U,
+            "nHe_I_div_U" => nHe_I_div_U,
+            "Hminus_nK" => Korg.Hminus_nK(T),
+            "nHminus_ground_state" => nHminus_gs,
+            "nHminus_korg_v1_2" => nHminus_korg,
+            "wavelengths_A" => continuum_wavelengths_A,
+            "outputs" => outputs,
+        )
+    end
+
+    reference_data["continuum_sources"] = src_data
+end
+
+# =============================================================================
 # Line class construction (approximate broadening)
 # =============================================================================
 println("  - line_class...")
@@ -926,12 +1057,18 @@ let
     nHe_II_cntm = 1.0e9
     nH2_cntm   = 1.0e12
 
+    # Korg 1.2 treats H⁻ as a species carried by chemical_equilibrium rather than deriving it
+    # inside Hminus_bf, so total_continuum_absorption now requires it in number_densities.
+    # Use the same relation chemical_equilibrium uses: n(H⁻) = nK(T) * n(H I) * nₑ.
+    nHminus_cntm = Korg.Hminus_nK(T_cntm) * nH_I_cntm * ne_cntm
+
     number_densities_cntm = Dict(
         Korg.species"H_I"  => nH_I_cntm,
         Korg.species"H_II" => nH_II_cntm,
         Korg.species"He_I" => nHe_I_cntm,
         Korg.species"He_II"=> nHe_II_cntm,
         Korg.species"H2"   => nH2_cntm,
+        Korg.species"H-"   => nHminus_cntm,
     )
 
     wavelengths_A = [3000.0, 4000.0, 5000.0, 6000.0, 8000.0, 10000.0]
@@ -949,10 +1086,44 @@ let
             "T" => T_cntm, "ne" => ne_cntm,
             "nH_I" => nH_I_cntm, "nH_II" => nH_II_cntm,
             "nHe_I" => nHe_I_cntm, "nHe_II" => nHe_II_cntm, "nH2" => nH2_cntm,
+            "nHminus" => nHminus_cntm,
             "wavelengths_A" => wavelengths_A,
             "outputs" => cntm_outputs
         )
     )
+
+    # The single solar layer above is a weak check on the sum: H⁻ dominates the optical
+    # continuum there, so a large relative error in e.g. metal bf or positive-ion ff would
+    # hide inside the tolerance.  Evaluate the total at the same three conditions used for
+    # the per-source references, with the full metal composition.
+    #
+    # n(H⁻) is passed using the ground-state convention (see the `continuum_sources`
+    # section) so the comparison is like-for-like with Korg.px, which still derives n(H⁻)
+    # internally from n(H I, n=1) rather than taking it as an argument.
+    conditions_outputs = Dict{String,Any}()
+    for (label, T, ne, nd_str) in continuum_conditions
+        nd = Dict(continuum_species(k) => v for (k, v) in nd_str)
+        U_H_I = Korg.default_partition_funcs[Korg.species"H I"](log(T))
+        nHminus = Korg.Hminus_nK(T) * (2 * nd_str["H_I"] / U_H_I) * ne
+        nd[Korg.species"H-"] = nHminus
+
+        outs = Dict{String,Float64}()
+        for wl_A in continuum_wavelengths_A
+            νs = [Korg.c_cgs / (wl_A * 1e-8)]
+            outs[string(wl_A)] = Float64(Korg.ContinuumAbsorption.total_continuum_absorption(νs, T,
+                                                                                             ne, nd,
+                                                                                             Korg.default_partition_funcs)[1])
+        end
+
+        conditions_outputs[label] = Dict(
+            "T" => T, "ne" => ne,
+            "number_densities" => nd_str,
+            "nHminus_ground_state" => nHminus,
+            "wavelengths_A" => continuum_wavelengths_A,
+            "outputs" => outs,
+        )
+    end
+    reference_data["total_continuum_absorption"]["conditions"] = conditions_outputs
 end
 
 # =============================================================================
@@ -1130,6 +1301,116 @@ let
 end
 
 # =============================================================================
+# Spherical radiative transfer (calculate_rays + the spherical solver)
+# =============================================================================
+println("  - spherical radiative transfer...")
+let
+    n_layers = 25
+
+    # Build a self-consistent shell atmosphere: the anchored optical depth
+    # scheme assumes dr/d(ln τ_ref) = -τ_ref/α_ref, so integrate that to get
+    # the radii instead of inventing an unrelated radial grid.  The τ_ref^0.9
+    # factor makes the geometric thickness spread over the whole optical depth
+    # range, as it does in a real extended model, rather than piling up in the
+    # deepest couple of layers.
+    tau_ref = Float64.(10 .^ range(-5, 2; length=n_layers))
+    log_tau_ref = log.(tau_ref)                   # Korg uses natural log
+    profile = (1.0 .+ 0.5 .* sin.(range(0, π; length=n_layers))) .* tau_ref .^ 0.9
+
+    R_inner = 1.0e12                              # innermost radius [cm]
+
+    # Returns (radii, α_ref) for an atmosphere whose geometric thickness is
+    # `t_over_R` times the innermost radius.
+    function build_atmosphere(t_over_R)
+        g = tau_ref ./ profile                    # -dr/d(ln τ_ref), up to a scale
+        dr = 0.5 .* (g[1:end-1] .+ g[2:end]) .* diff(log_tau_ref)
+        depth = vcat(0.0, cumsum(dr))
+        scale = depth[end] / (t_over_R * R_inner)
+        # radii[1] is the outermost layer, radii[end] the innermost
+        Float64.(R_inner .+ depth[end] / scale .- depth ./ scale), Float64.(profile .* scale)
+    end
+
+    # Source function and two absorption columns (layers × wavelengths)
+    S_col = Float64.(range(2.0e-5, 9.0e-5; length=n_layers))
+    S = hcat(S_col, S_col .* 1.1)
+
+    cases = Dict{String, Any}()
+    for (label, t_over_R) in [("extended", 0.3), ("thin", 1.0e-3)]
+        radii, alpha_ref = build_atmosphere(t_over_R)
+
+        alpha = hcat(alpha_ref .* 1.5,
+                     alpha_ref .* (1.0 .+ 0.8 .* cos.(range(0, 2π; length=n_layers))))
+
+        # --- calculate_rays geometry, for a 7-point μ grid ---
+        μ_geom, _ = Korg.RadiativeTransfer.generate_mu_grid(7)
+        rays = Korg.RadiativeTransfer.calculate_rays(μ_geom, radii, true)
+        ray_out = [Dict("mu" => Float64(μ_geom[i]),
+                        "b" => Float64(radii[1] * sqrt(1 - μ_geom[i]^2)),
+                        "n_layers" => length(rays[i][1]),
+                        "s" => Float64.(rays[i][1]),
+                        "dsdr" => Float64.(rays[i][2]))
+                   for i in eachindex(μ_geom)]
+
+        # --- the spherical solver, for each I_scheme and μ count ---
+        solver_out = Dict{String, Any}()
+        for I_scheme in ["linear_flux_only", "linear"], n_mu in [5, 20]
+            F, I, μ_grid, μ_weights = Korg.RadiativeTransfer.radiative_transfer(
+                alpha, S, radii, n_mu, true;
+                α_ref=alpha_ref, τ_ref=tau_ref,
+                I_scheme=I_scheme, τ_scheme="anchored")
+            n_inward = size(I, 1) - length(μ_grid)
+            surface_I = if I_scheme == "linear"
+                I[n_inward+1:end, :, 1]
+            else
+                I[n_inward+1:end, :]
+            end
+            solver_out["$(I_scheme)_$(n_mu)"] = Dict(
+                "flux" => Float64.(F),
+                "mu_grid" => Float64.(μ_grid),
+                "mu_weights" => Float64.(μ_weights),
+                "n_inward_rays" => n_inward,
+                # surface_I is (n_mu × n_wavelengths); store row-per-μ
+                "surface_I" => [Float64.(surface_I[i, :]) for i in 1:size(surface_I, 1)],
+            )
+        end
+
+        # Plane-parallel flux for the same columns, so the thin-atmosphere
+        # limit can be checked against Julia on both sides of the comparison.
+        # (I_scheme="linear" avoids Korg's expint shortcut, which would change
+        # the quadrature rather than just the geometry.)
+        planar_out = Dict{String, Any}()
+        for n_mu in [5, 20]
+            F_planar, _, _, _ = Korg.RadiativeTransfer.radiative_transfer(
+                alpha, S, radii .- radii[end], n_mu, false;
+                α_ref=alpha_ref, τ_ref=tau_ref,
+                I_scheme="linear", τ_scheme="anchored")
+            planar_out["linear_$(n_mu)"] = Float64.(F_planar)
+        end
+
+        cases[label] = Dict(
+            "radii" => Float64.(radii),
+            "alpha_ref" => alpha_ref,
+            "alpha" => [Float64.(alpha[:, j]) for j in 1:size(alpha, 2)],
+            "thickness_over_radius" => Float64((radii[1] - radii[end]) / radii[end]),
+            "rays" => ray_out,
+            "solver" => solver_out,
+            "planar" => planar_out,
+        )
+    end
+
+    reference_data["spherical_radiative_transfer"] = Dict(
+        "inputs" => Dict(
+            "n_layers" => n_layers,
+            "tau_ref" => tau_ref,
+            "log_tau_ref" => log_tau_ref,
+            "S" => [Float64.(S[:, j]) for j in 1:size(S, 2)],
+            "mu_geom_n_points" => 7,
+        ),
+        "cases" => cases,
+    )
+end
+
+# =============================================================================
 # Blackbody / Planck function
 # =============================================================================
 println("  - blackbody...")
@@ -1146,9 +1427,21 @@ let
 end
 
 # =============================================================================
+# Provenance
+# =============================================================================
+# Record which Korg.jl produced this file. tests/test_julia_reference.py asserts
+# this matches EXPECTED_KORG_VERSION, so stale reference data is a test failure
+# rather than a silent comparison against the wrong physics.
+reference_data["metadata"] = Dict(
+    "korg_version" => string(pkgversion(Korg)),
+    "julia_version" => string(VERSION),
+)
+println("\nGenerated with Korg.jl v$(pkgversion(Korg)) on Julia v$(VERSION)")
+
+# =============================================================================
 # Save to JSON
 # =============================================================================
-println("\nSaving to $output_file...")
+println("Saving to $output_file...")
 open(output_file, "w") do f
     JSON.print(f, reference_data, 2)  # 2-space indentation
 end

@@ -18,8 +18,25 @@ from .data_loader import (gauntff_table, gauntff_log10_gamma2, gauntff_log10_u,
                           HI_bf_cross_sections,
                           get_metal_bf_cross_sections)
 from .statmech import hummer_mihalas_w
+from .continuum_absorption.bounds_checking import (
+    in_bounds_mask, clamp_to_bound,
+    HMINUS_BF_NU_BOUND, HMINUS_BF_TEMP_BOUND,
+    HMINUS_FF_NU_BOUND, HMINUS_FF_TEMP_BOUND,
+    H2PLUS_NU_BOUND, H2PLUS_TEMP_BOUND,
+    HEMINUS_FF_NU_BOUND, HEMINUS_FF_TEMP_BOUND,
+)
 from . import stancil1994
 from . import peach1970
+
+# Strictly positive stand-ins used to fold out-of-bounds inputs onto something the
+# arithmetic can survive before the bounds mask discards it.  See
+# bounds_checking.clamp_to_bound for why zero is not an acceptable substitute.
+# These only ever apply where a bound reaches down to 0 (currently only H⁻ bf,
+# whose temperature bound is (0, ∞)); every other bound has a positive lower end
+# that is used instead.  1000 K is Korg's documented practical floor for the H⁻
+# Saha expression — below it exp(χ/kT) overflows to inf and poisons the cotangent.
+_NU_FLOOR = 1.0        # Hz
+_TEMP_FLOOR = 1000.0   # K
 
 
 # H⁻ ionization energy in eV (from McLaughlin+ 2017)
@@ -257,7 +274,10 @@ def ndens_Hminus(nH_I_div_partition, ne, T, ion_energy=_H_MINUS_ION_ENERGY):
     nHI_groundstate = 2.0 * nH_I_div_partition
 
     # Coefficient: (h²/(2πm))^1.5 where m is electron mass
-    coef = 3.31283018e-22  # cm³·eV^1.5
+    # See absorption_h_minus._ndens_Hminus: derived from constants rather than carried as
+    # Korg.jl v1.1's literal, which is high by 9.2e-7 relative to what v1.2 computes.
+    coef = (hplanck_cgs ** 2 * kboltz_eV
+            / (2 * jnp.pi * electron_mass_cgs * kboltz_cgs)) ** 1.5
 
     # β = 1/(k·T) in eV units
     beta = 1.0 / (kboltz_eV * T)
@@ -320,7 +340,15 @@ def Hminus_bf_cross_section(nu):
     # Coefficient from matching at table minimum
     sigma_at_min = _Hminus_bf_sigma_jax[0]
     coef = sigma_at_min / jnp.power(_Hminus_min_nu - _Hminus_ion_nu, 1.5)
-    sigma_extrap = coef * jnp.power(nu - _Hminus_ion_nu, 1.5)
+    # (ν - ν_ion) is negative below the detachment threshold, and a negative base
+    # raised to 1.5 is NaN.  The jnp.where below masks that *value*, but reverse-mode
+    # AD still pushes a cotangent through this branch and 0 * NaN is NaN — masking a
+    # NaN does not mask its gradient.  Substitute a strictly positive stand-in before
+    # the power (1.0 Hz; zero would not do, since d/dx x^1.5 = 1.5√x is fine at 0 but
+    # the *outer* division by the stand-in is not).  For ν > ν_ion the stand-in is the
+    # real value, so every selected σ is bit-for-bit unchanged.
+    delta_nu = jnp.where(nu > _Hminus_ion_nu, nu - _Hminus_ion_nu, 1.0)
+    sigma_extrap = coef * jnp.power(delta_nu, 1.5)
 
     # Select appropriate value based on frequency range
     result = jnp.where(below_threshold, 0.0,
@@ -358,6 +386,11 @@ def Hminus_bf(nu, T, nH_I_div_partition, ne):
     The number density of H⁻ is computed on the fly using the Saha equation,
     assuming n(H⁻) << n(H I) + n(H II).
 
+    Korg.jl wraps this source in ``bounds_checked_absorption`` with
+    ``ν_bound = closed_interval(0, 2.417989242625068e19)`` and an unrestricted
+    temperature; outside that range it returns exactly 0 rather than
+    extrapolating.  Korg.px does the same.
+
     Reference
     ---------
     McLaughlin+ 2017: https://ui.adsabs.harvard.edu/abs/2017JPhB...50k4001M
@@ -365,17 +398,21 @@ def Hminus_bf(nu, T, nH_I_div_partition, ne):
     # Convert to JAX arrays
     nu = jnp.asarray(nu)
 
+    mask = in_bounds_mask(nu, T, HMINUS_BF_NU_BOUND, HMINUS_BF_TEMP_BOUND)
+    nu_safe = clamp_to_bound(nu, HMINUS_BF_NU_BOUND, _NU_FLOOR)
+    T_safe = clamp_to_bound(T, HMINUS_BF_TEMP_BOUND, _TEMP_FLOOR)
+
     # Get cross-section in cm²
-    cross_section = Hminus_bf_cross_section(nu)
+    cross_section = Hminus_bf_cross_section(nu_safe)
 
     # Stimulated emission correction
-    stimulated_emission = 1.0 - jnp.exp(-hplanck_cgs * nu / (kboltz_cgs * T))
+    stimulated_emission = 1.0 - jnp.exp(-hplanck_cgs * nu_safe / (kboltz_cgs * T_safe))
 
     # H⁻ number density from Saha equation
-    n_Hminus = ndens_Hminus(nH_I_div_partition, ne, T)
+    n_Hminus = ndens_Hminus(nH_I_div_partition, ne, T_safe)
 
     # α = σ * n * (1 - exp(-hν/kT))
-    return n_Hminus * cross_section * stimulated_emission
+    return jnp.where(mask, n_Hminus * cross_section * stimulated_emission, 0.0)
 
 
 def Hminus_ff(nu, T, nH_I_div_partition, ne):
@@ -412,7 +449,9 @@ def Hminus_ff(nu, T, nH_I_div_partition, ne):
     - Ground-state H I number density: n(H I, n=1) = 2 * n(H I) / U(T)
 
     The table has wavelength range 1823-151890 Å and temperature (θ = 5040/T)
-    range 0.5-3.6, corresponding to T = 1400-10080 K.
+    range 0.5-3.6, corresponding to T = 1400-10080 K.  Outside either range this
+    returns exactly 0, matching Korg.jl's ``bounds_checked_absorption`` wrapper
+    (``absorption_H.jl:326``) rather than extrapolating off the end of the table.
 
     Reference
     ---------
@@ -420,6 +459,11 @@ def Hminus_ff(nu, T, nH_I_div_partition, ne):
     """
     # Convert frequency to wavelength in Angstroms
     nu = jnp.asarray(nu)
+
+    mask = in_bounds_mask(nu, T, HMINUS_FF_NU_BOUND, HMINUS_FF_TEMP_BOUND)
+    nu = clamp_to_bound(nu, HMINUS_FF_NU_BOUND, _NU_FLOOR)
+    T = clamp_to_bound(T, HMINUS_FF_TEMP_BOUND, _TEMP_FLOOR)
+
     lambda_angstrom = c_cgs * 1e8 / nu
 
     # Convert temperature to θ = 5040/T
@@ -470,7 +514,7 @@ def Hminus_ff(nu, T, nH_I_div_partition, ne):
     nHI_groundstate = 2.0 * nH_I_div_partition
 
     # α = K * P_e * n(H I, n=1)
-    return K * P_e * nHI_groundstate
+    return jnp.where(mask, K * P_e * nHI_groundstate, 0.0)
 
 
 def simple_hydrogen_bf_cross_section(n, nu):
@@ -676,8 +720,20 @@ def H_I_bf(nu, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
             # For nu >= nu_break: fully dissolved
             # For nu < nu_break: compute dissolution using MHD
             def compute_dissolution(nu_val):
-                # Effective quantum number for absorbed photon
-                n_eff = 1.0 / jnp.sqrt(1.0 / (n * n) - hplanck_eV * nu_val / chi_ion)
+                # Effective quantum number of the level the electron is excited to.
+                # The radicand 1/n² - hν/χ is only positive below the series limit
+                # (ν < nu_break); at or above it the electron is unbound and there is
+                # no upper level.  The result is discarded by the jnp.where below, but
+                # reverse-mode AD still pushes a cotangent through this branch, and a
+                # cotangent multiplied by a NaN is NaN — masking a NaN does not mask
+                # its gradient.  So clamp the radicand to a small positive floor
+                # *before* the square root (the standard "double where" trick).  The
+                # floor is never active for ν < nu_break in any regime of interest: it
+                # caps n_eff at 1e5, for which the upper level is already completely
+                # dissolved (w_upper underflows to exactly 0), so the selected values
+                # are bit-for-bit unchanged.
+                radicand = 1.0 / (n * n) - hplanck_eV * nu_val / chi_ion
+                n_eff = 1.0 / jnp.sqrt(jnp.maximum(radicand, 1e-10))
 
                 # Occupation probability for upper level
                 w_upper = hummer_mihalas_w(
@@ -724,6 +780,29 @@ def H_I_bf(nu, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
     return result[0] if is_scalar else result
 
 
+def _H2plus_bf_and_ff(nu, T, nH_I, nH_II):
+    """
+    Raw H₂⁺ bf+ff kernel, without bounds checking.
+
+    This is Korg.jl's ``_H2plus_bf_and_ff`` (``absorption_H.jl``): the Stancil
+    1994 tables are extrapolated freely, which can return *negative* absorption
+    below the tabulated temperature floor (e.g. -3.1e-11 cm⁻¹ at T = 3000 K).
+    Use :func:`H2plus_bf_and_ff` unless you specifically want the unclamped
+    interpolant.
+    """
+    nu = jnp.asarray(nu)
+    λ_angstrom = c_cgs * 1e8 / nu
+
+    K = stancil1994.K_H2plus(T)
+    σ_bf = stancil1994.σ_H2plus_bf(λ_angstrom, T)
+    σ_ff = stancil1994.σ_H2plus_ff(λ_angstrom, T)
+
+    beta_eV = 1.0 / (kboltz_eV * T)
+    stimulated_emission = 1.0 - jnp.exp(-hplanck_eV * nu * beta_eV)
+
+    return (σ_bf / K + σ_ff) * nH_I * nH_II * stimulated_emission
+
+
 def H2plus_bf_and_ff(nu, T, nH_I, nH_II):
     """
     Combined H₂⁺ bound-free and free-free linear absorption coefficient.
@@ -754,36 +833,31 @@ def H2plus_bf_and_ff(nu, T, nH_I, nH_II):
     the equilibrium constant K from Stancil 1994. The cross-sections have
     units of cm⁵ because they must be multiplied by n(H I) and n(H II).
 
-    Valid ranges:
+    Valid ranges (outside which this returns exactly 0, matching Korg.jl's
+    ``bounds_checked_absorption`` wrapper at ``absorption_H.jl:378``):
     - Temperature: 3150-25200 K
-    - Wavelength: 700-200000 Å (bf), 500-200000 Å (ff)
+    - Wavelength: 700-200000 Å
 
     The absorption coefficient is:
     α = (σ_bf/K + σ_ff) × n(H I) × n(H II) × (1 - exp(-hν/kT))
 
     where K = n(H I) × n(H II) / n(H₂⁺).
 
+    See Also
+    --------
+    _H2plus_bf_and_ff : the same expression without bounds checking.
+
     Reference
     ---------
     Stancil 1994: https://ui.adsabs.harvard.edu/abs/1994ApJ...430..360S/abstract
     """
-    # Convert frequency to wavelength in Angstroms
     nu = jnp.asarray(nu)
-    λ_angstrom = c_cgs * 1e8 / nu
 
-    # Get equilibrium constant and cross-sections
-    K = stancil1994.K_H2plus(T)
-    σ_bf = stancil1994.σ_H2plus_bf(λ_angstrom, T)
-    σ_ff = stancil1994.σ_H2plus_ff(λ_angstrom, T)
+    mask = in_bounds_mask(nu, T, H2PLUS_NU_BOUND, H2PLUS_TEMP_BOUND)
+    nu_safe = clamp_to_bound(nu, H2PLUS_NU_BOUND, _NU_FLOOR)
+    T_safe = clamp_to_bound(T, H2PLUS_TEMP_BOUND, _TEMP_FLOOR)
 
-    # Stimulated emission correction
-    beta_eV = 1.0 / (kboltz_eV * T)
-    stimulated_emission = 1.0 - jnp.exp(-hplanck_eV * nu * beta_eV)
-
-    # Combined absorption coefficient
-    # (σ_bf/K + σ_ff) has units of cm²
-    # Multiply by n(H I) × n(H II) to get cm⁻¹
-    return (σ_bf / K + σ_ff) * nH_I * nH_II * stimulated_emission
+    return jnp.where(mask, _H2plus_bf_and_ff(nu_safe, T_safe, nH_I, nH_II), 0.0)
 
 
 # He I state energies and degeneracies
@@ -897,6 +971,12 @@ def Heminus_ff(nu, T, nHe_I_div_partition, ne):
     Valid wavelength range: 5063-151878 Å
     Valid temperature range (θ = 5040/T): 0.5-3.6, corresponding to T = 1400-10080 K
 
+    Outside either range this returns exactly 0, matching Korg.jl's
+    ``bounds_checked_absorption`` wrapper (``absorption_He.jl:93``).  Note that
+    ν = c/5.063e-5 (i.e. λ = 5063 Å exactly) falls *just* outside the frequency
+    bound: Korg's ``λ_to_ν_bound`` nudge is lost to rounding in the c/λ division
+    at that endpoint.  Korg.px reproduces that quirk bit-for-bit.
+
     According to John (1994), improved calculations are unlikely to alter
     the tabulated data for λ > 10000 Å by more than about 2%. The errors
     for 5063 Å ≤ λ ≤ 10000 Å are expected to be well below 10%.
@@ -907,6 +987,11 @@ def Heminus_ff(nu, T, nHe_I_div_partition, ne):
     """
     # Convert frequency to wavelength in Angstroms
     nu = jnp.asarray(nu)
+
+    mask = in_bounds_mask(nu, T, HEMINUS_FF_NU_BOUND, HEMINUS_FF_TEMP_BOUND)
+    nu = clamp_to_bound(nu, HEMINUS_FF_NU_BOUND, _NU_FLOOR)
+    T = clamp_to_bound(T, HEMINUS_FF_TEMP_BOUND, _TEMP_FLOOR)
+
     lambda_angstrom = c_cgs * 1e8 / nu
 
     # Convert temperature to θ = 5040/T
@@ -956,11 +1041,8 @@ def Heminus_ff(nu, T, nHe_I_div_partition, ne):
     #              = n(He I) / U(T)
     nHeI_groundstate = ndens_state_He_I(1, nHe_I_div_partition, T)
 
-    # Return 0 outside valid wavelength range (5063-151878 Å), matching Julia's bounds_checked_absorption
-    in_bounds = (lambda_angstrom >= 5063.0) & (lambda_angstrom <= 151878.0)
-
     # α = K * P_e * n(He I, n=1)
-    return jnp.where(in_bounds, K * P_e * nHeI_groundstate, 0.0)
+    return jnp.where(mask, K * P_e * nHeI_groundstate, 0.0)
 
 
 def electron_scattering(ne):
@@ -1117,8 +1199,13 @@ def _parse_species_charge(species_name):
         'X': 9
     }
 
-    # Split on underscore and get the ionization stage
-    parts = species_name.split('_')
+    # Number-density dicts are keyed 'Fe_I' by synthesis but 'Fe I'/Species('Fe I')
+    # elsewhere; metal_bf_absorption already accommodates both. Normalise here too,
+    # otherwise every ion silently parses as neutral and positive_ion_ff_absorption
+    # contributes nothing.
+    if not isinstance(species_name, str):
+        species_name = str(species_name)
+    parts = species_name.replace(' ', '_').split('_')
     if len(parts) == 2:
         roman = parts[1]
         return roman_to_charge.get(roman, 0)
@@ -1279,13 +1366,20 @@ def metal_bf_absorption(nu, T, number_densities):
     logT = jnp.log10(T)
 
     for species_name, ndens in number_densities.items():
+        # The cross-section tables are keyed 'Fe I' (with a space), but the rest of the
+        # package keys number densities 'Fe_I' (with an underscore) — see
+        # synthesis.compute_continuum_absorption. Accept either spelling; without this
+        # every metal bf contribution is silently dropped from total_continuum_absorption.
+        table_key = species_name
+        if table_key not in species_data:
+            table_key = species_name.replace('_', ' ')
         # Skip if no data for this species
-        if species_name not in species_data:
+        if table_key not in species_data:
             continue
 
         # Get cross-section table for this species
         # Shape: (n_logT, n_nu), values are ln(σ in Mb)
-        log_sigma_table = species_data[species_name]
+        log_sigma_table = species_data[table_key]
 
         # Bilinear interpolation in (nu, logT) space
         # Find indices for frequency
@@ -1386,6 +1480,14 @@ def total_continuum_absorption(nu, T, ne, number_densities, partition_funcs):
     # Initialize total absorption
     alpha = jnp.zeros_like(nu)
 
+    # Accept 'Fe_I', 'Fe I' or Species('Fe I') as keys — synthesis uses the first,
+    # standalone callers and the Julia-reference fixtures use the others. Without
+    # this every lookup below silently falls back to 0.
+    number_densities = {
+        (k if isinstance(k, str) else str(k)).replace(' ', '_'): v
+        for k, v in number_densities.items()
+    }
+
     # Get commonly used number densities
     nH_I = number_densities.get('H_I', 0.0)
     nH_II = number_densities.get('H_II', 0.0)
@@ -1432,7 +1534,7 @@ def total_continuum_absorption(nu, T, ne, number_densities, partition_funcs):
     return alpha
 
 
-# Fixed species lists for fast batch continuum (order must match prepare_continuum_batch output)
+# Fixed species lists for fast batch continuum (order must match prepare_continuum_batch_fast output)
 _PEACH_SPECIES = ['He_II', 'C_II', 'Si_II', 'Mg_II']
 
 
@@ -1511,82 +1613,12 @@ def _total_continuum_fast(nu, T, ne, U_H_I, U_He_I,
     return alpha
 
 
-def prepare_continuum_batch(number_densities_list, partition_funcs, T_arr):
-    """
-    Pre-extract per-layer continuum inputs from chemical equilibrium results.
-
-    Returns numpy arrays suitable for _total_continuum_fast via vmap.
-    Called once after all chemical equilibria are solved.
-    """
-    import numpy as np
-    from .peach1970 import DEPARTURE_COEFFICIENTS
-
-    n_layers = len(number_densities_list)
-
-    # Build ordered metal BF species list from cross-section data
-    bf_data = get_metal_bf_cross_sections()
-    metal_species_order = list(bf_data['species'].keys())
-    n_metal = len(metal_species_order)
-    nu_grid = bf_data['nu_grid']
-    logT_grid = bf_data['logT_grid']
-    metal_bf_tables = jnp.stack([bf_data['species'][s] for s in metal_species_order])
-
-    # Identify which species keys map to which continuum inputs
-    # Keys in number_densities use string format 'H_I', 'Fe_II', etc.
-    def sp_key(sp):
-        return str(sp).replace(' ', '_')
-
-    # Pre-evaluate partition functions at each T
-    pf_H_I = next((v for k, v in partition_funcs.items() if sp_key(k) == 'H_I'), None)
-    pf_He_I = next((v for k, v in partition_funcs.items() if sp_key(k) == 'He_I'), None)
-    U_H_I_arr = np.array([float(pf_H_I(np.log(T))) for T in T_arr]) if pf_H_I else np.ones(n_layers)
-    U_He_I_arr = np.array([float(pf_He_I(np.log(T))) for T in T_arr]) if pf_He_I else np.ones(n_layers)
-
-    # Per-layer density arrays
-    nH_I_arr = np.zeros(n_layers); nH_II_arr = np.zeros(n_layers)
-    nHe_I_arr = np.zeros(n_layers); nH2_arr = np.zeros(n_layers)
-    n_peach_arr = np.zeros((n_layers, 4))
-    n_Z1_ff_arr = np.zeros(n_layers); n_Z2_ff_arr = np.zeros(n_layers)
-    metal_bf_dens_arr = np.zeros((n_layers, n_metal))
-
-    peach_keys = _PEACH_SPECIES  # ['He_II', 'C_II', 'Si_II', 'Mg_II']
-
-    for i, nd in enumerate(number_densities_list):
-        nd_str = {sp_key(k): v for k, v in nd.items()}
-        nH_I_arr[i] = nd_str.get('H_I', 0.0)
-        nH_II_arr[i] = nd_str.get('H_II', 0.0)
-        nHe_I_arr[i] = nd_str.get('He_I', 0.0)
-        nH2_arr[i] = nd_str.get('H2', 0.0)
-        for j, pk in enumerate(peach_keys):
-            n_peach_arr[i, j] = nd_str.get(pk, 0.0)
-        for j, ms in enumerate(metal_species_order):
-            metal_bf_dens_arr[i, j] = nd_str.get(ms, 0.0)
-        # Z=1 FF (non-Peach) and Z=2 FF
-        for key, val in nd_str.items():
-            charge = _parse_species_charge(key)
-            if charge == 1 and key not in peach_keys and key != 'H_II':
-                n_Z1_ff_arr[i] += val
-            elif charge == 2:
-                n_Z2_ff_arr[i] += val
-        # Add H_II to Z=1 (it's the most important)
-        n_Z1_ff_arr[i] += nd_str.get('H_II', 0.0)
-
-    return dict(
-        U_H_I=jnp.array(U_H_I_arr),
-        U_He_I=jnp.array(U_He_I_arr),
-        nH_I=jnp.array(nH_I_arr),
-        nH_II=jnp.array(nH_II_arr),
-        nHe_I=jnp.array(nHe_I_arr),
-        nH2=jnp.array(nH2_arr),
-        n_peach=jnp.array(n_peach_arr),
-        n_Z1_ff=jnp.array(n_Z1_ff_arr),
-        n_Z2_ff=jnp.array(n_Z2_ff_arr),
-        metal_bf_dens=jnp.array(metal_bf_dens_arr),
-        metal_bf_tables=metal_bf_tables,
-        nu_grid=jnp.array(nu_grid),
-        logT_grid=jnp.array(logT_grid),
-    )
-
+# ``prepare_continuum_batch`` used to sit here: the same preparation as the ``_fast``
+# version below, but reading dict-keyed number densities instead of pre-extracted raw
+# arrays.  It was orphaned when the custom-data chemistry branch was unified onto the
+# batched path, and was still imported by synthesis.py while never being called --
+# which is why it showed as a 90-line uncovered block.  Deleted; ``_fast`` is the one
+# implementation.
 
 # Vmapped version: compute continuum for all layers at once
 _batch_continuum_vmap = jax.vmap(
@@ -1623,7 +1655,7 @@ def _get_metal_bf_idx():
 
 def prepare_continuum_batch_fast(raw_arrays_list, partition_funcs, T_arr):
     """
-    Fast version of prepare_continuum_batch using pre-extracted raw density arrays.
+    Prepare per-layer continuum inputs from pre-extracted raw density arrays.
 
     raw_arrays_list: list of {'neutral_dens': (92,), 'ionized_dens': (92,),
                                'doubly_ionized_dens': (92,), 'mol_dens': (n_mol,)} dicts
@@ -1722,7 +1754,7 @@ def batch_continuum_absorption(nu, T_arr, ne_arr, batch_inputs):
     ne_arr : array (n_layers,)
         Electron density per layer
     batch_inputs : dict
-        Output of prepare_continuum_batch()
+        Output of prepare_continuum_batch_fast()
 
     Returns
     -------

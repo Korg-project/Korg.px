@@ -3,8 +3,8 @@ Wavelength handling utilities.
 
 Provides:
 - Wavelengths class for managing wavelength grids
-- Conversion between air and vacuum wavelengths using the
-  Birch and Downs (1994) formula via the VALD website.
+- Re-exports of ``air_to_vacuum``/``vacuum_to_air`` from ``korg.utils``
+  (Birch and Downs 1994, via the VALD website).
 
 Reference: Korg.jl wavelengths.jl
 """
@@ -16,102 +16,10 @@ from bisect import bisect_left, bisect_right
 from .constants import c_cgs
 
 
-def air_to_vacuum(wavelength, cgs=None):
-    """
-    Convert wavelength from air to vacuum.
-
-    Parameters
-    ----------
-    wavelength : float or array
-        Wavelength value(s). Assumed to be in Å if >= 1, in cm otherwise.
-    cgs : bool, optional
-        If True, treat wavelength as in cm. If False, treat as Å.
-        If None (default), auto-detect based on wavelength >= 1.
-
-    Returns
-    -------
-    float or array
-        Wavelength in vacuum (same units as input).
-
-    Notes
-    -----
-    Formula from Birch and Downs (1994) via the VALD website.
-    """
-    wavelength = np.asarray(wavelength)
-    scalar_input = wavelength.ndim == 0
-    wavelength = np.atleast_1d(wavelength)
-
-    # Auto-detect units if not specified
-    if cgs is None:
-        cgs = np.all(wavelength < 1)
-
-    lam = wavelength.copy()
-    if cgs:
-        lam = lam * 1e8  # cm to Å
-
-    # Calculate refractive index
-    s = 1e4 / lam
-    n = (1 + 0.00008336624212083 +
-         0.02408926869968 / (130.1065924522 - s**2) +
-         0.0001599740894897 / (38.92568793293 - s**2))
-
-    # Convert back to original units if needed
-    result = lam * n
-    if cgs:
-        result = result * 1e-8  # Å to cm
-
-    if scalar_input:
-        return float(result[0])
-    return result
-
-
-def vacuum_to_air(wavelength, cgs=None):
-    """
-    Convert wavelength from vacuum to air.
-
-    Parameters
-    ----------
-    wavelength : float or array
-        Wavelength value(s). Assumed to be in Å if >= 1, in cm otherwise.
-    cgs : bool, optional
-        If True, treat wavelength as in cm. If False, treat as Å.
-        If None (default), auto-detect based on wavelength >= 1.
-
-    Returns
-    -------
-    float or array
-        Wavelength in air (same units as input).
-
-    Notes
-    -----
-    Formula from Birch and Downs (1994) via the VALD website.
-    """
-    wavelength = np.asarray(wavelength)
-    scalar_input = wavelength.ndim == 0
-    wavelength = np.atleast_1d(wavelength)
-
-    # Auto-detect units if not specified
-    if cgs is None:
-        cgs = np.all(wavelength < 1)
-
-    lam = wavelength.copy()
-    if cgs:
-        lam = lam * 1e8  # cm to Å
-
-    # Calculate refractive index
-    s = 1e4 / lam
-    n = (1 + 0.0000834254 +
-         0.02406147 / (130 - s**2) +
-         0.00015998 / (38.9 - s**2))
-
-    # Convert back to original units if needed
-    result = lam / n
-    if cgs:
-        result = result * 1e-8  # Å to cm
-
-    if scalar_input:
-        return float(result[0])
-    return result
+# The air/vacuum conversions live in ``korg.utils`` (one implementation, as in
+# Korg.jl's utils.jl). They are re-exported here so that
+# ``korg.wavelengths.air_to_vacuum`` keeps working.
+from .utils import air_to_vacuum, vacuum_to_air  # noqa: E402,F401
 
 
 class Wavelengths:

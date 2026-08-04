@@ -7,12 +7,15 @@ intensity integration, and flux computation.
 Reference: Korg.jl RadiativeTransfer module
 """
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import jit
 
 from .optical_depth import compute_tau_anchored, compute_tau_direct, compute_tau_bezier
 from .intensity import (compute_I_linear_flux_only, compute_F_flux_only_expint,
                          compute_I_linear, compute_I_bezier, compute_flux_from_intensities)
+from .spherical import spherical_ray_flux
 
 
 def leggauss(n):
@@ -28,19 +31,26 @@ def leggauss(n):
     -------
     nodes : array, shape (n_mu, )
     weights : array, shape (n_mu, )
+
+    Notes
+    -----
+    Computed on the host with NumPy rather than in JAX. ``n`` sets an array
+    shape, so it can never be a traced value, and nothing differentiates with
+    respect to quadrature nodes — so there was nothing to gain from tracing this,
+    and something to lose. The previous implementation used Golub–Welsch
+    (``jnp.linalg.eigh`` of the Jacobi matrix), whose nodes come out ~4.5e-15
+    apart on LAPACK and cuSOLVER. That is unremarkable for a symmetric
+    eigensolver, but ``generate_mu_grid`` then forms ``0.5 * (x + 1)``, and for
+    the node nearest −1 that cancellation turns 4.5e-15 absolute into ~4e-13
+    relative — enough to make the grid disagree with Korg.jl by more than the
+    reference test's 1e-13 on GPU while passing on CPU.
+
+    ``np.polynomial.legendre.leggauss`` is backend-independent and agrees with
+    Korg.jl's ``FastGaussQuadrature.gausslegendre`` to 1.6e-14 on the
+    transformed grid.
     """
-    # Companion matrix for Legendre polynomials
-    i = jnp.arange(1, n)
-    beta = i / jnp.sqrt(4 * i**2 - 1)
-
-    # Symmetric tridiagonal matrix
-    T = jnp.diag(beta, -1) + jnp.diag(beta, 1)
-
-    # Eigenvalues are nodes, eigenvectors give weights
-    nodes, V = jnp.linalg.eigh(T)
-    weights = 2 * V[0, :]**2
-
-    return nodes, weights
+    nodes, weights = np.polynomial.legendre.leggauss(n)
+    return jnp.asarray(nodes), jnp.asarray(weights)
 
 
 def generate_mu_grid(n_mu=5):
@@ -51,12 +61,14 @@ def generate_mu_grid(n_mu=5):
 
     Parameters
     ----------
-    n_mu : int, optional
-        Number of quadrature points (default: 5)
-        More points = better accuracy but slower
+    n_mu : int or array_like, optional
+        Number of quadrature points (default: 5).
+        More points = better accuracy but slower.
+        An array of μ values may be given instead, in which case those values
+        are used directly and the integral is done with the trapezoid rule --
+        this mirrors Korg.jl's ``generate_mu_grid(μ_values)`` method.
 
     Returns
-    -------
     mu_points : array, shape (n_mu,)
         Quadrature points in [0, 1]
     mu_weights : array, shape (n_mu,)
@@ -67,6 +79,17 @@ def generate_mu_grid(n_mu=5):
     Uses Gauss-Legendre quadrature on [0, 1] interval.
     For n_mu=5, typical error in flux is < 0.1%.
     """
+    if np.ndim(n_mu) > 0:
+        # Explicit μ values: trapezoid weights, as in Korg.jl.
+        mu_points = jnp.asarray(n_mu)
+        if mu_points.size == 1:
+            return mu_points, jnp.ones_like(mu_points)
+        delta = jnp.diff(mu_points)
+        mu_weights = 0.5 * jnp.concatenate(
+            [delta[:1], delta[:-1] + delta[1:], delta[-1:]]
+        )
+        return mu_points, mu_weights
+
     # Get Gauss-Legendre quadrature on [-1, 1]
     # Then transform to [0, 1]
     points, weights = leggauss(n_mu)
@@ -155,7 +178,20 @@ def radiative_transfer_single_wavelength(
 
     The emergent flux is the angle integral:
     F = 2π ∫₀¹ I(0, μ) μ dμ
+
+    In spherical geometry that last step is not a μ-quadrature over a slab:
+    each μ selects a ray with its own impact parameter and its own set of
+    intersected shells, and the flux is assembled from those rays.  See
+    :mod:`korg.radiative_transfer.spherical`.
     """
+    if spherical:
+        fluxes, intensities = radiative_transfer_spherical(
+            jnp.atleast_2d(alpha), jnp.atleast_2d(S), spatial_coord, log_tau_ref,
+            alpha_ref, n_mu=n_mu, tau_scheme=tau_scheme,
+            intensity_scheme=intensity_scheme,
+        )
+        return fluxes[0], intensities[0]
+
     # Step 1: Compute optical depth
     if tau_scheme == "anchored":
         # Anchored scheme: integrate dτ/d(log τ_ref) = α(λ) / α_ref * τ_ref
@@ -275,6 +311,15 @@ def radiative_transfer(
     >>> log_tau_ref = np.linspace(-4, 2, n_layers)
     >>> fluxes, _ = radiative_transfer(alpha, S_grid, spatial_coord, log_tau_ref)
     """
+    if spherical:
+        # Every ray is different in spherical geometry, so the whole
+        # calculation is vectorised over (wavelength, μ) at once rather than
+        # looped wavelength by wavelength.
+        return radiative_transfer_spherical(
+            alpha_grid, S_grid, spatial_coord, log_tau_ref, alpha_ref,
+            n_mu=n_mu, tau_scheme=tau_scheme, intensity_scheme=intensity_scheme,
+        )
+
     n_wavelengths = alpha_grid.shape[0]
 
     fluxes = []
@@ -305,6 +350,87 @@ def radiative_transfer(
         intensities = jnp.array(intensities_list)
     else:
         intensities = None
+
+    return fluxes, intensities
+
+
+def radiative_transfer_spherical(
+    alpha_grid,
+    S_grid,
+    radii,
+    log_tau_ref,
+    alpha_ref,
+    n_mu=5,
+    mu_grid=None,
+    mu_weights=None,
+    tau_scheme="anchored",
+    intensity_scheme="linear_flux_only",
+    R_photosphere=None,
+):
+    """
+    Solve radiative transfer in spherical (shell) geometry.
+
+    Port of the spherical branch of Korg.jl's ``radiative_transfer``.  Each
+    surface μ defines a ray with impact parameter ``b = r[0] sqrt(1 - μ²)``;
+    the optical depth is integrated along the ray's own path-length
+    coordinate, tangent rays (those that do not reach the innermost shell)
+    are seeded by an inward ray, and the emergent flux is assembled from the
+    rays.
+
+    Parameters
+    ----------
+    alpha_grid : array, shape (n_wavelengths, n_layers)
+        Absorption coefficient [cm⁻¹].
+    S_grid : array, shape (n_wavelengths, n_layers)
+        Source function.
+    radii : array, shape (n_layers,)
+        Radius from the stellar centre [cm], outermost layer first (the same
+        ordering Korg.jl uses, with ``tau_ref`` increasing).
+    log_tau_ref : array, shape (n_layers,)
+        log₁₀ of the reference optical depth.
+    alpha_ref : array, shape (n_layers,)
+        Absorption coefficient at the reference wavelength [cm⁻¹].
+    n_mu : int or array_like, optional
+        Number of Gauss-Legendre μ points, or explicit μ values
+        (default: 5).  Ignored if *mu_grid* is given.
+    mu_grid, mu_weights : array, optional
+        Explicit surface μ grid and quadrature weights.
+    tau_scheme : {'anchored', 'bezier'}, optional
+        Optical depth scheme (default: 'anchored').
+    intensity_scheme : {'linear_flux_only', 'linear', 'bezier'}, optional
+        Intensity scheme (default: 'linear_flux_only').  Korg.jl defaults to
+        ``'linear'`` for shell atmospheres; the two agree to round-off.
+    R_photosphere : float, optional
+        Photospheric radius [cm].  If given, the flux is rescaled from the
+        outermost radius to the photospheric radius by ``(r[0]/R)²``, which
+        is Korg.jl's ``photosphere_correction``.  Default: no rescaling, i.e.
+        the flux at ``radii[0]``, matching Korg.jl's low-level
+        ``radiative_transfer(α, S, radii, μ, true)``.
+
+    Returns
+    -------
+    fluxes : array, shape (n_wavelengths,)
+        Emergent astrophysical flux.
+    intensities : array, shape (n_wavelengths, n_mu)
+        Emergent intensity along each ray.
+
+    Examples
+    --------
+    >>> fluxes, intensities = radiative_transfer_spherical(
+    ...     alpha_grid, S_grid, radii, log_tau_ref, alpha_ref, n_mu=20)
+    """
+    if mu_grid is None:
+        mu_grid, mu_weights = generate_mu_grid(n_mu)
+    elif mu_weights is None:
+        mu_grid, mu_weights = generate_mu_grid(mu_grid)
+
+    fluxes, intensities = spherical_ray_flux(
+        alpha_grid, S_grid, radii, log_tau_ref, alpha_ref, mu_grid, mu_weights,
+        tau_scheme=tau_scheme, intensity_scheme=intensity_scheme,
+    )
+
+    if R_photosphere is not None:
+        fluxes = fluxes * (jnp.asarray(radii)[0] / R_photosphere) ** 2
 
     return fluxes, intensities
 
@@ -427,7 +553,3 @@ def radiative_transfer_jit(
     fluxes = jax.vmap(solve_one_wavelength)(alpha_grid, S_grid)
 
     return fluxes, None
-
-
-# Make jax available for vmap
-import jax

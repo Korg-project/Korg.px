@@ -2,12 +2,19 @@
 Species and Formula types for representing atoms and molecules.
 """
 
+import re
 import numpy as np
 from typing import Union, List
 from dataclasses import dataclass
 from .atomic_data import atomic_symbols, atomic_numbers, atomic_masses, MAX_ATOMIC_NUMBER
 
 MAX_ATOMS_PER_MOLECULE = 6
+
+# Matches Korg.jl's `roman_numerals` in species.jl.
+ROMAN_NUMERALS = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
+
+# Julia: split(code, [' ', '.', '_']).  "-" can't be a separator (minus signs).
+_SPECIES_SEPARATORS = re.compile(r"[ ._]")
 
 @dataclass(frozen=True)
 class Formula:
@@ -127,10 +134,15 @@ class Formula:
         return atoms_arr[first_nonzero:]
 
     def get_atom(self) -> int:
-        """Returns the atomic number (only valid for single atoms, not molecules)."""
+        """Returns the atomic number (only valid for single atoms, not molecules).
+
+        The result is a Python ``int``, not a ``np.uint8``: the atom vector is
+        stored as uint8, and under NEP 50 an expression like ``Z * 100`` on a
+        uint8 wraps around silently.
+        """
         if self.is_molecule():
             raise ValueError("Can't get the atomic number of a molecule. Use get_atoms() instead.")
-        return self.get_atoms()[0]
+        return int(self.get_atoms()[0])
 
     def n_atoms(self) -> int:
         """Returns the number of atoms in the formula."""
@@ -138,7 +150,7 @@ class Formula:
 
     def is_molecule(self) -> bool:
         """Returns True if this formula represents a molecule (more than one atom)."""
-        return self.atoms[MAX_ATOMS_PER_MOLECULE - 2] != 0
+        return bool(self.atoms[MAX_ATOMS_PER_MOLECULE - 2] != 0)
 
     def get_mass(self) -> float:
         """Returns the mass in grams."""
@@ -230,8 +242,12 @@ class Species:
         if isinstance(formula_input, (str, float)):
             # Parse species code
             formula, parsed_charge = self._parse_species_code(str(formula_input))
+            charge = parsed_charge if charge is None else int(charge)
+            if charge < -1:
+                raise ValueError(f"Can't construct a species with charge < -1: "
+                                 f"{formula} with charge {charge}")
             object.__setattr__(self, 'formula', formula)
-            object.__setattr__(self, 'charge', parsed_charge if charge is None else charge)
+            object.__setattr__(self, 'charge', charge)
         else:
             # Direct construction
             if not isinstance(formula_input, Formula):
@@ -249,34 +265,30 @@ class Species:
         return cls(code)
 
     def _parse_species_code(self, code: str) -> tuple:
-        """Parse a species code string into (Formula, charge)."""
-        code = code.strip().lstrip('0').strip()
+        """
+        Parse a species code string into (Formula, charge).
 
-        # Handle + and - suffixes
+        This mirrors ``Korg.Species(code::AbstractString)`` in Korg.jl's
+        ``species.jl`` statement for statement.
+        """
+        # Julia: strip(code, ['0', ' ']) -- leading *and trailing* 0s and spaces
+        # are safe to remove. This is what makes "02.1000" parse as He II.
+        code = code.strip(' 0')
+
+        # If the species ends in "+" or "-", convert it to a numerical charge.
+        # The ionization number is charge+1, so "H 0" is H⁻ and "H 2" is H⁺.
         if code.endswith('+'):
-            code = code[:-1].strip() + " 2"
+            code = code[:-1] + " 2"
         elif code.endswith('-'):
-            code = code[:-1].strip() + " 0"
+            code = code[:-1] + " 0"
 
-        # Split on separators
-        separators = [' ', '.', '_']
-        for sep in separators:
-            if sep in code:
-                parts = [p for p in code.split(sep) if p]
-                break
-        else:
-            # No separator found
-            # Try to parse as float to detect format like "26.01"
-            try:
-                float_val = float(code)
-                int_part = int(float_val)
-                frac_part = int(round((float_val - int_part) * 100))
-                formula = Formula(int_part)
-                return formula, frac_part
-            except ValueError:
-                # Not a float, treat as formula without charge
-                parts = [code]
+        # Valid separators between the formula part and the charge part.
+        # Julia splits on all of them at once and drops empty tokens, so
+        # "01.01" parses the same as ".01..01.".
+        parts = [p for p in _SPECIES_SEPARATORS.split(code) if p]
 
+        if len(parts) == 0:
+            raise ValueError(f"{code!r} isn't a valid species code")
         if len(parts) > 2:
             raise ValueError(f"{code} isn't a valid species code")
 
@@ -288,17 +300,15 @@ class Species:
             # Parse charge
             charge_str = parts[1]
             # Check for Roman numerals
-            roman_numerals = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
-            if charge_str in roman_numerals:
-                charge = roman_numerals.index(charge_str)
+            if charge_str in ROMAN_NUMERALS:
+                charge = ROMAN_NUMERALS.index(charge_str)
             else:
                 charge = int(charge_str)
-                # If not a numeric code, subtract 1 (spectroscopic notation)
+                # If this is a Kurucz-style numeric code the charge is already
+                # correct, otherwise (spectroscopic notation) subtract 1.
                 try:
                     float(code)
-                    # Numeric code like "26.01" - charge is correct
                 except ValueError:
-                    # Spectroscopic notation like "Fe II" - subtract 1
                     charge -= 1
 
         return formula, charge
@@ -333,9 +343,8 @@ class Species:
             return formula_str
         elif self.charge == -1:
             return formula_str + "-"
-        elif 0 <= self.charge <= 9:
-            roman = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
-            return f"{formula_str} {roman[self.charge]}"
+        elif 0 <= self.charge <= len(ROMAN_NUMERALS) - 1:
+            return f"{formula_str} {ROMAN_NUMERALS[self.charge]}"
         else:
             return f"{formula_str} {self.charge}"
 

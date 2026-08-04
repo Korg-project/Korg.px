@@ -117,6 +117,9 @@ h5open(output_file, "w") do f
         na_number_densities[i] = n_Na_total / (1.0 + wII)
     end
     f["atmosphere/na_I_number_density"] = na_number_densities
+    # Provenance: which Korg.jl produced this reference.
+    attributes(f)["korg_version"] = string(pkgversion(Korg))
+    attributes(f)["julia_version"] = string(VERSION)
 end
 
 println("\n✓ Reference data saved to $output_file")

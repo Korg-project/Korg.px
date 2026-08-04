@@ -1,0 +1,50 @@
+site_name: Korg.px
+site_description: A JAX re-write of Korg.jl — differentiable, jit-compilable stellar spectral synthesis.
+repo_url: https://github.com/Korg-project/Korg.px
+repo_name: Korg-project/Korg.px
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.action.edit
+  palette:
+    # `!!! danger` and the admonition colours need both schemes defined, or the
+    # second one falls back to the first and the callouts lose their contrast.
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  # The docs use `!!!` admonitions and fenced code with language hints; without
+  # these two the callouts render as literal text.
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Overview: index.md
+  - Getting started: getting-started.md
+  - The synthesizer closure: the-synthesizer-closure.md
+  - Differences from Korg.jl: differences-from-korg-jl.md
+  - API reference: api-reference.md
+  - Voigt-Hjerting accuracy: voigt-hjerting-accuracy.md

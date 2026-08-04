@@ -7,7 +7,7 @@ tests/generate_solar_synthesis_reference.jl and committed as a CI artifact.
 These tests call korg.synthesize() as a black box with the same inputs Julia
 used and compare the continuum-normalised output.  The Na I line at 6000 Å
 is a simple, single-line case that exercises the full synthesis pipeline:
-  chemical_equilibrium → line_absorption → radiative_transfer
+  chemical_equilibrium_all_layers → line_absorption → radiative_transfer
 """
 
 from pathlib import Path
@@ -68,11 +68,13 @@ def python_result(julia_ref):
     wavelengths = julia_ref["wavelengths"]
     A_X = grevesse_2007_solar_abundances
 
-    result = korg.synthesize(atm, [na_line], wavelengths, A_X,
-                             hydrogen_lines=False, verbose=False)
-    cnorm = np.asarray(result.flux) / np.asarray(result.continuum)
-    return {"flux": np.asarray(result.flux), "continuum": np.asarray(result.continuum),
-            "cnorm": cnorm}
+    # ``synthesize`` returns ``(flux, continuum)``; it used to return a
+    # ``SynthesisResult`` and to take absolute number fractions. A_X here is
+    # already A(X), which is what it now requires.
+    flux, cntm = korg.synthesize(atm, [na_line], wavelengths, A_X,
+                                 hydrogen_lines=False)
+    flux, cntm = np.asarray(flux), np.asarray(cntm)
+    return {"flux": flux, "continuum": cntm, "cnorm": flux / cntm}
 
 
 # ---------------------------------------------------------------------------
@@ -151,21 +153,20 @@ class TestSynthesizeSelfConsistency:
 
         atm = korg.read_model_atmosphere(str(ATM_FILE))
         wls = np.linspace(5000.0, 5010.0, 50)
-        result = korg.synthesize(atm, [], wls, grevesse_2007_solar_abundances,
-                                 hydrogen_lines=False, verbose=False)
-        return result
+        flux, cntm = korg.synthesize(atm, [], wls, grevesse_2007_solar_abundances,
+                                     hydrogen_lines=False)
+        return np.asarray(flux), np.asarray(cntm)
 
     def test_empty_linelist_flux_equals_continuum(self, continuum_only):
         """With no lines, flux / continuum should be ≈ 1 everywhere."""
-        flux = np.asarray(continuum_only.flux)
-        cntm = np.asarray(continuum_only.continuum)
+        flux, cntm = continuum_only
         ratio = flux / cntm
         np.testing.assert_allclose(ratio, 1.0, atol=1e-3,
                                    err_msg="flux/continuum ≠ 1 for empty linelist")
 
     def test_continuum_positive_finite(self, continuum_only):
         """Continuum flux is always positive and finite."""
-        cntm = np.asarray(continuum_only.continuum)
+        _, cntm = continuum_only
         assert np.all(np.isfinite(cntm))
         assert np.all(cntm > 0)
 
@@ -183,12 +184,9 @@ class TestSynthesizeSelfConsistency:
         # A moderately strong Fe I line
         fe_line = create_line(5000.0, 0.0, "Fe I", 1.0)
 
-        result_line = korg.synthesize(atm, [fe_line], wls, A_X,
-                                      hydrogen_lines=False, verbose=False)
-        result_cntm = korg.synthesize(atm, [], wls, A_X,
-                                      hydrogen_lines=False, verbose=False)
-
-        cnorm = np.asarray(result_line.flux) / np.asarray(result_line.continuum)
+        flux_line, cntm_line = korg.synthesize(atm, [fe_line], wls, A_X,
+                                               hydrogen_lines=False)
+        cnorm = np.asarray(flux_line) / np.asarray(cntm_line)
         i_center = np.argmin(np.abs(wls - 5000.0))
 
         # Line should produce at least some absorption

@@ -172,14 +172,25 @@ def exponential_integral_1(x: float) -> float:
     Returns:
         E1(x) approximation
     """
+    # ``jnp.where`` masks the *value* of an unselected branch but not its cotangent,
+    # so every branch must be finite even where it is discarded. At x == 0 -- which
+    # really happens, because brackett_line_stark_profiles evaluates E1(y1) and E1(y2)
+    # on a wavelength grid that contains the line centre exactly, where y1 == y2 == 0
+    # -- ``-log(x)`` is +inf with derivative -inf and ``.../x`` is inf, and reverse-mode
+    # AD turns the masked 0 cotangent into 0 * inf == NaN. For x < 0, ``log(x)`` is NaN
+    # and ``exp(-x)`` overflows. Evaluating the dangerous sub-expressions at
+    # ``max(x, 1e-10)`` removes both hazards. 1e-10 is far below 0.01, the smallest x at
+    # which either branch is ever selected, so no *returned* value changes at all.
+    x_safe = jnp.maximum(x, 1e-10)
+
     # Compute all branches
     branch_neg = 0.0
-    branch_tiny = -jnp.log(jnp.maximum(x, 1e-10)) - 0.577215 + x  # Avoid log(0)
-    branch_small = (-jnp.log(x) - 0.57721566 +
+    branch_tiny = -jnp.log(x_safe) - 0.577215 + x  # Avoid log(0)
+    branch_small = (-jnp.log(x_safe) - 0.57721566 +
                     x * (0.99999193 + x * (-0.24991055 +
                          x * (0.05519968 + x * (-0.00976004 + x * 0.00107857)))))
-    branch_mid = ((x * (x + 2.334733) + 0.25062) /
-                  (x * (x + 3.330657) + 1.681534) / x * jnp.exp(-x))
+    branch_mid = ((x_safe * (x_safe + 2.334733) + 0.25062) /
+                  (x_safe * (x_safe + 3.330657) + 1.681534) / x_safe * jnp.exp(-x_safe))
     branch_large = 0.0
 
     # Use jnp.where to select the correct branch
@@ -303,8 +314,21 @@ def holtsmark_profile(beta: float, P: float) -> float:
     Returns:
         Holtsmark profile value
     """
+    # β enters the wing expressions only as 1/sqrt(β) and 1/β², both +inf at β == 0.
+    # β == 0 is reached in practice: brackett_line_stark_profiles evaluates this
+    # profile on a wavelength grid built by ``np.linspace`` around the line centre,
+    # which contains the centre exactly. The β <= 25.12 branch is the one selected
+    # there, but ``jnp.where`` masks only the *values* of the wing branches, not their
+    # cotangents, so reverse-mode AD computes 0 * inf == NaN and poisons the gradient
+    # of the branch that was actually selected. Evaluating the wing expressions at
+    # ``max(β, 1e-30)`` fixes that: β_wing**4 >= 1e-120 stays far above the float64
+    # underflow limit, and since no wing expression is ever *selected* below β = 8 the
+    # floor cannot change a returned value.
+    beta_wing = jnp.maximum(beta, 1e-30)
+    wing = (1.5 / jnp.sqrt(beta_wing) + 27 / beta_wing**2) / beta_wing**2
+
     # Very large β result
-    large_beta_result = (1.5 / jnp.sqrt(beta) + 27 / beta**2) / beta**2
+    large_beta_result = wing
 
     # Determine relevant Debye range
     # Julia: IM = min(Int(floor((5 * P) + 1)), 4) with 1-indexed arrays
@@ -340,9 +364,7 @@ def holtsmark_profile(beta: float, P: float) -> float:
                     0.0)
 
     # PR2: beta >= 8 ? value : 0.0
-    PR2 = jnp.where(beta >= 8,
-                    (1.5 / jnp.sqrt(beta) + 27 / beta**2) / beta**2,
-                    0.0)
+    PR2 = jnp.where(beta >= 8, wing, 0.0)
 
     small_beta_result = (PR1 * WT + PR2 * (1 - WT)) * CORR_small
 
@@ -350,8 +372,11 @@ def holtsmark_profile(beta: float, P: float) -> float:
     # Asymptotic part for medium β's
     CC = _HOLTSMARK_C7[IP] * WTPP + _HOLTSMARK_C7[IM] * WTPM
     DD = _HOLTSMARK_D7[IP] * WTPP + _HOLTSMARK_D7[IM] * WTPM
-    CORR_medium = 1 + DD / (CC + beta * jnp.sqrt(beta))
-    medium_beta_result = (1.5 / jnp.sqrt(beta) + 27 / beta**2) / beta**2 * CORR_medium
+    # ``beta * sqrt(beta)`` is differentiated as sqrt(β) + β/(2 sqrt(β)), i.e. 0 * inf
+    # at β == 0, so this too uses the floored β. This branch is only selected for
+    # β > 25.12, where beta_wing == beta, so the value is unchanged.
+    CORR_medium = 1 + DD / (CC + beta_wing * jnp.sqrt(beta_wing))
+    medium_beta_result = wing * CORR_medium
 
     # Select correct branch using nested jnp.where
     # if beta > 500: large_beta_result
@@ -403,17 +428,33 @@ def hummer_mihalas_w(T: float, n_eff: float, nH: float, nHe: float, ne: float,
     chi = RydbergH_eV / n_eff**2 * eV_to_cgs  # binding energy
     e = electron_charge_cgs
 
-    # Use jnp.where for use_hubeny_generalization branch
-    # Hubeny generalization
-    # Inner condition: (ne > 10) and (T > 10)
-    A = 0.09 * jnp.exp(0.16667 * jnp.log(ne)) / jnp.sqrt(T)
+    # Hubeny+ 1994 generalization, used only when ``use_hubeny_generalization`` is set
+    # *and* (ne > 10) and (T > 10).
+    #
+    # This whole block is evaluated unconditionally, and ``jnp.where`` masks the value
+    # of a discarded branch but not its cotangent, so anything non-finite in here leaks
+    # a NaN into the gradient of the branch that *was* selected -- including the default
+    # H&M branch that every synthesis actually uses. The reachable hazards are
+    # ``log(ne)`` at ne <= 0, ``1/sqrt(T)`` at T <= 0, ``BETAC**3`` overflowing to inf
+    # for absurdly small ne (giving inf/inf == NaN), and ``log(F)`` at F == 0 when
+    # BETAC**3 underflows for absurdly large ne or n_eff. Feeding the block benign
+    # constants whenever its result is discarded removes all of them at once. When the
+    # result *is* used the stand-ins are the real arguments, so no value changes.
+    hubeny_live = (jnp.asarray(use_hubeny_generalization, dtype=bool) &
+                   (ne > 10) & (T > 10))
+    ne_h = jnp.where(hubeny_live, ne, 1e14)
+    T_h = jnp.where(hubeny_live, T, 1e4)
+    n_eff_h = jnp.where(hubeny_live, n_eff, 1.0)
+    K_h = jnp.where(hubeny_live, K, 1.0)
+
+    A = 0.09 * jnp.exp(0.16667 * jnp.log(ne_h)) / jnp.sqrt(T_h)
     X = jnp.exp(3.15 * jnp.log(1 + A))
-    BETAC = 8.3e14 * jnp.exp(-0.66667 * jnp.log(ne)) * K / n_eff**4
+    BETAC = 8.3e14 * jnp.exp(-0.66667 * jnp.log(ne_h)) * K_h / n_eff_h**4
     F = 0.1402 * X * BETAC**3 / (1 + 0.1285 * X * BETAC * jnp.sqrt(BETAC))
     hubeny_charged_term = jnp.log(F / (1 + F)) / (-4 * jnp.pi / 3)
 
     # Select between hubeny formula or 0.0 based on (ne > 10) and (T > 10)
-    hubeny_charged_term = jnp.where((ne > 10) & (T > 10), hubeny_charged_term, 0.0)
+    hubeny_charged_term = jnp.where(hubeny_live, hubeny_charged_term, 0.0)
 
     # Standard H&M charged term
     hm_charged_term = 16 * ((e**2) / (chi * jnp.sqrt(K)))**3 * ne
@@ -494,10 +535,16 @@ def brackett_line_stark_profiles(m: int, wavelengths: np.ndarray, wavelength_cen
     # Select width based on condition
     width = jnp.where((y2 <= 1e-4) & (y1 <= 1e-5), width_simple, width_complex)
 
-    # Calculate impact profile using jnp.where
+    # Calculate impact profile using jnp.where.
+    # At the line centre betas == 0, so when the width has been floored to 0 the
+    # Lorentz density is 0/0 == NaN. That value is masked out but its cotangent is
+    # not, so the denominator is replaced by 1 wherever the branch is discarded --
+    # a "double where". Where the branch is kept, width > 0 and the denominator is
+    # untouched, so the returned profile is bit-for-bit the same.
+    lorentz_denominator = jnp.pi * (width**2 + betas**2)
     impact_electron_profile = jnp.where(
         width > 0,
-        width / (jnp.pi * (width**2 + betas**2)),  # Lorentz density
+        width / jnp.where(width > 0, lorentz_denominator, 1.0),  # Lorentz density
         0.0
     )
 
@@ -509,7 +556,17 @@ def brackett_line_stark_profiles(m: int, wavelengths: np.ndarray, wavelength_cen
     # Fit to (sqrt(π) - 2*gamma(3/2, y1))/sqrt(π) from HLINOP/Kurucz
     # Second term in eqn 8 of Griem 1967
     ps = (0.9 * y1)**2
-    quasistatic_e_contrib = (ps + 0.03 * jnp.sqrt(y1)) / (ps + 1.0)
+    # sqrt(y1) has an infinite derivative at y1 == 0, and y1 == 0 is hit exactly at the
+    # line centre (betas == 0 is on the profile grid). Nothing masks this one -- the
+    # term is live -- so the infinity propagates straight into d/dT and d/dne as
+    # inf * 0 == NaN. Evaluate the sqrt away from zero and re-select: sqrt(0) == 0, so
+    # the value is unchanged everywhere, while the derivative at y1 == 0 becomes a
+    # finite 0 instead of NaN. (The true one-sided derivative there is +inf; 0 is the
+    # conventional and the only usable choice, and it is only ever taken at the single
+    # grid point that sits exactly on the line centre.)
+    y1_pos = jnp.where(y1 > 0, y1, 1.0)
+    sqrt_y1 = jnp.where(y1 > 0, jnp.sqrt(y1_pos), 0.0)
+    quasistatic_e_contrib = (ps + 0.03 * sqrt_y1) / (ps + 1.0)
     # Fix potential NaNs from 0/0
     quasistatic_e_contrib = jnp.where(jnp.isnan(quasistatic_e_contrib), 0.0, quasistatic_e_contrib)
 

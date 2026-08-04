@@ -95,6 +95,28 @@ class PlanarAtmosphere:
         """Array of total number densities [cm⁻³]."""
         return np.array([layer.number_density for layer in self.layers])
 
+    @classmethod
+    def from_shell(cls, atm: "ShellAtmosphere") -> "PlanarAtmosphere":
+        """
+        Build a planar atmosphere from a shell one, discarding the radius.
+
+        Port of Korg.jl's ``PlanarAtmosphere(atm::ShellAtmosphere)``, which that
+        package documents as "mostly useful for testing".
+        """
+        return cls(
+            layers=[
+                PlanarAtmosphereLayer(
+                    tau_ref=l.tau_ref,
+                    z=l.z,
+                    temperature=l.temperature,
+                    electron_number_density=l.electron_number_density,
+                    number_density=l.number_density,
+                )
+                for l in atm.layers
+            ],
+            reference_wavelength=atm.reference_wavelength,
+        )
+
     def __repr__(self):
         return f"PlanarAtmosphere with {self.n_layers} layers"
 
@@ -169,6 +191,30 @@ class ShellAtmosphere:
         return np.array([layer.z for layer in self.layers])
 
     @property
+    def r(self):
+        """
+        Array of radii from the stellar centre [cm].
+
+        Matches Korg.jl's ``radii = [atm.R + l.z for l in atm.layers]`` in
+        ``RadiativeTransfer.radiative_transfer(atm::ShellAtmosphere, ...)``.
+        This is the spatial coordinate the spherical transfer solver integrates
+        along, as opposed to :attr:`z`, the height above the photosphere.
+        """
+        return self.R_photosphere + self.z
+
+    @property
+    def photosphere_correction(self):
+        """
+        Flux rescaling from the outermost radius to the photospheric radius.
+
+        Korg.jl: ``photosphere_correction = radii[1]^2 / atm.R^2`` (1-based, so
+        the *outermost* layer).  The spherical solver returns the flux at
+        ``r[0]``; multiplying by this factor moves it to ``R_photosphere``,
+        which is where a flux is conventionally quoted.
+        """
+        return (self.r[0] / self.R_photosphere) ** 2
+
+    @property
     def T(self):
         """Array of temperatures [K]."""
         return np.array([layer.temperature for layer in self.layers])
@@ -182,6 +228,30 @@ class ShellAtmosphere:
     def n_total(self):
         """Array of total number densities [cm⁻³]."""
         return np.array([layer.number_density for layer in self.layers])
+
+    @classmethod
+    def from_planar(cls, atm: "PlanarAtmosphere", R_photosphere: float) -> "ShellAtmosphere":
+        """
+        Build a shell atmosphere from a planar one and a photospheric radius.
+
+        Port of Korg.jl's ``ShellAtmosphere(atm::PlanarAtmosphere, R)``, which
+        that package documents as "mostly useful for testing".  The layer data
+        are copied unchanged; only the geometry interpretation changes.
+        """
+        return cls(
+            layers=[
+                ShellAtmosphereLayer(
+                    tau_ref=l.tau_ref,
+                    z=l.z,
+                    temperature=l.temperature,
+                    electron_number_density=l.electron_number_density,
+                    number_density=l.number_density,
+                )
+                for l in atm.layers
+            ],
+            R_photosphere=R_photosphere,
+            reference_wavelength=atm.reference_wavelength,
+        )
 
     def __repr__(self):
         return f"ShellAtmosphere with {self.n_layers} layers, R={self.R_photosphere:.2e} cm"
@@ -460,7 +530,7 @@ def _read_phoenix_model_atmosphere(fname: str):
         layers.append(PlanarAtmosphereLayer(
             tau_ref=float(tau[i]),
             z=float('nan'),  # no z coordinate in Phoenix models
-            temp=float(T[i]),
+            temperature=float(T[i]),
             electron_number_density=float(electron_number_density[i]),
             number_density=float(number_density[i]),
         ))
@@ -483,15 +553,25 @@ def _read_marcs_model_atmosphere(fname: str):
     with open(fname, 'r') as f:
         lines = f.readlines()
 
-    # Detect planar vs spherical
-    R = 1.0
+    # Detect planar vs spherical.  Korg.jl throws when the radius line is
+    # absent rather than assuming plane-parallel, because silently treating a
+    # spherical model as planar produces a wrong spectrum with no warning.
+    R = None
     for line in lines:
-        if 'adius' in line:
+        if 'adius' in line:   # {r,R}adius has uncertain capitalisation
             try:
                 R = float(line.split()[0])
             except (ValueError, IndexError):
-                pass
+                raise ValueError(
+                    "Cannot parse .mod file: the radius line is not a number "
+                    f"(should be 1.0 for plane-parallel atmospheres): {line!r}"
+                )
             break
+    if R is None:
+        raise ValueError(
+            "Cannot parse .mod file: cannot detect radius. "
+            "(It should be 1.0 for plane-parallel atmospheres.)"
+        )
     planar = (R == 1.0)
 
     # Find number of layers
@@ -543,12 +623,18 @@ def _read_marcs_model_atmosphere(fname: str):
                 atm_layers.append(ShellAtmosphereLayer(
                     tau_ref=10.0 ** log_tau5,
                     z=-depth,
-                    temp=temp,
+                    temperature=temp,
                     electron_number_density=ne,
                     number_density=n,
                 ))
-        except (ValueError, IndexError):
-            continue
+        except (ValueError, IndexError) as exc:
+            # Korg.jl parses these columns with no error handling at all, so a
+            # malformed row is a hard failure there.  Silently skipping it here
+            # would return an atmosphere with fewer layers than the header
+            # declares, which no caller checks.
+            raise ValueError(
+                f"Cannot parse .mod file: malformed model-structure row {line!r}"
+            ) from exc
 
     if planar:
         return PlanarAtmosphere(atm_layers, 5e-5)

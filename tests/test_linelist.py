@@ -277,14 +277,36 @@ class TestGetReferenceWavelengthLinelist:
         with pytest.raises((ValueError, Exception)):
             get_reference_wavelength_linelist([], reference_wavelength_cm=6e-5)
 
-    def test_fallback_disabled(self):
-        """With use_internal_reference_linelist=False and empty linelist, returns empty."""
+    def test_fallback_disabled_still_fills_an_empty_linelist(self):
+        """``use_internal_reference_linelist=False`` does not mean "return nothing".
+
+        Korg.jl v1.2.1 ``get_reference_wavelength_linelist`` only short-circuits to the
+        built-in list when the flag is *on*; with it off it filters the user's lines to
+        within 21 Å of 5000 Å and then, if that leaves nothing, still falls back to
+        ``_alpha_5000_default_linelist``.  The flag chooses whether the user's lines are
+        *preferred*, not whether alpha_5000 may be computed from a one-sided linelist.
+        (This test previously asserted an empty result, which was the port's behaviour
+        before the merge logic was implemented, not Korg's.)
+        """
         from korg.synthesis import get_reference_wavelength_linelist
+        from korg.data_loader import load_default_linelist
         result = get_reference_wavelength_linelist(
             [], reference_wavelength_cm=5e-5,
             use_internal_reference_linelist=False
         )
-        assert len(result) == 0
+        assert len(result) == len(load_default_linelist(5e-5))
+
+    def test_fallback_disabled_prefers_user_lines_that_span_5000(self):
+        """When the user's lines do straddle 5000 Å, the flag does take effect."""
+        from korg.synthesis import get_reference_wavelength_linelist
+        from korg.linelist import create_line, Species
+        spec = Species('Fe I')
+        lines = [create_line(wl, -1.0, spec, 1.0) for wl in (4995, 5000, 5005)]
+        result = get_reference_wavelength_linelist(
+            lines, reference_wavelength_cm=5e-5,
+            use_internal_reference_linelist=False
+        )
+        assert len(result) == 3
 
     def test_linelist_spanning_5000(self):
         """Linelist that spans 5000 Å should be returned as-is."""

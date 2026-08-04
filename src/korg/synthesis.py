@@ -8,33 +8,30 @@ Reference: Korg.jl synthesize.jl
 """
 
 import functools
+import warnings
+
 import numpy as np
 import jax.numpy as jnp
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Callable, Union
-from scipy.interpolate import interp1d
 
-from .atmosphere import PlanarAtmosphere, ShellAtmosphere
-from .statmech import (chemical_equilibrium, chemical_equilibrium_fast,
-                       chemical_equilibrium_all_layers)
+from .statmech import (chemical_equilibrium_fast,
+                       precompute_chemical_equilibrium_data)
 from .data_loader import (ionization_energies, default_partition_funcs,
                           default_log_equilibrium_constants,
                           default_chem_eq_data, default_mol_species)
-from .continuum import (prepare_continuum_batch, prepare_continuum_batch_fast, batch_continuum_absorption,
-                        Hminus_bf, Hminus_ff)
+from .continuum import Hminus_bf, Hminus_ff
 from .constants import (electron_mass_cgs, electron_charge_cgs, c_cgs,
                         kboltz_eV, hplanck_eV, hplanck_cgs, kboltz_cgs,
                         bohr_radius_cgs)
-from .radiative_transfer import radiative_transfer, radiative_transfer_jit
 from .linelist import Line
 from .species import Species
 from .line_absorption import line_absorption, _vdW_to_tuple, _voigt_profile_jax
 from .hydrogen_line_absorption import (hydrogen_line_absorption, precompute_hummer_ws,
                                        hline_stark_profiles,
                                        hydrogen_line_absorption_stark_batched)
-from .atomic_data import atomic_masses, atomic_symbols
-from .abundances import A_X_to_absolute
+from .atomic_data import atomic_symbols
 
 
 @dataclass
@@ -57,6 +54,20 @@ class SynthesisResult:
     flux: np.ndarray
     continuum: np.ndarray
     intensities: Optional[np.ndarray] = None
+    # Korg.jl's SynthesisResult also carries the absorption coefficient, the
+    # per-species number densities and the electron number density.  They are
+    # needed by prune_linelist (and are part of Korg.jl's public result), so
+    # expose them here under Korg.jl's names.  They default to None so that
+    # existing constructions of SynthesisResult keep working unchanged.
+    alpha: Optional[np.ndarray] = None                     # (n_layers, n_wl), cm⁻¹
+    alpha_cntm: Optional[np.ndarray] = None                # continuum-only alpha
+    number_densities: Optional[dict] = None                # Species -> (n_layers,) cm⁻³
+    electron_number_density: Optional[np.ndarray] = None   # (n_layers,) cm⁻³
+
+    @property
+    def cntm(self):
+        """Alias for ``continuum``, matching Korg.jl's field name."""
+        return self.continuum
 
 
 def planck_function(nu, T):
@@ -261,658 +272,61 @@ def get_reference_wavelength_linelist(linelist: List[Line],
     buffer_cm = 21e-8  # 21 Å in cm
     filtered = filter_linelist(linelist, window_cm, buffer_cm, warn_empty=False)
 
-    if reference_wavelength_cm != 5e-5 and len(filtered) == 0:
-        raise ValueError(
-            f"The provided linelist contains no lines near the reference wavelength "
-            f"{reference_wavelength_cm * 1e8:.1f} Å. Korg has a built-in fallback "
-            f"only for 5000 Å (the MARCS default)."
-        )
-
-    if len(filtered) > 0 and filtered[0].wl <= reference_wavelength_cm <= filtered[-1].wl:
+    if reference_wavelength_cm != 5e-5:
+        if len(filtered) == 0:
+            raise ValueError(
+                f"The provided linelist contains no lines near the reference wavelength "
+                f"{reference_wavelength_cm * 1e8:.1f} Å. Korg has a built-in fallback "
+                f"only for 5000 Å (the MARCS default)."
+            )
+        # Korg.jl evaluates `filtered_linelist` here without returning it, so it
+        # falls through into the 5000 Å merge below even for a non-5000 Å
+        # reference.  That is an upstream slip (merging a 5000 Å fallback list
+        # into a, say, 8000 Å reference is meaningless), so it is not
+        # replicated: the user's lines are returned as-is.
         return filtered
 
-    # Filter lines below the reference wavelength that aren't already covered
-    if len(filtered) > 0 and filtered[0].wl > reference_wavelength_cm:
-        return filtered
-    if len(filtered) > 0 and filtered[-1].wl < reference_wavelength_cm:
-        return filtered
+    # 5000 Å reference with the internal list disabled.  Korg.jl still uses the
+    # built-in list to fill in wherever the user's lines do not reach across
+    # 5000 Å, so that alpha_5000 is never computed from a one-sided linelist.
+    def _default_5000_linelist():
+        from .data_loader import load_default_linelist
+        try:
+            return load_default_linelist(5e-5)
+        except Exception:
+            return []
 
+    if len(filtered) == 0:
+        return _default_5000_linelist()
+    if filtered[0].wl > 5e-5:
+        # user lines all sit redward of 5000 Å: prepend the built-in lines below them
+        return [l for l in _default_5000_linelist()
+                if l.wl < filtered[0].wl] + list(filtered)
+    if filtered[-1].wl < 5e-5:
+        # user lines all sit blueward of 5000 Å: append the built-in lines above them
+        return list(filtered) + [l for l in _default_5000_linelist()
+                                 if l.wl > filtered[-1].wl]
+    # the user's lines span 5000 Å: they are sufficient on their own
     return filtered
 
 
-def synthesize_spectrum(
-    atmosphere,
-    linelist: List[Line],
-    wavelengths_angstrom: np.ndarray,
-    abundances: np.ndarray,
-    vmic: float = 1.0,
-    line_buffer: float = 10.0,
-    cntm_step: float = 1.0,
-    hydrogen_lines: bool = True,
-    hydrogen_line_window_size: float = 150.0,
-    line_cutoff_threshold: float = 3e-4,
-    return_continuum: bool = True,
-    partition_funcs: Optional[Dict] = None,
-    ionization_energies_dict: Optional[Dict] = None,
-    log_equilibrium_constants: Optional[Dict] = None,
-    verbose: bool = True,
-    profile: bool = False,
-):
-    """
-    Compute synthetic spectrum with lines.
-
-    This is the main synthesis function following Julia's synthesize().
-
-    Parameters
-    ----------
-    atmosphere : PlanarAtmosphere or ShellAtmosphere
-        Model atmosphere structure
-    linelist : list of Line
-        Atomic/molecular lines to include
-    wavelengths_angstrom : array
-        Wavelength grid [Å]
-    abundances : array, shape (92,)
-        Absolute abundances (N_X/N_total) for elements 1-92
-    vmic : float, optional
-        Microturbulent velocity [km/s] (default: 1.0)
-    line_buffer : float, optional
-        Distance [Å] from wavelength range to include lines (default: 10.0)
-    cntm_step : float, optional
-        Continuum sampling interval [Å] (default: 1.0)
-    hydrogen_lines : bool, optional
-        Include hydrogen lines (default: True)
-    hydrogen_line_window_size : float, optional
-        Window size for H lines [Å] (default: 150.0)
-    line_cutoff_threshold : float, optional
-        Line cutoff as fraction of continuum (default: 3e-4)
-    return_continuum : bool, optional
-        Whether to compute continuum spectrum (default: True)
-    partition_funcs : dict, optional
-        Partition functions (default: use built-in)
-    ionization_energies_dict : dict, optional
-        Ionization energies (default: use built-in)
-    log_equilibrium_constants : dict, optional
-        Equilibrium constants (default: use built-in)
-    verbose : bool, optional
-        Print progress messages (default: True)
-    profile : bool, optional
-        Print timing information for each synthesis step (default: False)
-
-    Returns
-    -------
-    result : SynthesisResult
-        Synthesis results with wavelengths, flux, and continuum
-    """
-    import time
-    timings = {} if profile else None
-    t_start = time.time() if profile else None
-
-    using_defaults = (partition_funcs is None and ionization_energies_dict is None
-                      and log_equilibrium_constants is None)
-    if partition_funcs is None:
-        partition_funcs = default_partition_funcs
-    if ionization_energies_dict is None:
-        ionization_energies_dict = ionization_energies
-    if log_equilibrium_constants is None:
-        log_equilibrium_constants = default_log_equilibrium_constants
-
-    # Convert to working units (cm)
-    wavelengths_cm = wavelengths_angstrom * 1e-8
-    vmic_cm_s = vmic * 1e5  # km/s -> cm/s
-    line_buffer_cm = line_buffer * 1e-8
-    cntm_step_cm = cntm_step * 1e-8
-    h_line_window_cm = hydrogen_line_window_size * 1e-8
-
-    n_layers = atmosphere.n_layers
-    n_wavelengths = len(wavelengths_angstrom)
-
-    # Get atmosphere properties
-    T = atmosphere.T
-    ne_model = atmosphere.ne
-    n_total = atmosphere.n_total
-    log_tau_ref = atmosphere.log_tau_ref
-
-    if isinstance(atmosphere, ShellAtmosphere):
-        spatial_coord = atmosphere.r
-        spherical = True
-    else:
-        spatial_coord = atmosphere.z
-        spherical = False
-
-    # Sort linelist by wavelength if needed
-    if linelist and not all(linelist[i].wl <= linelist[i+1].wl
-                            for i in range(len(linelist)-1)):
-        linelist = sorted(linelist, key=lambda l: l.wl)
-
-    # Filter linelist to wavelength range
-    wl_min = wavelengths_cm[0] - line_buffer_cm
-    wl_max = wavelengths_cm[-1] + line_buffer_cm
-    linelist = [l for l in linelist if wl_min <= l.wl <= wl_max]
-
-    if verbose:
-        print(f"Synthesizing spectrum...")
-        print(f"  Wavelengths: {n_wavelengths} points from "
-              f"{wavelengths_angstrom[0]:.1f} to {wavelengths_angstrom[-1]:.1f} Å")
-        print(f"  Lines: {len(linelist)} in wavelength range")
-        print(f"  Layers: {n_layers}")
-
-    # Set up continuum wavelength grid (coarser sampling)
-    cntm_wl_min = wl_min - cntm_step_cm
-    cntm_wl_max = wl_max + cntm_step_cm
-    cntm_wavelengths_cm = np.arange(cntm_wl_min, cntm_wl_max + cntm_step_cm, cntm_step_cm)
-
-    # Initialize arrays
-    alpha = np.zeros((n_layers, n_wavelengths))  # Total absorption
-    source_function = np.zeros((n_wavelengths, n_layers))
-
-    # Reference wavelength for optical depth (5000 Å for MARCS models)
-    lambda_ref_cm = 5e-5  # 5000 Å in cm
-
-    # Convert A(X) format abundances to linear number fractions for chemical_equilibrium.
-    # Julia's format_A_X() returns A(X) = log10(N_X/N_H) + 12; chemical_equilibrium
-    # expects N(X)/N_total (values summing to ~1). Detect A(X) by H abundance > 1.
-    if abundances[0] > 1.0:
-        abs_abundances = A_X_to_absolute(np.asarray(abundances))
-    else:
-        abs_abundances = np.asarray(abundances)
-
-    # Store chemical equilibrium results
-    electron_densities = np.zeros(n_layers)
-    alpha_ref = np.zeros(n_layers)  # Absorption at reference wavelength
-    number_densities_list = []
-    raw_arrays_list = []  # Raw numpy arrays from fast chemical equilibrium
-    alpha_cntm_interps = []  # Continuum interpolators for each layer
-
-    # Compute chemical equilibrium and continuum for each layer
-    if verbose:
-        print(f"Computing chemical equilibrium and continuum...")
-    if profile:
-        t_loop_start = time.time()
-        t_chem_eq = 0.0
-        t_cntm_abs = 0.0
-        t_source_fn = 0.0
-
-    # Pass 1: chemical equilibrium for all layers
-    if profile:
-        t0 = time.time()
-    if using_defaults:
-        # Batch all layers at once: single XLA dispatch, avoids 56× dict overhead
-        electron_densities, number_densities_batch, raw_arrays_list = \
-            chemical_equilibrium_all_layers(
-                T, n_total, ne_model, abs_abundances,
-                default_chem_eq_data, default_mol_species
-            )
-        number_densities_list = None  # not used in fast path
-    else:
-        for i in range(n_layers):
-            T_i = T[i]
-            ne_i = ne_model[i]
-            n_i = n_total[i]
-            ne_calc, n_dict = chemical_equilibrium(
-                T_i, n_i, ne_i, abs_abundances,
-                ionization_energies_dict,
-                partition_funcs,
-                log_equilibrium_constants,
-                electron_density_warn_threshold=1.0
-            )
-            electron_densities[i] = ne_calc
-            number_densities_list.append(n_dict)
-    if profile:
-        t_chem_eq = time.time() - t0
-
-    # Pass 2: continuum absorption — batch all layers at once
-    if profile:
-        t0 = time.time()
-    if using_defaults:
-        # Fast path: vmapped JIT continuum over all layers
-        cntm_frequencies = c_cgs / cntm_wavelengths_cm
-        batch = prepare_continuum_batch_fast(raw_arrays_list, partition_funcs, T)
-        alpha_cntm_all = np.array(batch_continuum_absorption(
-            jnp.asarray(cntm_frequencies),
-            jnp.asarray(T, dtype=np.float64),
-            jnp.asarray(electron_densities, dtype=np.float64),
-            batch
-        ))
-        for i in range(n_layers):
-            alpha_cntm_interp = interp1d(cntm_wavelengths_cm, alpha_cntm_all[i],
-                                          kind='linear', fill_value='extrapolate')
-            alpha_cntm_interps.append(alpha_cntm_interp)
-            alpha[i, :] = alpha_cntm_interp(wavelengths_cm)
-            alpha_ref[i] = alpha_cntm_interp(lambda_ref_cm)
-    else:
-        for i in range(n_layers):
-            alpha_cntm_coarse = compute_continuum_absorption(
-                cntm_wavelengths_cm, T[i], electron_densities[i],
-                number_densities_list[i], partition_funcs
-            )
-            alpha_cntm_interp = interp1d(cntm_wavelengths_cm, alpha_cntm_coarse,
-                                          kind='linear', fill_value='extrapolate')
-            alpha_cntm_interps.append(alpha_cntm_interp)
-            alpha[i, :] = alpha_cntm_interp(wavelengths_cm)
-            alpha_ref[i] = alpha_cntm_interp(lambda_ref_cm)
-    if profile:
-        t_cntm_abs = time.time() - t0
-
-    # Source function (fast: vectorized blackbody over all layers and wavelengths)
-    if profile:
-        t0 = time.time()
-    for i in range(n_layers):
-        source_function[:, i] = blackbody(T[i], wavelengths_cm)
-    if profile:
-        t_source_fn = time.time() - t0
-
-    # Build combined number_densities dict
-    if using_defaults:
-        # Already built as (n_layers,) arrays in chemical_equilibrium_all_layers
-        number_densities = number_densities_batch
-    else:
-        all_species = set()
-        for n_dict in number_densities_list:
-            all_species.update(n_dict.keys())
-        number_densities = {
-            spec: np.array([n_dict.get(spec, 0.0) for n_dict in number_densities_list])
-            for spec in all_species
-        }
-
-    if profile:
-        timings['layer_loop'] = t_chem_eq + t_cntm_abs + t_source_fn
-        timings['chemical_equilibrium'] = t_chem_eq
-        timings['continuum_absorption'] = t_cntm_abs
-        timings['source_function'] = t_source_fn
-        t0 = time.time()
-
-    # Add line absorption at reference wavelength to alpha_ref (matching Julia).
-    # Julia's alpha_ref = continuum + line opacity at 5000 Å, which correctly accounts
-    # for the total opacity that determines the MARCS depth scale.
-    ref_ll_for_ref = get_reference_wavelength_linelist(linelist, lambda_ref_cm)
-    if ref_ll_for_ref:
-        def _cntm_at_ref_wl(wl_cm):
-            wl_arr = np.atleast_1d(wl_cm)
-            result = np.stack([alpha_cntm_interps[i](wl_arr) for i in range(n_layers)], axis=-1)
-            return result if np.ndim(wl_cm) > 0 else result[0]
-        line_at_ref = line_absorption(
-            ref_ll_for_ref, np.array([lambda_ref_cm]),
-            T, electron_densities, number_densities,
-            partition_funcs, vmic_cm_s, _cntm_at_ref_wl,
-            cutoff_threshold=line_cutoff_threshold,
-        )  # (n_layers, 1)
-        alpha_ref += np.asarray(line_at_ref[:, 0])
-
-    # Save continuum-only alpha before H-lines/atomic lines are added.
-    # The continuum RT is computed later (after the correct alpha_ref is known) so that
-    # both continuum and total RT use the same tau scale.
-    alpha_cntm_only = alpha.copy()  # (n_layers, n_wl), continuum opacity only
-    continuum_flux = None
-
-    if profile:
-        timings['continuum_rt'] = 0.0  # measured later
-        t0 = time.time()
-
-    # Add hydrogen line absorption
-    if hydrogen_lines:
-        if verbose:
-            print(f"Adding hydrogen line absorption...")
-        if profile:
-            t_h_lines_start = time.time()
-
-        # Pre-filter Stark profiles to only those near the synthesis wavelength range.
-        # Approximate vacuum line centers via Rydberg formula; profiles whose center is
-        # more than h_line_window_cm outside the range contribute exactly zero and are
-        # skipped entirely (avoids O(84 × n_layers) JIT dispatches when the range
-        # contains no H lines, e.g. 5000–5100 Å contains only the far wing of Hβ).
-        _RYDBERG_CM = 1.0973731568539e5
-        wl_min_cm = wavelengths_cm[0]
-        wl_max_cm = wavelengths_cm[-1]
-        nearby_stark = {
-            k: v for k, v in hline_stark_profiles.items()
-            if (wl_min_cm - h_line_window_cm
-                <= 1.0 / (_RYDBERG_CM * (1.0/v.lower**2 - 1.0/v.upper**2))
-                <= wl_max_cm + h_line_window_cm)
-        }
-
-        # Batch-precompute occupation probabilities for all layers (much faster than per-layer)
-        if raw_arrays_list:
-            nH_I_arr = np.array([ra['neutral_dens'][0] for ra in raw_arrays_list])
-            nHe_I_arr = np.array([ra['neutral_dens'][1] for ra in raw_arrays_list])
-        else:
-            nH_I_arr = np.array([nd.get(Species("H_I"), 0.0) for nd in number_densities_list])
-            nHe_I_arr = np.array([nd.get(Species("He_I"), 0.0) for nd in number_densities_list])
-        ws_all = precompute_hummer_ws(T, nH_I_arr, nHe_I_arr, electron_densities)
-
-        pf_H_I = partition_funcs[Species("H_I")]
-        # Vectorized partition function evaluation (avoids 56 JAX scalar dispatches)
-        log_T_arr = np.log(T)
-        if hasattr(pf_H_I, 'numpy_eval'):
-            U_H_I_arr = pf_H_I.numpy_eval(log_T_arr)
-        else:
-            U_H_I_arr = np.array([float(pf_H_I(lt)) for lt in log_T_arr])
-
-        # Stehlé Stark profiles: process all layers at once (1 JIT dispatch per nearby line)
-        if nearby_stark:
-            alpha_stark = hydrogen_line_absorption_stark_batched(
-                wavelengths_cm, T, electron_densities, nH_I_arr, U_H_I_arr,
-                h_line_window_cm, vmic_cm_s, ws_all, nearby_stark
-            )
-            alpha += alpha_stark
-
-        # Brackett series (lower=4): all series lines are in the IR (>1.4 μm), so skip
-        # the per-layer loop entirely when the synthesis range is in the optical/UV.
-        brackett_in_range = any(
-            wl_min_cm - h_line_window_cm
-            <= 1.0 / (_RYDBERG_CM * (1.0/16.0 - 1.0/m**2))
-            <= wl_max_cm + h_line_window_cm
-            for m in range(5, 31)
-        )
-        if brackett_in_range:
-            for i in range(n_layers):
-                alpha_H = hydrogen_line_absorption(
-                    wavelengths_cm, T[i], electron_densities[i], nH_I_arr[i], nHe_I_arr[i],
-                    float(U_H_I_arr[i]), vmic_cm_s,
-                    h_line_window_cm, use_MHD=True, ws=ws_all[i],
-                    stark_profiles={}   # Stark already handled above
-                )
-                alpha[i, :] += alpha_H
-        if profile:
-            timings['hydrogen_lines'] = time.time() - t_h_lines_start
-
-    # Add atomic/molecular line absorption
-    if linelist:
-        if verbose:
-            print(f"Adding line absorption for {len(linelist)} lines...")
-        if profile:
-            t_line_abs_start = time.time()
-
-        # Create continuum opacity callable for line_absorption
-        # Accepts scalar or 1D array of wavelengths; returns (n_layers,) or (n_wl, n_layers)
-        def continuum_opacity(wl_cm):
-            wl_arr = np.atleast_1d(wl_cm)
-            result = np.stack([alpha_cntm_interps[i](wl_arr) for i in range(n_layers)], axis=-1)
-            return result if np.ndim(wl_cm) > 0 else result[0]
-
-        # Compute line absorption
-        alpha_lines = line_absorption(
-            linelist,
-            wavelengths_cm,
-            T,
-            electron_densities,
-            number_densities,
-            partition_funcs,
-            vmic_cm_s,
-            continuum_opacity,
-            cutoff_threshold=line_cutoff_threshold
-        )
-
-        alpha += alpha_lines
-        if profile:
-            timings['line_absorption'] = time.time() - t_line_abs_start
-
-    # alpha_ref was set at line 527 (continuum + reference-linelist lines, NO H-lines),
-    # matching Julia's alpha_5 = cntm + synthesis_linelist_lines.  Do not overwrite it here.
-
-    # Compute continuum flux if requested (using correct alpha_ref so tau scale is consistent)
-    if return_continuum:
-        if verbose:
-            print(f"Computing continuum spectrum...")
-        if profile:
-            t_cntm_rt = time.time()
-        if using_defaults and not spherical:
-            flux_cntm, _ = radiative_transfer_jit(
-                jnp.asarray(alpha_cntm_only.T), jnp.asarray(source_function),
-                jnp.asarray(spatial_coord), jnp.asarray(log_tau_ref),
-                jnp.asarray(alpha_ref)
-            )
-        else:
-            flux_cntm, _ = radiative_transfer(
-                alpha_cntm_only.T, source_function, spatial_coord, log_tau_ref,
-                alpha_ref=alpha_ref, spherical=spherical,
-                intensity_scheme="linear_flux_only", use_expint_flux=True
-            )
-        continuum_flux = flux_cntm * 1e-8
-        if profile:
-            timings['continuum_rt'] = time.time() - t_cntm_rt
-
-    # Solve radiative transfer with full opacity
-    if verbose:
-        print(f"Solving radiative transfer...")
-    if profile:
-        t_rt_start = time.time()
-
-    if using_defaults and not spherical:
-        flux_nu, _ = radiative_transfer_jit(
-            jnp.asarray(alpha.T), jnp.asarray(source_function),
-            jnp.asarray(spatial_coord), jnp.asarray(log_tau_ref),
-            jnp.asarray(alpha_ref)
-        )
-    else:
-        flux_nu, _ = radiative_transfer(
-            alpha.T, source_function, spatial_coord, log_tau_ref,
-            alpha_ref=alpha_ref, spherical=spherical,
-            intensity_scheme="linear_flux_only", use_expint_flux=True
-        )
-
-    # Convert from erg/s/cm^5 (per cm wavelength) to erg/s/cm^4/Å (per Angstrom)
-    # Since we use B_λ (wavelength-based Planck), we just multiply by 1e-8
-    # (same as Julia's synthesize.jl line 304)
-    flux_lambda = flux_nu * 1e-8
-
-    if profile:
-        timings['radiative_transfer'] = time.time() - t_rt_start
-        timings['total'] = time.time() - t_start
-        print("\n=== PROFILING RESULTS ===")
-        print(f"  Layer loop total:       {timings.get('layer_loop', 0):.3f} s")
-        print(f"    - Chemical equilibrium: {timings.get('chemical_equilibrium', 0):.3f} s")
-        print(f"    - Continuum absorption: {timings.get('continuum_absorption', 0):.3f} s")
-        print(f"    - Source function:      {timings.get('source_function', 0):.3f} s")
-        if 'continuum_rt' in timings:
-            print(f"  Continuum RT:           {timings['continuum_rt']:.3f} s")
-        if 'hydrogen_lines' in timings:
-            print(f"  Hydrogen lines:         {timings['hydrogen_lines']:.3f} s")
-        if 'line_absorption' in timings:
-            print(f"  Line absorption:        {timings['line_absorption']:.3f} s")
-        print(f"  Radiative transfer:     {timings.get('radiative_transfer', 0):.3f} s")
-        print(f"  TOTAL:                  {timings['total']:.3f} s")
-        print("========================\n")
-
-    if verbose:
-        print(f"✓ Synthesis complete!")
-
-    return SynthesisResult(
-        wavelengths=wavelengths_angstrom,
-        flux=np.array(flux_lambda),
-        continuum=np.array(continuum_flux) if continuum_flux is not None else np.array(flux_lambda),
-        intensities=None
-    )
-
-
-def synthesize_continuum(
-    atmosphere,
-    wavelengths_angstrom,
-    abundances,
-):
-    """
-    Compute continuum spectrum (without lines).
-
-    This is a convenience wrapper that calls synthesize_spectrum with no linelist.
-
-    Parameters
-    ----------
-    atmosphere : PlanarAtmosphere or ShellAtmosphere
-        Model atmosphere structure
-    wavelengths_angstrom : array
-        Wavelength grid [Å]
-    abundances : array, shape (92,)
-        Absolute abundances (N_X/N_total) for elements 1-92
-
-    Returns
-    -------
-    flux : array
-        Continuum flux at each wavelength [erg cm⁻² s⁻¹ Å⁻¹]
-    """
-    result = synthesize_spectrum(
-        atmosphere,
-        linelist=[],
-        wavelengths_angstrom=wavelengths_angstrom,
-        abundances=abundances,
-        hydrogen_lines=False,
-        return_continuum=False,
-        verbose=True
-    )
-    return result.flux
-
-
-def synthesize(
-    atmosphere,
-    linelist: List[Line],
-    wavelengths_angstrom: np.ndarray,
-    abundances: np.ndarray,
-    vmic: float = 1.0,
-    line_buffer: float = 10.0,
-    hydrogen_lines: bool = True,
-    hydrogen_line_window_size: float = 150.0,
-    line_cutoff_threshold: float = 3e-4,
-    return_cntm: bool = True,
-    verbose: bool = True,
-    profile: bool = False,
-    **kwargs
-):
-    """
-    Main spectral synthesis function.
-
-    Computes synthetic spectrum for a given atmosphere, linelist, and abundances.
-    This is the primary user-facing API, matching Julia's `synthesize()`.
-
-    Parameters
-    ----------
-    atmosphere : PlanarAtmosphere or ShellAtmosphere
-        Model atmosphere structure with T, P, ρ vs depth
-    linelist : list of Line
-        Atomic and molecular lines to include. Use [] for continuum-only.
-    wavelengths_angstrom : array
-        Wavelength grid for output spectrum [Å]
-    abundances : array, shape (92,)
-        Absolute abundances (N_X/N_total) for elements 1-92
-        Can be generated using format_A_X()
-    vmic : float, optional
-        Microturbulent velocity [km/s] (default: 1.0)
-    line_buffer : float, optional
-        Distance [Å] from wavelength range to include lines (default: 10.0)
-    hydrogen_lines : bool, optional
-        Include hydrogen lines (default: True)
-    hydrogen_line_window_size : float, optional
-        Window size for H lines [Å] (default: 150.0)
-    line_cutoff_threshold : float, optional
-        Line cutoff as fraction of continuum (default: 3e-4)
-    return_cntm : bool, optional
-        Whether to compute continuum spectrum (default: True)
-    verbose : bool, optional
-        Print progress messages (default: True)
-    profile : bool, optional
-        Print timing information for each synthesis step (default: False)
-
-    Returns
-    -------
-    result : SynthesisResult
-        Synthesis results with wavelengths, flux, and continuum
-
-    Examples
-    --------
-    >>> from korg.atmosphere import create_solar_test_atmosphere
-    >>> from korg.abundances import format_A_X
-    >>> from korg.linelist import read_linelist
-    >>>
-    >>> # Create solar atmosphere
-    >>> atm = create_solar_test_atmosphere()
-    >>>
-    >>> # Get solar abundances
-    >>> A_X = format_A_X(M_H=0.0, alpha_M=0.0)
-    >>> abundances = 10**(A_X - 12)
-    >>> abundances /= abundances.sum()
-    >>>
-    >>> # Read linelist
-    >>> linelist = read_linelist("path/to/linelist.vald")
-    >>>
-    >>> # Define wavelength grid
-    >>> wavelengths = np.linspace(5000, 5100, 1000)  # Å
-    >>>
-    >>> # Synthesize
-    >>> result = synthesize(atm, linelist, wavelengths, abundances)
-    >>>
-    >>> # Plot
-    >>> import matplotlib.pyplot as plt
-    >>> plt.plot(result.wavelengths, result.flux)
-    >>> plt.xlabel('Wavelength [Å]')
-    >>> plt.ylabel('Flux')
-    >>> plt.show()
-
-    Notes
-    -----
-    This is the main user-facing function for spectral synthesis.
-
-    The synthesis proceeds in stages:
-    1. Chemical equilibrium: compute species densities at each layer
-    2. Continuum absorption: compute opacity from all continuum sources
-    3. Hydrogen line absorption: Stark-broadened H lines (if hydrogen_lines=True)
-    4. Line absorption: Voigt profiles for atomic/molecular lines
-    5. Radiative transfer: solve for emergent flux
-    """
-    wavelengths_angstrom = np.asarray(wavelengths_angstrom)
-
-    return synthesize_spectrum(
-        atmosphere=atmosphere,
-        linelist=linelist,
-        wavelengths_angstrom=wavelengths_angstrom,
-        abundances=abundances,
-        vmic=vmic,
-        line_buffer=line_buffer,
-        hydrogen_lines=hydrogen_lines,
-        hydrogen_line_window_size=hydrogen_line_window_size,
-        line_cutoff_threshold=line_cutoff_threshold,
-        return_continuum=return_cntm,
-        verbose=verbose,
-        profile=profile,
-        **kwargs
-    )
-
-
-def synth(
-    atmosphere,
-    linelist: List[Line],
-    wavelengths_angstrom: np.ndarray,
-    abundances: np.ndarray,
-    vmic: float = 1.0,
-    **kwargs
-):
-    """
-    Convenience wrapper for synthesize() that returns simple tuple.
-
-    Parameters
-    ----------
-    atmosphere : PlanarAtmosphere or ShellAtmosphere
-        Model atmosphere
-    linelist : list of Line
-        Atomic and molecular lines. Use [] for continuum-only.
-    wavelengths_angstrom : array
-        Wavelength grid [Å]
-    abundances : array
-        Elemental abundances
-    vmic : float, optional
-        Microturbulent velocity [km/s] (default: 1.0)
-
-    Returns
-    -------
-    wavelengths : array
-        Wavelength grid [Å]
-    flux : array
-        Emergent flux
-    continuum : array
-        Continuum flux
-
-    Examples
-    --------
-    >>> wl, flux, cont = synth(atm, linelist, wavelengths, abundances)
-    """
-    result = synthesize(atmosphere, linelist, wavelengths_angstrom, abundances, vmic=vmic, **kwargs)
-    return result.wavelengths, result.flux, result.continuum
+# ``synthesize_spectrum`` stood here, and ``synthesize``/``synth`` wrapped it.
+#
+# It was the Python-orchestrated NumPy path: it drove jitted kernels from a host
+# loop and dropped to SciPy in places, so it could not be jit-compiled, vmapped
+# over stellar parameters, or differentiated end to end. It carried its own
+# deprecation warning to that effect. Everything it did is now done by the traced
+# closure in ``korg.synthesis_plan``, which agrees with the Korg.jl reference
+# spectra in ``tests/synthesis_reference_data.json`` to 3.2e-3 relative -- the
+# same agreement the deleted path had, measured against the same fixtures.
+#
+# ``synthesize_continuum`` had already gone the same way; ``prepare_synthesis(wls,
+# [])`` expresses it and stays differentiable.
+#
+# ``korg.synthesize`` is now ``korg.synthesis_plan.synthesize``: Korg.jl's
+# argument order, A(X) abundances, and a ``(flux, continuum)`` tuple. It is
+# re-exported at the bottom of this module so ``from korg.synthesis import
+# synthesize`` keeps working; there is one implementation, not two.
 
 
 # =============================================================================
@@ -928,10 +342,10 @@ def synth(
 import jax
 from typing import NamedTuple
 from .statmech import (ChemicalEquilibriumData, precompute_chemical_equilibrium_data,
-                       chemical_equilibrium_jit, MAX_ATOMIC_NUMBER,
+                       picard_chemical_equilibrium_guess, MAX_ATOMIC_NUMBER,
                        _compute_saha_weights_jit, translational_U,
                        _compute_mol_densities_jit,
-                       _chemical_equilibrium_batch_jit,
+                       _picard_chemical_equilibrium_guess_batch,
                        _compute_mol_densities_batch_jit,
                        _compute_saha_weights_batch_jit,
                        _chem_eq_newton_batch_jit,
@@ -1134,9 +548,12 @@ def precompute_synthesis_data(
         T_min=T_min, T_max=T_max, n_temps=n_temps
     )
 
-    # Load Gaunt factor table for free-free absorption
-    from .continuum_absorption.hydrogenic_bf_ff import _load_gauntff_table
+    # Load Gaunt factor table for free-free absorption.  The import belongs
+    # inside the try: the fallback below exists precisely for the case where
+    # the tabulated data cannot be obtained, and an ImportError is one way for
+    # that to happen.
     try:
+        from .continuum_absorption.hydrogenic_bf_ff import _load_gauntff_table
         gaunt_table, log_gamma2_grid, log_u_grid = _load_gauntff_table()
         gaunt_table = jnp.array(gaunt_table)
         gaunt_log_u_grid = jnp.array(log_u_grid)
@@ -1248,7 +665,7 @@ def precompute_atmosphere(
     c_cgs_float = float(c_cgs)
 
     # ── Phase 1: Picard initial guess ────────────────────────────────────────
-    ne_init, nf_init = _chemical_equilibrium_batch_jit(
+    ne_init, nf_init = _picard_chemical_equilibrium_guess_batch(
         T_layers, n_total_layers, ne_layers, abundances, data.chem_eq_data
     )
 
@@ -1331,9 +748,17 @@ def precompute_atmosphere(
         lambda row: jnp.interp(wavelengths_cm, cntm_wl_jnp, row)
     )(alpha_cntm_coarse)  # (n_layers, n_wl)
 
-    alpha_ref_all = jax.vmap(
-        lambda row: jnp.interp(jnp.array([lambda_ref_cm]), cntm_wl_jnp, row)[0]
-    )(alpha_cntm_coarse)  # (n_layers,)
+    # Continuum opacity *at* the reference wavelength.  Korg.jl evaluates it
+    # directly there rather than reading it off the synthesis window's coarse
+    # grid; `jnp.interp` clamps outside the grid, so for any window that does
+    # not contain 5000 Å the old expression returned the continuum at the edge
+    # of the window instead, silently rescaling the whole optical-depth scale.
+    alpha_ref_all = _batch_continuum_vmap(
+        jnp.array([c_cgs_float / lambda_ref_cm]), T_layers, ne_all,
+        U_H_I_all, U_He_I_all, nH_I_all, nH_II_all, nHe_I_all, nH2_all,
+        n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
+        data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
+    )[:, 0]  # (n_layers,)
 
     # Add line absorption at reference wavelength
     from .data_loader import load_default_linelist as _load_ref_ll
@@ -1351,10 +776,12 @@ def precompute_atmosphere(
         _mol_np = np.asarray(mol_dens)
         for _i, _mol_sp in enumerate(default_mol_species):
             _nd_ref[_mol_sp] = _mol_np[:, _i]
-        _cntm_coarse_np = np.asarray(alpha_cntm_coarse)
+        # Korg.jl passes a constant-per-layer continuum here: the alpha_ref just
+        # computed.  See the note above about interpolating off-grid.
+        _alpha_ref_cntm_np = np.asarray(alpha_ref_all)
         def _cntm_at_ref_fn(wl_cm):
-            wl_arr = np.atleast_1d(wl_cm)
-            result = np.stack([np.interp(wl_arr, cntm_wl_np_cached, _cntm_coarse_np[i]) for i in range(n_layers)], axis=-1)
+            n_out = np.size(wl_cm)
+            result = np.repeat(_alpha_ref_cntm_np[None, :], n_out, axis=0)
             return result if np.ndim(wl_cm) > 0 else result[0]
         _line_at_ref = line_absorption(
             _ref_ll, np.array([lambda_ref_cm]),
@@ -1984,9 +1411,18 @@ def _hminus_bf_jit(nu, T, nH_I_div_U, ne):
     a = jnp.array([1.99654, -1.18267e-1, 2.64243e-2,
                    -4.40524e-3, 3.23992e-4, -1.39568e-5, 2.78701e-7])
 
-    x = wavelength_um
+    in_range = (wavelength_um > 0.125) & (wavelength_um < 1.6419)
+    # (x - 0.125)**1.5 is complex for x < 0.125 and its derivative is infinite
+    # at x == 0.125.  jnp.where selects the 0.0 branch, but it does not stop the
+    # *unselected* branch from being evaluated: below 0.125 um the whole
+    # expression came back complex (so the function returned a complex zero),
+    # and jax.grad returned NaN.  Substituting a wavelength strictly inside the
+    # fit's validity range makes the unselected branch real and smooth.  0.5 um
+    # is used rather than clamping to 0.125, because (x - 0.125)**1.5 has an
+    # infinite derivative exactly at the endpoint.
+    x = jnp.where(in_range, wavelength_um, 0.5)
     sigma = jnp.where(
-        (wavelength_um > 0.125) & (wavelength_um < 1.6419),
+        in_range,
         1e-18 * (a[0] + a[1]*x + a[2]*x**2 + a[3]*x**3 +
                  a[4]*x**4 + a[5]*x**5 + a[6]*x**6) * (x - 0.125)**1.5 / x**3,
         0.0
@@ -2108,6 +1544,20 @@ def _continuum_absorption_jit(wavelength_cm, T, ne, nH_I, nH_II, nHe_I, nH2, U_H
     return alpha_rayleigh + alpha_electron + alpha_H_ff + alpha_Hminus_bf + alpha_Hminus_ff
 
 
+def _dawson_ratio(v):
+    """
+    ``(1 - exp(-v²)) / v``, finite in value *and* gradient at ``v == 0``.
+
+    The limit is 0, and the derivative there is 0 as well.  Evaluating the
+    ratio at a substituted non-zero ``v`` keeps the unselected branch of the
+    surrounding ``jnp.where`` free of the 0/0 that otherwise poisons the
+    reverse-mode cotangent.
+    """
+    tiny = jnp.abs(v) < 1e-6
+    v_safe = jnp.where(tiny, 1.0, v)      # strictly non-zero substitute
+    return jnp.where(tiny, 1.0, (1 - jnp.exp(-v_safe**2)) / v_safe)
+
+
 def _voigt_jit(a, v):
     """
     Voigt-Hjerting function H(a, v) (JIT-compatible approximation).
@@ -2131,9 +1581,14 @@ def _voigt_jit(a, v):
             # Medium |z|
             a / jnp.pi * (1 / (v**2 + a**2) +
                          1.5 / (v**2 + a**2 + 1.5)),
-            # Small |z|: more accurate approximation
+            # Small |z|: more accurate approximation.
+            # (1 - exp(-v^2))/v is 0/0 at v == 0.  jnp.where picks the 1.0
+            # branch there, but the unselected branch is still differentiated
+            # and its NaN cotangent survives the multiply-by-zero, so dH/dv was
+            # NaN at exactly v == 0.  Feeding the ratio a strictly non-zero v
+            # removes the singularity without touching any selected value.
             jnp.exp(-v**2) * (1 - a * 2 / jnp.sqrt(jnp.pi) *
-                              jnp.where(jnp.abs(v) < 1e-6, 1.0, (1 - jnp.exp(-v**2)) / v))
+                              _dawson_ratio(v))
         )
     )
 
@@ -2177,7 +1632,7 @@ def _compute_number_densities_jit(T, n_total, ne, abundances, data):
     Returns arrays indexed by (Z-1) for H I, H II, He I, H2, plus the self-consistent ne.
     """
     # Picard iteration for self-consistent electron density and neutral fractions
-    ne_sol, neutral_fracs = chemical_equilibrium_jit(T, n_total, ne, abundances, data.chem_eq_data)
+    ne_sol, neutral_fracs = picard_chemical_equilibrium_guess(T, n_total, ne, abundances, data.chem_eq_data)
 
     # First-ionization weights at the self-consistent ne
     wII_ne1, _ = _compute_saha_weights_jit(T, 1.0, data.chem_eq_data)
@@ -2231,13 +1686,30 @@ def _pf_orig_eval(log_T, t_arr, u_arr, h_arr, z_arr, n_knots):
     t_arr/u_arr/h_arr/z_arr are padded to 201 entries (inf in tail of t_arr).
     n_knots is the number of valid (unpadded) knots — may be a traced JAX integer.
     """
-    t_max = t_arr[n_knots - 1]
-    log_T_c = jnp.clip(log_T, t_arr[0], t_max)
-    i = jnp.clip(jnp.searchsorted(t_arr, log_T_c, side='right') - 1, 0, n_knots - 2)
-    ti  = t_arr[i];   ti1 = t_arr[i + 1]
+    # A species with a single tabulated knot -- H III, which does not exist --
+    # makes `n_knots - 2` equal -1. jnp.clip(x, 0, -1) returns -1, so `t_arr[i]`
+    # wraps to the last element, which is the *inf padding*, and `h_arr[i + 1]`
+    # becomes a zero divisor. The value is masked downstream but the cotangent is
+    # not, and inf/0 partials meeting a zero cotangent give NaN.
+    #
+    # This is the same degeneracy that was fixed in the table *builder*; the
+    # shipped table predates that fix and still contains it (201 non-finite knot
+    # entries against 199 in a freshly computed one). Guarding here means the
+    # evaluator is correct for both, rather than depending on which table a
+    # caller happens to load -- which is what made a verified-this-morning
+    # gradient come back NaN in production.
+    n_eff = jnp.maximum(n_knots, 2)
+    t_safe = jnp.where(jnp.isfinite(t_arr), t_arr, jnp.finfo(jnp.float64).max)
+    t_max = t_safe[n_eff - 1]
+    log_T_c = jnp.clip(log_T, t_safe[0], t_max)
+    i = jnp.clip(jnp.searchsorted(t_safe, log_T_c, side='right') - 1, 0, n_eff - 2)
+    ti  = t_safe[i];  ti1 = t_safe[i + 1]
     ui  = u_arr[i];   ui1 = u_arr[i + 1]
     zi  = z_arr[i];   zi1 = z_arr[i + 1]
     hi1 = h_arr[i + 1]
+    # Strictly positive substitute, not a clamp to zero: 1/h and h both appear,
+    # so a zero divisor is infinite either way.
+    hi1 = jnp.where(hi1 != 0.0, hi1, 1.0)
     return (zi  * (ti1 - log_T_c)**3 / (6.0 * hi1)
             + zi1 * (log_T_c - ti )**3 / (6.0 * hi1)
             + (ui1 / hi1 - zi1 * hi1 / 6.0) * (log_T_c - ti )
@@ -2391,34 +1863,11 @@ def _compute_line_params_table_jit(
 _voigt_profile_jax_jit = jax.jit(_voigt_profile_jax)
 
 
-@functools.partial(jax.jit, static_argnames=('W', 'n_wl_s', 'n_layers_s'))
-def _voigt_bucket_jit(
-    amp, sigma_D, gamma_L,
-    i_lo_jax, max_wins_jax, wls_jax, wl_jax,
-    *,
-    W: int, n_wl_s: int, n_layers_s: int,
-):
-    """JIT Voigt + scatter for one bucket of lines.
-
-    Parameters already sliced to this bucket; window geometry (i_lo, max_wins)
-    is precomputed at precompute_atmosphere time and passed as JAX arrays.
-
-    amp, sigma_D, gamma_L : (n_b, n_layers)
-    i_lo_jax              : (n_b,) int32  — centered window start pixels
-    max_wins_jax          : (n_b,) float  — half-width in cm per line
-    wls_jax               : (n_b,) float  — line centers [cm]
-    wl_jax                : (n_wl,) float — synthesis wavelength grid [cm]
-    """
-    pix_idx  = i_lo_jax[:, None] + jnp.arange(W)[None, :]          # (n_b, W)
-    delta    = wl_jax[pix_idx] - wls_jax[:, None]                   # (n_b, W)
-    mask     = jnp.abs(delta) <= max_wins_jax[:, None]              # (n_b, W)
-    profiles = _voigt_profile_jax(
-        delta[:, None, :], sigma_D[:, :, None], gamma_L[:, :, None]
-    )  # (n_b, n_layers, W)
-    contrib      = mask[:, None, :] * amp[:, :, None] * profiles    # (n_b, n_layers, W)
-    flat_pix     = pix_idx.ravel()                                    # (n_b * W,)
-    flat_contrib = contrib.transpose(1, 0, 2).reshape(n_layers_s, -1)  # (n_layers, n_b*W)
-    return jax.vmap(lambda c: jnp.zeros(n_wl_s).at[flat_pix].add(c))(flat_contrib)
+# ``_voigt_bucket_jit`` stood here: a single-bucket Voigt-and-scatter kernel with no
+# callers anywhere in src/ or tests/. ``_all_buckets_jit`` below fuses every bucket
+# into one XLA program and superseded it; the traced path in traced_lines.py has
+# since superseded that in turn. Deleted rather than kept: an uncalled kernel is how
+# this package accumulated seven pieces of code that could never have worked.
 
 
 @functools.partial(jax.jit, static_argnames=('bucket_Ws', 'bucket_n_bs', 'n_wl_s', 'n_layers_s'))
@@ -2554,7 +2003,7 @@ def synthesize_jit(
         # ── Phase 1: Picard initial guess for Newton solver ──────────────────────
         # A single Picard pass (300 iterations, all layers at once) gives ne and
         # neutral fractions close enough that Newton converges in ~5 iterations.
-        ne_init, nf_init = _chemical_equilibrium_batch_jit(
+        ne_init, nf_init = _picard_chemical_equilibrium_guess_batch(
             T_layers, n_total_layers, ne_layers, abundances, data.chem_eq_data
         )
 
@@ -2656,10 +2105,16 @@ def synthesize_jit(
             lambda row: jnp.interp(wavelengths_cm, cntm_wl_jnp, row)
         )(alpha_cntm_coarse)  # (n_layers, n_wl)
 
-        # Reference opacity at lambda_ref from coarse grid (matches synthesize's alpha_cntm_interp(lambda_ref))
-        alpha_ref_all = jax.vmap(
-            lambda row: jnp.interp(jnp.array([lambda_ref_cm]), cntm_wl_jnp, row)[0]
-        )(alpha_cntm_coarse)  # (n_layers,)
+        # Reference opacity: evaluate the continuum *at* lambda_ref, as Korg.jl
+        # does.  Reading it off the synthesis window's coarse grid returns the
+        # clamped edge value whenever the window excludes 5000 Å, which
+        # rescales the entire anchored optical-depth scale.
+        alpha_ref_all = _batch_continuum_vmap(
+            jnp.array([c_cgs_float / lambda_ref_cm]), T_layers, ne_all,
+            U_H_I_all, U_He_I_all, nH_I_all, nH_II_all, nHe_I_all, nH2_all,
+            n_peach, n_Z1_ff, n_Z2_ff, metal_bf_dens,
+            data.metal_bf_tables, data.metal_bf_nu_grid, data.metal_bf_logT_grid
+        )[:, 0]  # (n_layers,)
 
         # Add line absorption at reference wavelength to alpha_ref_all (matching Julia).
         # Julia's alpha_ref = continuum + lines at 5000 Å.
@@ -2680,10 +2135,11 @@ def synthesize_jit(
             _mol_np = np.asarray(mol_dens)
             for _i, _mol_sp in enumerate(default_mol_species):
                 _nd_ref[_mol_sp] = _mol_np[:, _i]
-            _cntm_coarse_np = np.asarray(alpha_cntm_coarse)
+            # Korg.jl: a constant per-layer continuum equal to alpha_ref.
+            _alpha_ref_cntm_np = np.asarray(alpha_ref_all)
             def _cntm_at_ref_jit_fn(wl_cm):
-                wl_arr = np.atleast_1d(wl_cm)
-                result = np.stack([np.interp(wl_arr, cntm_wl_np_cached, _cntm_coarse_np[i]) for i in range(n_layers)], axis=-1)
+                n_out = np.size(wl_cm)
+                result = np.repeat(_alpha_ref_cntm_np[None, :], n_out, axis=0)
                 return result if np.ndim(wl_cm) > 0 else result[0]
             _line_at_ref = line_absorption(
                 _ref_ll, np.array([lambda_ref_cm]),
@@ -2963,3 +2419,15 @@ def synthesize_jit(
 
     # Convert cm⁻¹ → Å⁻¹ (1 cm = 1e8 Å)
     return flux * 1e-8, flux_cntm * 1e-8
+
+
+# ---------------------------------------------------------------------------
+# The public entry point
+# ---------------------------------------------------------------------------
+# One implementation, three import paths. ``synthesize`` and ``synth`` live in
+# ``korg.synthesis_plan`` next to ``prepare_synthesis``, the plan they build; they
+# are re-exported here because ``korg.synthesis`` is where callers have always
+# looked for them. Imported at the bottom because ``synthesis_plan`` imports this
+# module (lazily, inside its functions), and a top-of-file import would close the
+# cycle at import time.
+from .synthesis_plan import synthesize, synth  # noqa: E402,F401

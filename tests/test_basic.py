@@ -63,12 +63,13 @@ def test_synthesis_basic():
 
     # Synthesize a small wavelength range
     wavelengths_ang = np.linspace(5000.0, 5010.0, 50)
-    result = korg.synthesize(
-        atm, linelist, wavelengths_ang, A_X, verbose=False
+    # ``synthesize`` returns ``(flux, continuum)``; the wavelength grid is the
+    # one that was passed in. ``korg.synth`` returns all three.
+    wavelengths, flux_abs, continuum = korg.synth(
+        atm, linelist, wavelengths_ang, A_X
     )
-    wavelengths = result.wavelengths
-    flux = result.flux / result.continuum  # continuum-normalized
-    continuum = result.continuum
+    flux = np.asarray(flux_abs) / np.asarray(continuum)  # continuum-normalized
+    continuum = np.asarray(continuum)
 
     # Check outputs
     assert len(wavelengths) > 0

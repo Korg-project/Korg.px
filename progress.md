@@ -2,6 +2,36 @@
 
 This file tracks the progress of converting Julia functions to JAX-compatible Python.
 
+**Reference version: Korg.jl v1.2.1** (pinned exactly in `Project.toml`). All Julia reference
+fixtures are regenerated from that release; `tests/test_julia_reference.py` asserts the fixtures
+carry a matching version stamp.
+
+## Chemical equilibrium
+
+Both solvers implement the Korg.jl v1.2 formulation: the system is solved in log₁₀ space with a
+step-clipped Newton method, nₑ is a free parameter with its own charge-balance equation, H⁻ is
+carried as a species via `Hminus_nK(T)`, molecules contribute their locked-up nuclei to the nucleus
+budget, and a continuation on molecular abundance anneals into cool, dense regimes.
+
+There are deliberately two of them, and the names say which is which:
+
+| Function | Role | Accuracy | JIT | Autodiff |
+|---|---|---|---|---|
+| `reference_chemical_equilibrium` | oracle — direct spline evaluation, adaptive continuation | 8e-15 vs Korg.jl v1.2.1 | no | no |
+| `_chem_eq_newton_layer_jit` (via `chemical_equilibrium_all_layers`) | the synthesis path — tabulated coefficients, fixed continuation, hand-written analytic Jacobian | 1.6e-9 vs the oracle | yes | reverse + forward |
+| `picard_chemical_equilibrium_guess` | initialiser only — Picard iteration neglecting molecules, seeds the solver above | n/a | yes | forward only |
+
+The reference solver is not traceable in either AD mode: its adaptive schedule branches on Python
+control flow and it returns Python floats. That is intentional — it exists to be the thing the fast
+path is checked against. The batched solver gets its derivatives from the implicit function theorem
+(`dy* = −J⁻¹ ∂F/∂θ`) rather than by unrolling the iteration.
+
+Remaining differences between this port and the v1.2.1 target:
+
+- **H⁻ opacity.** v1.2 also changed `Hminus_bf` to take n(H⁻) directly instead of deriving it from
+  a local Saha relation. `continuum.Hminus_bf` still derives it internally. The two agree to <1e-6
+  at solar conditions, and both solvers now return n(H⁻) for callers that want it.
+
 Legend:
 - [ ] Not started
 - [x] Completed
@@ -228,7 +258,13 @@ Each function has three checkboxes:
 
 | Level | Function | Note | Converted | Tested (no JIT) | Tested (JIT) |
 |-------|----------|------|-----------|-----------------|--------------|
-| 4 | `chemical_equilibrium(T, nₜ, nₑ, ...)` | solve equilibrium (JIT via chemical_equilibrium_jit) | ✓ | ✓ | ✓ |
+| 4 | `reference_chemical_equilibrium(T, nₜ, nₑ, ...)` | oracle only, not the synthesis path. Direct spline evaluation + adaptive continuation. Matches v1.2.1 to 8e-15 | ✓ | ✓ | N/A (Python control flow) |
+| 4 | `Hminus_nK(T)` | H⁻ formation coefficient, n(H⁻) = nK·n(H I)·nₑ (new in v1.2) | ✓ | ✓ | ✓ |
+| 4 | `clipped_newton(...)` | Newton with per-decade step clipping, matches v1.2 `clipped_newton` | ✓ | ✓ | N/A (Python loop) |
+| 4 | `_chem_eq_log_residuals` / `_chem_eq_log_jacobian` | v1.2 residuals and hand-written analytic Jacobian; Jacobian checked against `jacfwd` to 5.8e-16 | ✓ | ✓ | ✓ |
+| 4 | `_chem_eq_newton_layer_jit(...)` | the synthesis solver. Fixed continuation, implicit-function-theorem derivatives. Matches the oracle to 1.6e-9 | ✓ | ✓ | ✓ |
+| 4 | `chemical_equilibrium_all_layers(...)` | batched entry point used by `synthesize()` | ✓ | ✓ | ✓ |
+| 4 | `picard_chemical_equilibrium_guess(...)` | initialiser only — seeds the solver above, neglects molecules | ✓ | ✓ | ✓ |
 
 ### Total Continuum (`continuum.py`)
 

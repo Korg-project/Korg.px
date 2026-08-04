@@ -36,18 +36,26 @@ class StarkProfileLine:
     def __init__(self, temps, nes, profile_interp, lambda0_interp,
                  lower, upper, Kalpha, log_gf,
                  log_delta_nu_grid=None, profile_data=None, lambda0_data_array=None):
-        self.temps = jnp.array(temps)
-        self.electron_number_densities = jnp.array(nes)
+        # Held as NumPy and converted to JAX lazily, by the properties below.
+        #
+        # These are constant tables. Nothing is differentiated through their
+        # construction and no kernel consumes them until a synthesis touches
+        # hydrogen, but this class is instantiated 84 times at *import* time, once
+        # per Stehle-Hutcheon transition. Building the arrays eagerly with `jnp`
+        # made `import korg` dispatch ~550 one-op XLA compilations on the CUDA
+        # backend -- 15.7 s of the 25 s import, and the ~1,100 `'+ptx85' is not a
+        # recognized feature` lines that came with it. The identical preparation in
+        # NumPy takes 0.102 s.
+        self._temps_np = np.asarray(temps, dtype=np.float64)
+        self._nes_np = np.asarray(nes, dtype=np.float64)
         # Concrete Python-float grid bounds. These are used for the (data-dependent,
         # control-flow) in-bounds check on T/ne. Keeping them as plain floats means
         # the check never creates JAX tracers, even when prepare_stark_profiles_for_jit
         # runs inside an enclosing jax.jit trace.
-        _temps_np = np.asarray(temps, dtype=np.float64)
-        _nes_np = np.asarray(nes, dtype=np.float64)
-        self.temp_min = float(_temps_np.min())
-        self.temp_max = float(_temps_np.max())
-        self.ne_min = float(_nes_np.min())
-        self.ne_max = float(_nes_np.max())
+        self.temp_min = float(self._temps_np.min())
+        self.temp_max = float(self._temps_np.max())
+        self.ne_min = float(self._nes_np.min())
+        self.ne_max = float(self._nes_np.max())
         self.lower = lower
         self.upper = upper
         self.Kalpha = Kalpha
@@ -57,10 +65,48 @@ class StarkProfileLine:
         self.profile = profile_interp
         self.lambda0 = lambda0_interp
 
-        # JAX-compatible data arrays
-        self.log_delta_nu_grid = jnp.array(log_delta_nu_grid) if log_delta_nu_grid is not None else None
-        self.profile_data = jnp.array(profile_data) if profile_data is not None else None
-        self.lambda0_data = jnp.array(lambda0_data_array) if lambda0_data_array is not None else None
+        # JAX-compatible data arrays, held as NumPy until first use.
+        self._log_delta_nu_grid_np = (np.asarray(log_delta_nu_grid)
+                                      if log_delta_nu_grid is not None else None)
+        self._profile_data_np = (np.asarray(profile_data)
+                                 if profile_data is not None else None)
+        self._lambda0_data_np = (np.asarray(lambda0_data_array)
+                                 if lambda0_data_array is not None else None)
+        self._jax_cache = {}
+
+    # -- lazily-converted JAX views ------------------------------------------
+    #
+    # Properties rather than plain attributes so the public type is unchanged:
+    # callers that read `line.profile_data` still get a JAX array, and the ones
+    # that wrap it in `jnp.asarray` anyway are unaffected. The device transfer
+    # happens once per array, on first touch, instead of 84 times at import.
+
+    def _as_jax(self, name, value):
+        if value is None:
+            return None
+        if name not in self._jax_cache:
+            self._jax_cache[name] = jnp.asarray(value)
+        return self._jax_cache[name]
+
+    @property
+    def temps(self):
+        return self._as_jax("temps", self._temps_np)
+
+    @property
+    def electron_number_densities(self):
+        return self._as_jax("nes", self._nes_np)
+
+    @property
+    def log_delta_nu_grid(self):
+        return self._as_jax("log_delta_nu_grid", self._log_delta_nu_grid_np)
+
+    @property
+    def profile_data(self):
+        return self._as_jax("profile_data", self._profile_data_np)
+
+    @property
+    def lambda0_data(self):
+        return self._as_jax("lambda0_data", self._lambda0_data_np)
 
     def interpolate_lambda0_jax(self, T: float, ne: float) -> float:
         """
@@ -126,21 +172,24 @@ def _load_stark_profiles(fname: str) -> Dict[str, StarkProfileLine]:
             Kalpha = float(grp.attrs['Kalpha'])
             log_gf = float(grp.attrs['log_gf'])
 
-            # Create log profile, handling -Inf values
-            #with jnp.errstate(divide='ignore', invalid='ignore'):
-            logP = jnp.log(P)
+            # NumPy, not JAX: this is one-time host-side table preparation that
+            # runs at import, and every eager `jnp` op here is a separate XLA
+            # compilation. See the note in StarkProfileLine.__init__.
+            with np.errstate(divide='ignore', invalid='ignore'):
+                logP = np.log(P)
             # Clipping to -700 (slightly larger than log(floatmin)) to avoid NaNs
-            logP = jnp.where(jnp.isfinite(logP), logP, -700.0)
+            logP = np.where(np.isfinite(logP), logP, -700.0)
 
             # Prepare grid for interpolation
             # Julia uses: (temps, nes, [-floatmax; log.(delta_nu_over_F0[2:end])])
             # For the first delta_nu_over_F0 (which is 0), use -floatmax equivalent
-            log_delta_nu = jnp.log(delta_nu_over_F0[1:])  # Skip first element (0)
-            log_delta_nu_grid = jnp.concatenate([jnp.array([-1e308]), log_delta_nu])
+            with np.errstate(divide='ignore', invalid='ignore'):
+                log_delta_nu = np.log(delta_nu_over_F0[1:])  # Skip first element (0)
+            log_delta_nu_grid = np.concatenate([np.array([-1e308]), log_delta_nu])
 
             # Transpose logP to match interpolator convention: (temps, nes, delta_nu)
             # HDF5 has shape (delta_nu, ne, temps), we need (temps, nes, delta_nu)
-            logP_transposed = jnp.transpose(logP, (2, 1, 0))
+            logP_transposed = np.transpose(logP, (2, 1, 0))
 
             # Create 3D interpolator for profile
             # Uses flat extrapolation (values outside bounds use nearest boundary value)

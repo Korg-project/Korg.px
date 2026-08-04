@@ -226,12 +226,14 @@ def metal_bf_absorption(
         # In the table, log(0) is represented as -inf
         mask = jnp.isfinite(log_sigma)
 
-        # Convert from log10(sigma) in 10^-18 cm^2 to cm^2 and multiply by density
-        # sigma is in units of 10^-18 cm^2 in the table
+        # The tables store the *natural* log of sigma in Megabarns, so exponentiate
+        # directly (Korg.jl: `exp.(log(n) .+ log_σ) * 1e-18`). Scaling log_sigma by
+        # ln(10) here treated the table as log10 and was wrong by orders of magnitude.
+        # sigma[cm^2] = exp(log_sigma) * 1e-18
         # Only add where cross-section is finite and density is positive
         contribution = jnp.where(
             mask,
-            jnp.exp(jnp.log(jnp.maximum(n_density, 1e-300)) + log_sigma * jnp.log(10.0)) * 1e-18,
+            jnp.exp(jnp.log(jnp.maximum(n_density, 1e-300)) + log_sigma) * 1e-18,
             0.0
         )
         out_alpha = out_alpha + contribution

@@ -33,7 +33,7 @@ import tempfile
 import pytest
 
 from korg.linelist import Line, Species
-from korg.synthesis import synthesize
+from korg.synthesis_plan import synthesize
 from korg.atmosphere import PlanarAtmosphere, PlanarAtmosphereLayer
 from korg.abundances import format_A_X
 from korg.constants import kboltz_cgs
@@ -268,11 +268,10 @@ def test_galah_solar_synthesis():
 
     # Get solar abundances
     print("\nSetting up solar abundances...")
+    # ``synthesize`` takes A(X) directly; it used to take absolute number
+    # fractions, and the conversion that stood here is now its own job.
     A_X = format_A_X(default_metals_H=0.0, default_alpha_H=0.0)  # Solar
-    abundances = 10**(A_X - 12)
-    # Normalize to sum to 1 (fractional abundances)
-    abundances = abundances / abundances.sum()
-    print(f"  ✓ Abundances set (sum = {abundances.sum():.3f})")
+    print(f"  ✓ Abundances set (A(Fe) = {A_X[25]:.2f})")
 
     # Read VALD linelist for this region
     #print(f"\nReading VALD linelist...")
@@ -296,34 +295,30 @@ def test_galah_solar_synthesis():
     print("Python Korg Synthesis")
     print("="*70)
 
-    def _run_py_synth(verbose):
-        return synthesize(
-            atmosphere=atm,
-            linelist=linelist,
-            wavelengths_angstrom=wavelengths,
-            abundances=abundances,
-            vmic=1.0,  # km/s
-            hydrogen_lines=True,
-            verbose=verbose,
-        )
+    def _run_py_synth():
+        flux, cntm = synthesize(atm, linelist, wavelengths, A_X,
+                                vmic=1.0,  # km/s
+                                hydrogen_lines=True)
+        # block_until_ready: the traced path returns JAX arrays, so without this
+        # the timing would measure dispatch rather than synthesis.
+        return np.asarray(flux), np.asarray(cntm)
 
-    # Cold call: includes JAX tracing/compilation. synthesize() returns flux as a
-    # materialized numpy array (np.array(...)), which forces the device
-    # computation to finish, so the wall time captures the full synthesis.
+    # Cold call: includes JAX tracing/compilation, and building the plan.
     _t0 = time.perf_counter()
-    result_py = _run_py_synth(verbose=True)
+    result_py = _run_py_synth()
     py_cold_seconds = time.perf_counter() - _t0
 
-    # Warm call: identical shapes, so JAX reuses the compiled executable.
+    # Warm call: identical shapes, so JAX reuses the compiled executable. The
+    # plan is rebuilt, though -- ``prepare_synthesis`` is the form that avoids
+    # that, and is what a real timing comparison should use.
     _t0 = time.perf_counter()
-    result_py = _run_py_synth(verbose=False)
+    result_py = _run_py_synth()
     py_warm_seconds = time.perf_counter() - _t0
 
     print(f"\n  Python synthesis wall time: cold={py_cold_seconds:.3f} s, "
           f"warm={py_warm_seconds:.3f} s")
 
-    flux_py = np.array(result_py.flux)
-    continuum_py = np.array(result_py.continuum)
+    flux_py, continuum_py = result_py
     cnorm_py = flux_py / continuum_py
 
     print(f"\n✓ Python synthesis complete")

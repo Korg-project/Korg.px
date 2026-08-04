@@ -30,7 +30,10 @@ jobs:
 
       - name: Install Julia dependencies
         run: |
-          julia --project=. -e 'using Pkg; Pkg.instantiate()'
+          # Project.toml pins Korg exactly, so this resolves to the targeted
+          # release or fails. Print it so the log records which physics the
+          # reference data was built from.
+          julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.status("Korg")'
 
       - name: Generate Julia reference data
         run: |
@@ -89,7 +92,10 @@ jobs:
 
       - name: Install Julia dependencies
         run: |
-          julia --project=. -e 'using Pkg; Pkg.instantiate()'
+          # Project.toml pins Korg exactly, so this resolves to the targeted
+          # release or fails. Print it so the log records which physics the
+          # reference data was built from.
+          julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.status("Korg")'
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v6

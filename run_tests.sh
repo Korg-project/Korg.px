@@ -12,19 +12,36 @@ done
 
 cd "$(dirname "$0")"
 
-# Step 1: Julia reference data
-if [[ $REGEN -eq 1 ]] || [[ ! -f tests/julia_reference_data.json ]] || [[ ! -f julia_solar_synthesis.h5 ]]; then
-    echo "==> Generating Julia reference data..."
-    julia --project=. tests/generate_julia_reference.jl
-    julia --project=. tests/generate_solar_synthesis_reference.jl
-else
-    echo "==> Julia reference data already present (use --regen to refresh)"
-fi
+# Every reference fixture the test suite compares against, and the script that
+# builds it. All of them come from the Korg.jl version pinned in Project.toml.
+REFERENCES=(
+    "tests/julia_reference_data.json:tests/generate_julia_reference.jl"
+    "julia_solar_synthesis.h5:tests/generate_solar_synthesis_reference.jl"
+    "julia_broad_solar_synthesis.h5:tests/generate_broad_solar_reference.jl"
+    "tests/data/balmer_abo_reference.h5:tests/gen_balmer_abo_reference.jl"
+)
 
-# Step 2: CI artifact placeholders
+# Step 1: Julia environment. The exact-version pin in Project.toml means this
+# resolves to the targeted Korg.jl release or fails loudly.
+echo "==> Instantiating Julia environment..."
+julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.status("Korg")'
+
+# Step 2: Julia reference data
+for entry in "${REFERENCES[@]}"; do
+    target="${entry%%:*}"
+    script="${entry#*:}"
+    if [[ $REGEN -eq 1 ]] || [[ ! -f "$target" ]]; then
+        echo "==> Generating $target..."
+        julia --project=. "$script"
+    else
+        echo "==> $target already present (use --regen to refresh)"
+    fi
+done
+
+# Step 3: CI artifact placeholders
 echo "==> Setting up CI artifact placeholders..."
 python .github/scripts/setup_ci_artifacts.py
 
-# Step 3: Tests
+# Step 4: Tests
 echo "==> Running tests..."
 pytest tests/ -v --tb=short
