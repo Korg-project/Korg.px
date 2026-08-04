@@ -111,15 +111,30 @@ jobs:
         run: |
           python .github/scripts/setup_ci_artifacts.py
 
+      # The XLA executables the suite compiles are keyed by a hash of the HLO
+      # module plus the jaxlib version, so a stale entry can never be wrong --
+      # it simply will not be hit. Restoring it skips the chemical-equilibrium
+      # kernel build, which is the bulk of the run.
+      - name: Cache compiled JAX kernels
+        uses: actions/cache@v4
+        with:
+          path: .jax_cache
+          key: jax-cache-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('src/korg/**/*.py', 'pyproject.toml') }}
+          restore-keys: |
+            jax-cache-${{ runner.os }}-py${{ matrix.python-version }}-
+
+      # -n 1 on purpose: the hosted runners have two cores, so extra workers
+      # contend for CPU and each one pays its own compilation. Locally,
+      # run_tests.sh uses -n 8.
       - name: Run tests
         run: |
-          pytest tests/ -v --tb=short
+          pytest tests/ -v --tb=short -n 1
 
       - name: Run tests with coverage
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         run: |
           pip install pytest pytest-cov
-          pytest tests/ --cov --cov-branch --cov-report=xml
+          pytest tests/ --cov --cov-branch --cov-report=xml -n 1
 
       - name: Upload coverage reports to Codecov
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
