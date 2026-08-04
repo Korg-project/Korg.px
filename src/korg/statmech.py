@@ -1286,10 +1286,17 @@ def _chem_eq_solve_log(T, n_total, abundances, data, y0):
         # A diverged step leaves y unchanged rather than poisoning the rest of the walk.
         return jnp.where(jnp.all(jnp.isfinite(y_new)), y_new, y)
 
-    y = y0
-    for log_xi in _XI_SCHEDULE:
+    # The schedule is walked with a scan rather than a Python loop so that
+    # ``newton_step`` -- a 93x93 Jacobian assembly and a dense solve -- is emitted into
+    # the HLO once instead of once per schedule entry. The iteration is identical either
+    # way (scan is sequential, and the trip count is static), but the unrolled form cost
+    # ~65 s of XLA compilation per shape, which the test suite paid over and over.
+    def _anneal(y, log_xi):
         y = jax.lax.fori_loop(0, _XI_INNER_ITERS,
-                              lambda _, yy, lx=log_xi: newton_step(yy, lx), y)
+                              lambda _, yy: newton_step(yy, log_xi), y)
+        return y, None
+
+    y, _ = jax.lax.scan(_anneal, y0, jnp.asarray(_XI_SCHEDULE, dtype=y0.dtype))
     return jax.lax.fori_loop(0, _XI_FINAL_ITERS, lambda _, yy: newton_step(yy, 0.0), y)
 
 

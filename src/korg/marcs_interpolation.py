@@ -428,23 +428,35 @@ def _interpolate_marcs_jit(
     # grid shape: (n_layers, 5, d0, d1, d2, d3, d4)
     n_layers = grid.shape[0]
     n_quant = grid.shape[1]
+    # Cut the 2x2x2x2x2 bracket out of the grid once, then read the corners from
+    # that. The obvious form -- walking the full grid down to a scalar index
+    # inside the corner loop -- reads the 619 MB grid constant 32 separate times,
+    # and XLA sizes the compilation accordingly: 32 x 619 MB is ~20 GB, and a
+    # forward synthesis through here measured a 25 GB compile against 740 MB for
+    # the entire rest of the opacity stack (reverse mode doubled it to 46 GB).
+    # The bracket is 56 x 5 x 32 float32 = 36 KB.
+    #
+    # ``upper[i]`` is clipped to [1, n_nodes-1], so the slice start is in range
+    # and start + 2 never runs off the end. The corner values and the weights
+    # they are combined with are exactly those the per-corner gathers produced.
+    block = grid  # (n_layers, n_quant, d0, d1, d2, d3, d4)
+    for i in range(N_PARAMS):
+        # dynamic_slice_in_dim keeps the axis (size 2), so the next parameter's
+        # axis is 2 + i rather than a fixed 2.
+        block = jax.lax.dynamic_slice_in_dim(block, upper[i] - 1, 2, axis=2 + i)
+
     result = jnp.zeros((n_layers, n_quant), dtype=jnp.float64)
 
     for corner in range(1 << N_PARAMS):
         # bits[i] ∈ {0, 1}: whether to use the upper node in dimension i
-        bits = jnp.array([(corner >> i) & 1 for i in range(N_PARAMS)], dtype=jnp.int32)
+        bit_list = [(corner >> i) & 1 for i in range(N_PARAMS)]
+        bits = jnp.array(bit_list, dtype=jnp.int32)
 
         # Corner weight: product of (w if upper, (1-w) if lower)
         w_corner = jnp.prod(jnp.where(bits, weights, 1.0 - weights))
 
-        # Gather grid value at this corner using jnp.take (traced-index safe)
-        # We sequentially index each parameter dimension; after each take the
-        # consumed dimension is gone and the next parameter is always at axis 2.
-        val = grid  # (n_layers, n_quant, d0, d1, d2, d3, d4)
-        for i in range(N_PARAMS):
-            idx_i = upper[i] - 1 + bits[i]  # traced int32 scalar
-            val = jnp.take(val, idx_i, axis=2)
-        # val now has shape (n_layers, n_quant)
+        # Static indices into the 2-wide bracket -- no traced index, no gather.
+        val = block[(slice(None), slice(None)) + tuple(bit_list)]
 
         result = result + w_corner * val
 
