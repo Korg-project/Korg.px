@@ -110,6 +110,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test]"
 
+      # The MARCS grids are the one artifact CI cannot fake. prepare_synthesis
+      # *measures* each line's window at a reference (Teff, logg, [M/H]) rather
+      # than guessing it, so it interpolates the grid on every call -- and so
+      # does everything built on it. Against the 0-byte placeholder,
+      # load_marcs_grid hands back its single-point dummy grid at Teff=5000 and
+      # the whole synthesis path dies with
+      #
+      #     AtmosphereInterpolationError: Teff is out of bounds (5777.0 in [5000.0, 5000.0])
+      #
+      # which was 36 failures and 72 errors. Placeholders predate the plan, and
+      # skipping everything they break would take the synthesis path -- the
+      # point of the package -- out of CI entirely. So fetch the real thing.
+      #
+      # Restore before the placeholder step: create_placeholder_artifact uses
+      # Path.touch(), which does not truncate, and is_placeholder_file goes by
+      # size, so a restored grid survives that step intact.
+      - name: Cache MARCS atmosphere grids
+        id: marcs-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.korg
+          key: korg-artifacts-${{ runner.os }}-marcs-v2
+
+      - name: Download MARCS atmosphere grids
+        if: steps.marcs-cache.outputs.cache-hit != 'true'
+        run: |
+          python - <<'PY'
+          from korg.marcs_interpolation import get_marcs_grid_path
+          for grid in ("standard", "low_Z", "cool_dwarfs"):
+              print(f"{grid}: {get_marcs_grid_path(grid, auto_download=True)}")
+          PY
+
       - name: Setup CI artifacts (placeholders)
         run: |
           python .github/scripts/setup_ci_artifacts.py

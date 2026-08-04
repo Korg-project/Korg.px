@@ -301,9 +301,19 @@ class TestPruneLinelistFunctional:
         gone; the densities now come from ``_photosphere_opacities``, so that is
         what is intercepted instead.
         """
-        from korg import prune_linelist as pl
+        import importlib
+
         from korg.prune_linelist import prune_linelist
         from korg.species import Species
+
+        # ``korg/__init__.py`` does ``from .prune_linelist import prune_linelist``,
+        # which rebinds the ``korg.prune_linelist`` attribute from the submodule
+        # to the function of the same name. ``from korg import prune_linelist``
+        # and ``import korg.prune_linelist as pl`` therefore both hand back the
+        # function -- ``import ... as`` falls back to getattr -- and the patch
+        # below lands on a function object instead of the module. Go through
+        # importlib, which reads sys.modules and so gets the module itself.
+        pl = importlib.import_module("korg.prune_linelist")
 
         real = pl._photosphere_opacities
         target = Species("FeH")

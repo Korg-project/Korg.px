@@ -439,7 +439,18 @@ class TestSynthesizeOptions:
         flux, cntm = _synth(tiny_atm, [fe_line], tiny_wls, A_X,
                             hydrogen_lines=False)
         assert np.any(flux < cntm), "the line must depress the flux"
-        np.testing.assert_allclose(cntm, baseline[1], rtol=1e-12)
+        # The continuum is close to, but not independent of, the linelist, so
+        # this cannot be rtol=1e-12. traced_synthesis computes
+        #
+        #     alpha_ref_all = (alpha_cntm_all + line_alpha)[:, ref_pixel]
+        #
+        # and hands that same reference opacity to *both* transfers, the full
+        # one and the continuum-only one. A line at the reference pixel
+        # therefore shifts the tau scale the continuum is integrated against.
+        # That follows Korg.jl's tau_5000 convention rather than being a bug:
+        # alpha_ref is the total opacity at 5000 A, lines included. Measured
+        # here at 1.1e-3, and 2.8e-3 for the full VALD solar list.
+        np.testing.assert_allclose(cntm, baseline[1], rtol=1e-2)
 
     def test_hydrogen_lines_change_the_spectrum(self, tiny_atm, A_X):
         """Evaluated at Hβ, where switching H lines off is unmistakable."""
@@ -1110,8 +1121,13 @@ class TestJit:
     def test_planck_function_jits(self):
         nu = np.array([c_cgs / 5e-5, c_cgs / 1e-4])
         out = jax.jit(lambda T: planck_function(nu, T))(5777.0)
+        # A few ULP rather than rtol=0. jit is not required to reproduce the
+        # eager result bit for bit: XLA fuses and reassociates the exponential
+        # and the division, which moves the last place or two. Observed drift
+        # here is ~9e-16 relative, i.e. 4 ULP of float64.
         np.testing.assert_allclose(np.asarray(out),
-                                   np.asarray(planck_function(nu, 5777.0)), rtol=0)
+                                   np.asarray(planck_function(nu, 5777.0)),
+                                   rtol=1e-14)
 
     def test_blackbody_vmaps_over_layers(self):
         wl = np.linspace(4e-5, 6e-5, 7)
