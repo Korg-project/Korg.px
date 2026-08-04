@@ -64,11 +64,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        # One Python version on purpose. The suite's cost is dominated by XLA
+        # compilation and by the synthesis comparisons, neither of which varies
+        # across interpreter minor versions -- the three-version matrix was
+        # paying triple for the same physics. 3.11 is the one the coverage step
+        # below keys on. pyproject declares support for 3.10-3.13, so a release
+        # is still worth checking more widely than a push is.
+        python-version: ["3.11"]
         os: [ubuntu-latest, macos-latest]
-        exclude:
-          - os: macos-latest
-            python-version: "3.10"
 
     steps:
       - uses: actions/checkout@v6
