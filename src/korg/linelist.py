@@ -22,6 +22,13 @@ from .data_loader import ionization_energies
 # in Korg.jl's utils.jl. Re-exported here (and from ``korg``) so that
 # ``korg.linelist.air_to_vacuum`` keeps working.
 from .utils import air_to_vacuum, vacuum_to_air  # noqa: F401
+# NIST isotopic abundances, atomic number -> {mass number -> abundance}. This
+# module used to carry a hand-transcribed copy that stopped at Z = 30, which
+# silently disabled isotopic log gf scaling for everything heavier — Ba, the
+# element Kurucz linelists split into the most HFS/isotope components, being the
+# obvious casualty. korg.isotopic_data is the machine-generated transcription of
+# Korg.jl's isotopic_data.jl, so there is one table and it is that one.
+from .isotopic_data import isotopic_abundances  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -474,39 +481,159 @@ def approximate_line_strength(line: Line, T: float) -> float:
     return line.log_gf + math.log10(line.wl) - math.log10(math.e) * line.E_lower / (kboltz_eV * T)
 
 
-# NIST isotopic abundances: maps atomic number -> {mass_number -> abundance}
-isotopic_abundances = {
-    1: {1: 1.0, 2: 1e-10},
-    2: {3: 1.34e-6, 4: 0.99999866},
-    3: {6: 0.0759, 7: 0.9241},
-    4: {9: 1.0},
-    5: {10: 0.199, 11: 0.801},
-    6: {12: 0.9893, 13: 0.0107},
-    7: {14: 0.99636, 15: 0.00364},
-    8: {16: 0.99757, 17: 0.00038, 18: 0.00205},
-    9: {19: 1.0},
-    10: {20: 0.9048, 21: 0.0027, 22: 0.0925},
-    11: {23: 1.0},
-    12: {24: 0.7899, 25: 0.1, 26: 0.1101},
-    13: {27: 1.0},
-    14: {28: 0.92223, 29: 0.04685, 30: 0.03092},
-    15: {31: 1.0},
-    16: {32: 0.9499, 33: 0.0075, 34: 0.0425, 36: 0.0001},
-    17: {35: 0.7576, 37: 0.2424},
-    18: {36: 0.003336, 38: 0.000629, 40: 0.996035},
-    19: {39: 0.932581, 40: 0.000117, 41: 0.067302},
-    20: {40: 0.96941, 42: 0.00647, 43: 0.00135, 44: 0.02086, 46: 4.0e-5, 48: 0.00187},
-    21: {45: 1.0},
-    22: {46: 0.0825, 47: 0.0744, 48: 0.7372, 49: 0.0541, 50: 0.0518},
-    23: {50: 0.0025, 51: 0.9975},
-    24: {50: 0.04345, 52: 0.83789, 53: 0.09501, 54: 0.02365},
-    25: {55: 1.0},
-    26: {54: 0.05845, 56: 0.91754, 57: 0.02119, 58: 0.00282},
-    27: {59: 1.0},
-    28: {58: 0.68077, 60: 0.26223, 61: 0.011399, 62: 0.036346, 64: 0.009255},
-    29: {63: 0.6915, 65: 0.3085},
-    30: {64: 0.4917, 66: 0.2773, 67: 0.0404, 68: 0.1845, 70: 0.0061},
+def _parse_or_zero(dtype, s: str):
+    """
+    Parse ``s``, treating a blank or whitespace-only field as zero.
+
+    Kurucz linelists come out of Fortran ``FORMAT`` statements, where an all-blank
+    numeric field reads back as zero rather than raising. Korg.jl's ``parse_or_zero``
+    (linelist.jl) does the same.
+    """
+    s = s.strip()
+    return dtype(s) if s else dtype(0)
+
+
+def _first_nonempty_line(path: str):
+    """Return the first line of ``path`` that is not entirely whitespace, or ''."""
+    with open(path, 'r') as fp:
+        for raw in fp:
+            if raw.strip():
+                return raw
+    return ''
+
+
+# Kurucz "gfall" records are fixed-width, 160 characters wide, and the fields are
+# addressed by column rather than by whitespace splitting (many of them run into
+# their neighbours). These are Korg.jl's slices from parse_kurucz_linelist in
+# linelist.jl, translated from Julia's inclusive 1-based ranges to Python's
+# half-open 0-based ones.
+_KURUCZ_COLUMNS = {
+    'wl': slice(0, 11),           # Julia  1:11   wavelength, nm
+    'log_gf': slice(11, 18),      # Julia 12:18
+    'species': slice(18, 24),     # Julia 19:24   MOOG-style code, e.g. " 26.00"
+    'E_level_1': slice(24, 36),   # Julia 25:36   cm^-1
+    'E_level_2': slice(52, 64),   # Julia 53:64   cm^-1
+    'log_gamma_rad': slice(80, 86),    # Julia 81:86
+    'log_gamma_stark': slice(86, 92),  # Julia 87:92
+    'vdW': slice(92, 98),         # Julia 93:98
+    'isotope_1': slice(106, 109),      # Julia 107:109
+    'hyperfine_log_gf': slice(109, 115),  # Julia 110:115
+    'isotope_2': slice(115, 118),      # Julia 116:118
+    'isotope_log_gf': slice(118, 124),  # Julia 119:124
 }
+
+
+def parse_kurucz_linelist(f, isotopic_abundances=None, vacuum: bool = False,
+                          verbose: bool = False) -> list:
+    """
+    Parse an *atomic* Kurucz-format linelist (http://kurucz.harvard.edu/linelists.html).
+
+    Args:
+        f: File path or file-like object.
+        isotopic_abundances: Isotopic abundances dict {Z: {mass number: abundance}}.
+            ``None`` (the default, as in Korg.jl) means "trust the log gf isotope
+            adjustment Kurucz already wrote into the file" — see below.
+        vacuum: If True the wavelengths are already vacuum. If False (the default)
+            they are air and get converted.
+        verbose: Print a note whenever a line's isotope is absent from
+            ``isotopic_abundances`` and Kurucz's own adjustment is used instead.
+
+    Returns:
+        List of Line objects, in file order (read_linelist sorts).
+
+    Notes:
+        Kurucz encodes the isotopic scaling of log gf twice: once as his own
+        additive correction (columns 119-124) and once as the bare isotope number
+        (columns 107-109 or 116-118). Passing ``isotopic_abundances=None`` takes
+        the former verbatim; passing a table recomputes the correction from it,
+        which is more precise because Kurucz's column carries few digits. Isotopes
+        missing from the table fall back on Kurucz's number.
+    """
+    if isinstance(f, str):
+        with open(f, 'r') as fp:
+            content_lines = fp.readlines()
+    else:
+        content_lines = f.readlines()
+
+    result = []
+    for raw in content_lines:
+        row = raw.rstrip('\n').rstrip('\r')
+        if not row.strip():
+            continue
+
+        # Some distributions of gfall drop one leading column of the wavelength
+        # field, shifting every subsequent field left by one. Restore it.
+        if len(row) == 159:
+            row = ' ' + row
+        # Others have had the trailing (non-numeric) columns stripped by an
+        # editor. The Fortran FORMAT guarantees 160 characters, so pad back out
+        # and let _parse_or_zero read the now-blank fields as zero.
+        if len(row) < 160:
+            row = row.ljust(160)
+
+        # Kurucz gives the wavenumbers of "level 1" and "level 2" without saying
+        # which is the lower one — that is set by parity — so take the smaller.
+        # The values are negative when Kurucz predicted rather than measured them.
+        E_levels = [abs(float(row[_KURUCZ_COLUMNS[k]])) * c_cgs * hplanck_eV
+                    for k in ('E_level_1', 'E_level_2')]
+
+        species = Species(row[_KURUCZ_COLUMNS['species']])
+
+        # log gf, plus the hyperfine-structure splitting of this component
+        log_gf = (float(row[_KURUCZ_COLUMNS['log_gf']])
+                  + _parse_or_zero(float, row[_KURUCZ_COLUMNS['hyperfine_log_gf']]))
+
+        kurucz_iso_adjust = _parse_or_zero(float, row[_KURUCZ_COLUMNS['isotope_log_gf']])
+        if isotopic_abundances is None:
+            log_gf += kurucz_iso_adjust
+        else:
+            # The isotope number lives in one of two columns depending on which
+            # of the two splitting mechanisms produced the line.
+            iso_number = _parse_or_zero(int, row[_KURUCZ_COLUMNS['isotope_1']])
+            if iso_number == 0:
+                iso_number = _parse_or_zero(int, row[_KURUCZ_COLUMNS['isotope_2']])
+            if iso_number != 0:  # no isotope number means no adjustment at all
+                Z = species.get_atom()
+                if iso_number not in isotopic_abundances[Z]:
+                    if verbose:
+                        print(f"Isotope {iso_number} not in isoabunds for {species}. "
+                              f"Using Kurucz's value of {kurucz_iso_adjust}.")
+                else:
+                    log_gf += math.log10(isotopic_abundances[Z][iso_number])
+
+        wl_cm = float(row[_KURUCZ_COLUMNS['wl']]) * 1e-7  # nm -> cm
+        if not vacuum:
+            wl_cm = air_to_vacuum(wl_cm)
+
+        # Columns 81-98 are log10(γ_rad), log10(γ_Stark) and the vdW parameter,
+        # with an exact zero standing for "no data" in all three (Korg.jl's
+        # tentotheOrMissing/idOrMissing). create_line then fills the gaps.
+        log_gamma_rad = _parse_or_zero(float, row[_KURUCZ_COLUMNS['log_gamma_rad']])
+        log_gamma_stark = _parse_or_zero(float, row[_KURUCZ_COLUMNS['log_gamma_stark']])
+        vdW = _parse_or_zero(float, row[_KURUCZ_COLUMNS['vdW']])
+
+        result.append(create_line(
+            wl_cm, log_gf, species, min(E_levels),
+            gamma_rad=None if log_gamma_rad == 0 else 10.0 ** log_gamma_rad,
+            gamma_stark=None if log_gamma_stark == 0 else 10.0 ** log_gamma_stark,
+            vdW=None if vdW == 0 else vdW,
+        ))
+
+    return result
+
+
+def parse_kurucz_molecular_linelist(f, isotopic_abundances=isotopic_abundances,
+                                    vacuum: bool = False) -> list:
+    """
+    Parse a *molecular* Kurucz-format linelist.
+
+    Not implemented, exactly as in Korg.jl v1.2.1: its parse_kurucz_molecular_linelist
+    throws before reaching the (still present but dead) parsing code, because the
+    energy levels it reads are not reliably the ones Korg needs.
+    """
+    raise ValueError("Kurucz linelists are not yet supported for molecules. Please open an "
+                     "issue at https://github.com/ajwheeler/Korg.jl/issues if this is a "
+                     "problem for you.")
 
 
 def _moog_species_code_to_species(code_str: str):
@@ -544,7 +671,8 @@ def _moog_species_code_to_species(code_str: str):
         return Species(formula, charge=charge)
 
 
-def parse_moog_linelist(f, iso_abundances=None, vacuum_wavelengths: bool = True) -> list:
+def parse_moog_linelist(f, isotopic_abundances=isotopic_abundances,
+                        vacuum_wavelengths: bool = True) -> list:
     """
     Parse a MOOG-format linelist.
 
@@ -552,16 +680,14 @@ def parse_moog_linelist(f, iso_abundances=None, vacuum_wavelengths: bool = True)
 
     Args:
         f: File path or file-like object
-        iso_abundances: Isotopic abundances dict {Z: {mass: abundance}}.
-            Defaults to NIST values from `isotopic_abundances`.
+        isotopic_abundances: Isotopic abundances dict {Z: {mass: abundance}}.
+            Defaults to the NIST table, as in Korg.jl.
         vacuum_wavelengths: If True, wavelengths are vacuum. If False, convert air->vacuum.
 
     Returns:
         List of Line objects sorted by wavelength
     """
     import math
-    if iso_abundances is None:
-        iso_abundances = isotopic_abundances
 
     if isinstance(f, str):
         with open(f, 'r') as fp:
@@ -598,8 +724,8 @@ def parse_moog_linelist(f, iso_abundances=None, vacuum_wavelengths: bool = True)
                         for j, Z in enumerate(atoms):
                             iso_start = j * digits_per
                             m_num = int(iso_str[iso_start:iso_start + digits_per])
-                            if Z in iso_abundances and m_num in iso_abundances[Z]:
-                                delta_loggf += math.log10(iso_abundances[Z][m_num])
+                            if Z in isotopic_abundances and m_num in isotopic_abundances[Z]:
+                                delta_loggf += math.log10(isotopic_abundances[Z][m_num])
                 except (ValueError, AttributeError):
                     pass
 
@@ -614,22 +740,21 @@ def parse_moog_linelist(f, iso_abundances=None, vacuum_wavelengths: bool = True)
     return sorted(result, key=lambda l: l.wl)
 
 
-def parse_turbospectrum_linelist(fn: str, iso_abundances=None,
-                                  vacuum: bool = False) -> list:
+def parse_turbospectrum_linelist(fn: str, isotopic_abundances=isotopic_abundances,
+                                 vacuum: bool = False) -> list:
     """
     Parse a TurboSpectrum-format linelist.
 
     Args:
         fn: File path
-        iso_abundances: Isotopic abundances dict. Defaults to NIST values.
+        isotopic_abundances: Isotopic abundances dict. Defaults to the NIST table,
+            as in Korg.jl.
         vacuum: If True, wavelengths are already in vacuum. If False (default), convert.
 
     Returns:
         List of Line objects sorted by wavelength
     """
     import math, re
-    if iso_abundances is None:
-        iso_abundances = isotopic_abundances
 
     with open(fn, 'r') as fp:
         content_lines = fp.readlines()
@@ -672,8 +797,8 @@ def parse_turbospectrum_linelist(fn: str, iso_abundances=None,
                 m_num = int(isostring[m_start:m_start + 3])
                 if m_num == 0:
                     continue
-                if atom_Z in iso_abundances and m_num in iso_abundances[atom_Z]:
-                    delta_loggf += math.log10(iso_abundances[atom_Z][m_num])
+                if atom_Z in isotopic_abundances and m_num in isotopic_abundances[atom_Z]:
+                    delta_loggf += math.log10(isotopic_abundances[atom_Z][m_num])
 
         for raw in content_lines[first_line_idx + 2:last_line_idx + 1]:
             raw = raw.strip()
@@ -824,19 +949,27 @@ def read_korg_linelist(path: str) -> list:
 
 
 def read_linelist(filename: str, format: str = None,
-                  iso_abundances=None) -> list:
+                  isotopic_abundances=isotopic_abundances) -> list:
     """
     Read a linelist file in various formats.
 
     Args:
         filename: Path to linelist file
-        format: One of "vald", "moog", "moog_air", "turbospectrum",
-                "turbospectrum_vac", "korg". Defaults to "korg" if filename
-                ends in .h5, else "vald".
-        iso_abundances: Isotopic abundances dict for MOOG/TurboSpectrum formats.
+        format: One of "vald", "kurucz", "kurucz_vac", "moog", "moog_air",
+                "turbospectrum", "turbospectrum_vac", "korg". Defaults to "korg"
+                if filename ends in .h5, else "vald".
+        isotopic_abundances: Isotopic abundances dict {Z: {mass: abundance}} used
+            to scale log gf, for the formats that carry isotope information.
+            Defaults to the NIST table. Pass ``None`` to use the isotopic
+            adjustments Kurucz embedded in a Kurucz-format linelist instead.
 
     Returns:
         List of Line objects sorted by wavelength
+
+    Notes:
+        "kurucz" is for air wavelengths, "kurucz_vac" for vacuum. Korg does not
+        guess: Kurucz publishes vacuum wavelengths below 2000 Å and air above it,
+        and it is the caller's job to say which file this is.
     """
     if format is None:
         format = 'korg' if filename.endswith('.h5') else 'vald'
@@ -845,18 +978,38 @@ def read_linelist(filename: str, format: str = None,
         return read_korg_linelist(filename)
     elif format == 'vald':
         return read_vald_linelist(filename)
+    elif format in ('kurucz', 'kurucz_vac'):
+        # Atomic and molecular Kurucz records share no columns, and the only
+        # thing telling them apart is the record width: molecular records are
+        # ~74 characters, atomic ones 159-160. Korg.jl thresholds at 100.
+        if len(_first_nonempty_line(filename)) > 100:
+            lines = parse_kurucz_linelist(filename, isotopic_abundances,
+                                          vacuum=format.endswith('_vac'))
+        else:
+            lines = parse_kurucz_molecular_linelist(filename, isotopic_abundances,
+                                                    vacuum=format.endswith('_vac'))
+        # Korg.jl applies this filter in read_linelist to every format. Korg.px's
+        # other parsers predate it and their reference data was generated without
+        # it, so it lives here rather than in the parser: gfall covers the whole
+        # periodic table in every ionization stage, and Korg models neither
+        # triply-ionized species nor H lines through the linelist machinery
+        # (hydrogen gets its own Stark-broadened treatment).
+        H_I = Species('H I')
+        return sorted((l for l in lines
+                       if 0 <= l.species.charge <= 2 and l.species != H_I),
+                      key=lambda l: l.wl)
     elif format == 'moog':
-        return parse_moog_linelist(filename, iso_abundances, vacuum_wavelengths=True)
+        return parse_moog_linelist(filename, isotopic_abundances, vacuum_wavelengths=True)
     elif format == 'moog_air':
-        return parse_moog_linelist(filename, iso_abundances, vacuum_wavelengths=False)
+        return parse_moog_linelist(filename, isotopic_abundances, vacuum_wavelengths=False)
     elif format == 'turbospectrum':
-        return parse_turbospectrum_linelist(filename, iso_abundances, vacuum=False)
+        return parse_turbospectrum_linelist(filename, isotopic_abundances, vacuum=False)
     elif format == 'turbospectrum_vac':
-        return parse_turbospectrum_linelist(filename, iso_abundances, vacuum=True)
+        return parse_turbospectrum_linelist(filename, isotopic_abundances, vacuum=True)
     else:
         raise ValueError(f"Unknown linelist format: {format!r}. "
-                         "Use one of: vald, moog, moog_air, turbospectrum, "
-                         "turbospectrum_vac, korg")
+                         "Use one of: vald, kurucz, kurucz_vac, moog, moog_air, "
+                         "turbospectrum, turbospectrum_vac, korg")
 
 
 def get_APOGEE_DR17_linelist(include_water: bool = True) -> list:

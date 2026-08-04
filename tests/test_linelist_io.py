@@ -145,7 +145,7 @@ class TestMOOGParser:
 
         custom = {Z: dict(d) for Z, d in isotopic_abundances.items()}
         custom[25][55] = 0.5  # pretend only half of Mn is Mn-55
-        lines = parse_moog_linelist(_require(self.MOOG), iso_abundances=custom)
+        lines = parse_moog_linelist(_require(self.MOOG), isotopic_abundances=custom)
         mn = [l for l in lines if str(l.species) == "Mn I"][0]
         assert np.isclose(mn.log_gf, -3.363 + math.log10(0.5), rtol=1e-13)
 
@@ -255,6 +255,240 @@ class TestMOOGSpeciesCodes:
         spec = _moog_species_code_to_species(code)
         assert spec.charge == expected_charge
         assert [int(a) for a in spec.formula.atoms if a != 0] == expected_atoms
+
+
+# ===========================================================================
+# Kurucz
+# ===========================================================================
+
+KURUCZ_DIR = DATA_DIR / "kurucz"
+
+# (reference key, filename) for every Kurucz file the Julia generator covers.
+KURUCZ_FILES = [
+    ("head", "gfallvac08oct17.head.dat"),
+    ("head_missing_col", "gfallvac08oct17-missing-col.head.dat"),
+    ("short_lines", "gfallvac08oct17-short-lines.stub.dat"),
+    ("ba", "gfallvac08oct17_ba"),
+    ("filtered_species", "gfallvac08oct17-filtered-species.dat"),
+]
+
+
+class TestKuruczParser:
+    """``parse_kurucz_linelist`` and the ``kurucz``/``kurucz_vac`` dispatch."""
+
+    @pytest.mark.parametrize("key,fname", KURUCZ_FILES)
+    def test_air_matches_julia(self, ref, key, fname):
+        from korg.linelist import isotopic_abundances, parse_kurucz_linelist
+
+        lines = parse_kurucz_linelist(_require(KURUCZ_DIR / fname), isotopic_abundances)
+        assert_lines_match(lines, ref["kurucz"][key]["air"], context=f"kurucz air {key}")
+
+    @pytest.mark.parametrize("key,fname", KURUCZ_FILES)
+    def test_vac_matches_julia(self, ref, key, fname):
+        from korg.linelist import isotopic_abundances, parse_kurucz_linelist
+
+        lines = parse_kurucz_linelist(_require(KURUCZ_DIR / fname), isotopic_abundances,
+                                      vacuum=True)
+        assert_lines_match(lines, ref["kurucz"][key]["vac"], context=f"kurucz vac {key}")
+
+    @pytest.mark.parametrize("key,fname", KURUCZ_FILES)
+    def test_kurucz_embedded_isotopic_adjustment_matches_julia(self, ref, key, fname):
+        """``isotopic_abundances=None`` means "use Kurucz's own log gf adjustment"."""
+        from korg.linelist import parse_kurucz_linelist
+
+        lines = parse_kurucz_linelist(_require(KURUCZ_DIR / fname), None)
+        assert_lines_match(lines, ref["kurucz"][key]["kurucz_iso"],
+                           context=f"kurucz embedded iso {key}")
+
+    @pytest.mark.parametrize("key,fname", KURUCZ_FILES)
+    @pytest.mark.parametrize("fmt,refkey", [("kurucz", "read_linelist"),
+                                            ("kurucz_vac", "read_linelist_vac")])
+    def test_read_linelist_matches_julia(self, ref, key, fname, fmt, refkey):
+        from korg.linelist import read_linelist
+
+        lines = read_linelist(_require(KURUCZ_DIR / fname), format=fmt)
+        assert_lines_match(lines, ref["kurucz"][key][refkey], context=f"{fmt} {key}")
+
+    @pytest.mark.parametrize("key,fname", KURUCZ_FILES)
+    def test_read_linelist_with_embedded_isotopes_matches_julia(self, ref, key, fname):
+        from korg.linelist import read_linelist
+
+        lines = read_linelist(_require(KURUCZ_DIR / fname), format="kurucz",
+                              isotopic_abundances=None)
+        assert_lines_match(lines, ref["kurucz"][key]["read_linelist_kurucz_iso"],
+                           context=f"kurucz embedded iso via read_linelist {key}")
+
+    def test_column_spec_on_a_single_record(self):
+        """
+        Pin the fixed-width column spec against hand-decoded values.
+
+        The first record of gfallvac08oct17 is Be II 7232.0699 nm (air; gfall
+        wavelengths are nanometres, so this is a 7.23 µm infrared line),
+        log gf -0.826, levels 140020.580 and 141403.310 cm^-1, and
+        log10 of γ_rad/γ_Stark/γ_vdW = 7.93/-2.41/-6.91.  These are the numbers
+        Korg.jl's own test suite asserts (test/linelist.jl, "kurucz linelist
+        parsing"), so a shifted slice cannot pass by accident.
+        """
+        from korg.constants import c_cgs, hplanck_eV
+        from korg.linelist import isotopic_abundances, parse_kurucz_linelist
+        from korg.species import Species
+        from korg.utils import air_to_vacuum
+
+        line = parse_kurucz_linelist(_require(KURUCZ_DIR / "gfallvac08oct17.head.dat"),
+                                     isotopic_abundances)[0]
+        assert line.species == Species("Be II")
+        assert line.log_gf == -0.826
+        assert np.isclose(line.wl, air_to_vacuum(7232.0699e-7), rtol=1e-15)
+        assert np.isclose(line.wl, 0.0007234041763337705, rtol=1e-13)  # Korg.jl's value
+        assert np.isclose(line.E_lower, 140020.580 * c_cgs * hplanck_eV, rtol=1e-15)
+        assert np.isclose(line.E_lower, 17.360339371573698, rtol=1e-13)  # Korg.jl's value
+        assert np.isclose(line.gamma_rad, 10.0 ** 7.93, rtol=1e-14)
+        assert np.isclose(line.gamma_stark, 10.0 ** -2.41, rtol=1e-14)
+        assert np.isclose(line.vdW[0], 10.0 ** -6.91, rtol=1e-14)
+        assert line.vdW[1] == -1.0
+
+    def test_missing_column_variant_parses_identically(self):
+        """
+        A 159-character record is the 160-character one with the leading column
+        of the wavelength field lost.  Restoring it must reproduce the same lines.
+        """
+        from korg.linelist import read_linelist
+
+        full = read_linelist(_require(KURUCZ_DIR / "gfallvac08oct17.head.dat"),
+                             format="kurucz")
+        short = read_linelist(_require(KURUCZ_DIR / "gfallvac08oct17-missing-col.head.dat"),
+                              format="kurucz")
+        assert full == short
+
+    def test_records_with_stripped_trailing_columns_parse(self):
+        """
+        gfallvac08oct17-short-lines.stub.dat holds 160-, 106- and 98-character
+        records of the *same* transition; padding back to 160 must make them
+        identical apart from the isotope columns that were truncated away.
+        """
+        from korg.linelist import isotopic_abundances, parse_kurucz_linelist
+        from korg.species import Species
+
+        lines = parse_kurucz_linelist(
+            _require(KURUCZ_DIR / "gfallvac08oct17-short-lines.stub.dat"),
+            isotopic_abundances)
+        assert len(lines) == 5
+        assert all(l.species == Species("Be II") for l in lines[:4])
+        assert all(l == lines[0] for l in lines[1:4])
+
+    def test_blank_lines_are_skipped(self):
+        """The missing-col file opens with blank lines; they contribute nothing."""
+        from korg.linelist import isotopic_abundances, parse_kurucz_linelist
+
+        path = _require(KURUCZ_DIR / "gfallvac08oct17-missing-col.head.dat")
+        with open(path) as f:
+            assert sum(1 for row in f if not row.strip()) >= 2
+        assert len(parse_kurucz_linelist(path, isotopic_abundances)) == 20
+
+    def test_read_linelist_filters_high_ionization_and_hydrogen(self):
+        """
+        Korg.jl's read_linelist keeps only 0 <= charge <= 2 and drops H I, which
+        gfall (unlike the other formats' test files) actually exercises.
+        """
+        from korg.linelist import isotopic_abundances, parse_kurucz_linelist, read_linelist
+        from korg.species import Species
+
+        path = _require(KURUCZ_DIR / "gfallvac08oct17-filtered-species.dat")
+        assert [str(l.species) for l in parse_kurucz_linelist(path, isotopic_abundances)] == \
+            ["Be II", "S IV", "Cu V", "H I"]
+        kept = read_linelist(path, format="kurucz")
+        assert [l.species for l in kept] == [Species("Be II")]
+
+    def test_sorted_by_wavelength(self):
+        from korg.linelist import read_linelist
+
+        for _, fname in KURUCZ_FILES:
+            lines = read_linelist(_require(KURUCZ_DIR / fname), format="kurucz")
+            assert lines == sorted(lines, key=lambda l: l.wl), fname
+
+    def test_air_and_vac_differ_by_the_air_to_vacuum_conversion(self):
+        from korg.linelist import read_linelist
+        from korg.utils import air_to_vacuum
+
+        path = _require(KURUCZ_DIR / "gfallvac08oct17.head.dat")
+        air = read_linelist(path, format="kurucz")
+        vac = read_linelist(path, format="kurucz_vac")
+        assert all(np.isclose(a.wl, air_to_vacuum(v.wl), rtol=1e-15)
+                   for a, v in zip(air, vac))
+        assert all(a.wl > v.wl for a, v in zip(air, vac))
+
+    def test_isotopic_scaling_recovers_the_unsplit_log_gf(self):
+        """
+        Korg.jl issue #463: the HFS/isotope components of the 6143.4 Å Ba II line
+        must sum back to the log gf of the unsplit line (-0.03).  Kurucz's own
+        embedded adjustments only get within ~0.02 because his column is short of
+        digits, which is the whole reason the NIST table is the default.
+        """
+        from korg.linelist import isotopic_abundances, read_linelist
+
+        path = _require(KURUCZ_DIR / "gfallvac08oct17_ba")
+        nist = read_linelist(path, format="kurucz")
+        embedded = read_linelist(path, format="kurucz", isotopic_abundances=None)
+        assert math.isclose(math.log10(sum(10 ** l.log_gf for l in nist)), -0.03, abs_tol=0.01)
+        assert math.isclose(math.log10(sum(10 ** l.log_gf for l in embedded)), -0.01,
+                            abs_tol=0.01)
+
+    def test_custom_isotopic_abundances_change_log_gf(self):
+        from korg.linelist import isotopic_abundances, read_linelist
+
+        path = _require(KURUCZ_DIR / "gfallvac08oct17_ba")
+        custom = {Z: dict(d) for Z, d in isotopic_abundances.items()}
+        custom[56][137] /= 2
+        default = read_linelist(path, format="kurucz")
+        halved = read_linelist(path, format="kurucz", isotopic_abundances=custom)
+        # every component tagged with 137-Ba drops by log10(2); the rest are equal
+        shifts = {round(d.log_gf - h.log_gf, 12) for d, h in zip(default, halved)}
+        assert shifts == {0.0, round(math.log10(2), 12)}
+
+    def test_unknown_isotope_falls_back_on_kuruczs_value(self, tmp_path, capsys):
+        """
+        An isotope Korg has no abundance for keeps Korg's log gf untouched (it does
+        *not* silently pick up Kurucz's adjustment), and says so under verbose.
+        """
+        from korg.linelist import isotopic_abundances, parse_kurucz_linelist
+
+        row = list(open(_require(KURUCZ_DIR / "gfallvac08oct17_ba")).readline().rstrip("\n"))
+        row[106:109] = "199"  # no such Ba isotope
+        p = tmp_path / "bad_isotope.dat"
+        p.write_text("".join(row) + "\n")
+
+        line = parse_kurucz_linelist(str(p), isotopic_abundances, verbose=True)[0]
+        assert np.isclose(line.log_gf, -0.030 + -1.234, rtol=1e-13)  # log gf + HFS only
+        assert "Isotope 199 not in isoabunds" in capsys.readouterr().out
+
+    def test_molecular_linelist_is_rejected(self):
+        """
+        Korg.jl v1.2.1 throws for molecular Kurucz lists rather than parsing them;
+        so does Korg.px, and the dispatcher must route the file there by width.
+        """
+        from korg.linelist import parse_kurucz_molecular_linelist, read_linelist
+
+        path = _require(KURUCZ_DIR / "kurucz_cn.txt")
+        with pytest.raises(ValueError, match="not yet supported for molecules"):
+            read_linelist(path, format="kurucz")
+        with pytest.raises(ValueError, match="not yet supported for molecules"):
+            parse_kurucz_molecular_linelist(path)
+
+    def test_file_object_accepted(self):
+        """A file-like object works as well as a path, as for the MOOG parser."""
+        from korg.linelist import isotopic_abundances, parse_kurucz_linelist
+
+        path = _require(KURUCZ_DIR / "gfallvac08oct17.head.dat")
+        with open(path) as f:
+            from_object = parse_kurucz_linelist(f, isotopic_abundances)
+        assert from_object == parse_kurucz_linelist(path, isotopic_abundances)
+
+    def test_empty_file_yields_no_lines(self, tmp_path):
+        from korg.linelist import isotopic_abundances, parse_kurucz_linelist
+
+        p = tmp_path / "empty.dat"
+        p.write_text("\n   \n\n")
+        assert parse_kurucz_linelist(str(p), isotopic_abundances) == []
 
 
 # ===========================================================================
@@ -516,7 +750,7 @@ class TestTurbospectrumParser:
         from korg.linelist import isotopic_abundances, parse_turbospectrum_linelist
 
         custom = {Z: dict(d) for Z, d in isotopic_abundances.items()}
-        lines = parse_turbospectrum_linelist(_require(self.TS), iso_abundances=custom,
+        lines = parse_turbospectrum_linelist(_require(self.TS), isotopic_abundances=custom,
                                              vacuum=True)
         assert len(lines) == 3
 
@@ -675,16 +909,16 @@ class TestReadLinelistDispatch:
         from korg.linelist import read_linelist
 
         with pytest.raises(ValueError, match="Unknown linelist format"):
-            read_linelist("whatever.txt", format="kurucz")
+            read_linelist("whatever.txt", format="sme")
 
-    def test_iso_abundances_forwarded(self):
-        """``iso_abundances`` must reach the MOOG parser."""
+    def test_isotopic_abundances_forwarded(self):
+        """``isotopic_abundances`` must reach the MOOG parser."""
         from korg.linelist import isotopic_abundances, read_linelist
 
         custom = {Z: dict(d) for Z, d in isotopic_abundances.items()}
         custom[25][55] = 0.25
         lines = read_linelist(_require(DATA_DIR / "s5eqw_short.moog"), format="moog",
-                              iso_abundances=custom)
+                              isotopic_abundances=custom)
         mn = [l for l in lines if str(l.species) == "Mn I"][0]
         assert np.isclose(mn.log_gf, -3.363 + math.log10(0.25), rtol=1e-13)
 

@@ -61,6 +61,53 @@ ref["moog"] = Dict(
 )
 
 # ---------------------------------------------------------------------------
+# Kurucz
+#
+# parse_kurucz_linelist is captured unfiltered and in file order; read_linelist
+# is captured on top of it because that is where Korg.jl drops triply+ ionized
+# species and hydrogen and sorts by wavelength.
+# ---------------------------------------------------------------------------
+println("  - Kurucz linelists...")
+const KURUCZ = joinpath(DATA, "kurucz")
+kurucz_out = Dict{String,Any}()
+for (key, fname) in [
+    "head" => "gfallvac08oct17.head.dat",
+    "head_missing_col" => "gfallvac08oct17-missing-col.head.dat",
+    "short_lines" => "gfallvac08oct17-short-lines.stub.dat",
+    "ba" => "gfallvac08oct17_ba",
+    "filtered_species" => "gfallvac08oct17-filtered-species.dat",
+]
+    path = joinpath(KURUCZ, fname)
+    kurucz_out[key] = Dict(
+        "file" => "kurucz/" * fname,
+        # air wavelengths, Korg's NIST isotopic abundances
+        "air" => [line_dict(l)
+                  for l in open(f -> Korg.parse_kurucz_linelist(f;
+                                                                isotopic_abundances=Korg.isotopic_abundances),
+                                path)],
+        # vacuum wavelengths (format="kurucz_vac")
+        "vac" => [line_dict(l)
+                  for l in open(f -> Korg.parse_kurucz_linelist(f; vacuum=true,
+                                                                isotopic_abundances=Korg.isotopic_abundances),
+                                path)],
+        # isotopic_abundances=nothing: use the adjustment Kurucz wrote into the file
+        "kurucz_iso" => [line_dict(l)
+                         for l in open(f -> Korg.parse_kurucz_linelist(f;
+                                                                       isotopic_abundances=nothing),
+                                       path)],
+        # the full read_linelist path: parse, filter, sort
+        "read_linelist" => [line_dict(l)
+                            for l in Korg.read_linelist(path; format="kurucz")],
+        "read_linelist_vac" => [line_dict(l)
+                                for l in Korg.read_linelist(path; format="kurucz_vac")],
+        "read_linelist_kurucz_iso" => [line_dict(l)
+                                       for l in Korg.read_linelist(path; format="kurucz",
+                                                                   isotopic_abundances=nothing)],
+    )
+end
+ref["kurucz"] = kurucz_out
+
+# ---------------------------------------------------------------------------
 # Turbospectrum
 # ---------------------------------------------------------------------------
 println("  - Turbospectrum linelist...")

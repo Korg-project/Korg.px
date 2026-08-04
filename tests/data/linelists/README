@@ -1,1 +1,28 @@
 Note: none of these are real linelists. DO NOT USE THEM.
+
+Everything here comes from Korg.jl v1.2.1's own test suite (test/data/linelists),
+so that Korg.px and Korg.jl parse byte-identical inputs.  See
+tests/generate_linelist_reference.jl.
+
+kurucz/
+  gfallvac08oct17_ba                    verbatim.  The HFS + isotope components of
+                                        one Ba II line; the regression file for
+                                        Korg.jl issue #463.
+  gfallvac08oct17-short-lines.stub.dat  verbatim.  160-, 98- and 106-character
+                                        records, i.e. lines whose trailing
+                                        (non-numeric) columns were stripped.
+  kurucz_cn.txt                         verbatim.  A molecular (CN) linelist,
+                                        which both Korg.jl and Korg.px refuse.
+  gfallvac08oct17.head.dat              the first 20 records of Korg.jl's
+                                        gfallvac08oct17.stub.dat (the full file
+                                        is 999 records / 160 kB).
+  gfallvac08oct17-missing-col.head.dat  the matching 20 records of Korg.jl's
+                                        gfallvac08oct17-missing-col.stub.dat:
+                                        the same lines with the leading column of
+                                        the wavelength field dropped (159
+                                        characters), plus its blank lines.
+  gfallvac08oct17-filtered-species.dat  records 0, 101, 618 and 840 of
+                                        gfallvac08oct17.stub.dat sorted by
+                                        wavelength: Be II, S IV, Cu V, H I.  Only
+                                        the Be II line survives read_linelist's
+                                        charge <= 2 / not-hydrogen filter.
