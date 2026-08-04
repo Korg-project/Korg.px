@@ -1,6 +1,6 @@
 # korg
 
-[![Tests](https://github.com/ajwheeler/Korg.jl/actions/workflows/PythonTests.yml/badge.svg)](https://github.com/ajwheeler/Korg.jl/actions/workflows/PythonTests.yml)
+[![Tests](https://github.com/Korg-project/Korg.px/actions/workflows/PythonTests.yml/badge.svg)](https://github.com/Korg-project/Korg.px/actions/workflows/PythonTests.yml)
 
 A Python (JAX) implementation of [Korg.jl](https://github.com/ajwheeler/Korg.jl), a package for computing stellar spectra from 1D model atmospheres and linelists assuming local thermodynamic equilibrium.
 
@@ -63,14 +63,17 @@ Abundances use the A(X) format: `A(X) = log10(N_X/N_H) + 12`
 # Solar abundances
 A_X = korg.format_A_X()
 
-# Metal-poor (-1 dex)
-A_X = korg.format_A_X(metals=-1.0)
+# Metal-poor: [metals/H] = -1
+A_X = korg.format_A_X(-1.0)
 
-# Alpha-enhanced
-A_X = korg.format_A_X(metals=-0.5, alpha=0.3)
+# Alpha-enhanced. The second argument is [alpha/H], not [alpha/M], so
+# [metals/H] = -0.5 enhanced by 0.3 dex is -0.2.
+A_X = korg.format_A_X(-0.5, -0.2)
 
-# Custom element abundances
-A_X = korg.format_A_X(abundances={"Fe": 7.0, "C": 8.5})
+# Custom element abundances. These are [X/H] by default -- pass
+# solar_relative=False to give A(X) values instead.
+A_X = korg.format_A_X(abundances={"Fe": -0.3, "C": 0.2})
+A_X = korg.format_A_X(abundances={"Fe": 7.2, "C": 8.2}, solar_relative=False)
 ```
 
 
