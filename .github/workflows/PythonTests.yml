@@ -71,7 +71,13 @@ jobs:
         # below keys on. pyproject declares support for 3.10-3.13, so a release
         # is still worth checking more widely than a push is.
         python-version: ["3.11"]
-        os: [ubuntu-latest, macos-latest]
+        # macOS only. The ubuntu runner did not fail the suite -- it died with
+        # "The hosted runner lost communication with the server" 70 minutes in,
+        # the signature of a runner starved of memory or CPU, while the macOS
+        # runner completed the identical suite in 58 minutes. Rather than keep a
+        # cell that reports infrastructure noise as a test failure, run the one
+        # that finishes. Revisit if the suite gets cheaper.
+        os: [macos-latest]
 
     steps:
       - uses: actions/checkout@v6
@@ -133,14 +139,14 @@ jobs:
           path: ~/.korg
           key: korg-artifacts-${{ runner.os }}-marcs-v2
 
-      - name: Download MARCS atmosphere grids
+      # 'standard' only. That is 619 MB extracted and is the sole grid a
+      # developer checkout normally has; the suite passes against it alone, so
+      # low_Z (1.4 MB) and cool_dwarfs (109 MB compressed, ~1 GB extracted) are
+      # dead weight in the cache and on a runner's disk.
+      - name: Download MARCS atmosphere grid
         if: steps.marcs-cache.outputs.cache-hit != 'true'
         run: |
-          python - <<'PY'
-          from korg.marcs_interpolation import get_marcs_grid_path
-          for grid in ("standard", "low_Z", "cool_dwarfs"):
-              print(f"{grid}: {get_marcs_grid_path(grid, auto_download=True)}")
-          PY
+          python -c "from korg.marcs_interpolation import get_marcs_grid_path; print(get_marcs_grid_path('standard', auto_download=True))"
 
       - name: Setup CI artifacts (placeholders)
         run: |
@@ -158,21 +164,23 @@ jobs:
           restore-keys: |
             jax-cache-${{ runner.os }}-py${{ matrix.python-version }}-
 
+      # One pass, with coverage attached. This used to be two full runs of the
+      # suite -- once plain, once under --cov -- which at ~58 minutes a pass
+      # made a two-hour job and doubled the exposure to the infrastructure
+      # flake that killed the ubuntu cell. Nothing needed the uninstrumented
+      # run: no test in this suite asserts on elapsed time (the one timing
+      # check, test_interpolate_marcs_jit.py, deliberately prints rather than
+      # asserts), so coverage cannot change a result here.
+      #
       # -n 1 on purpose: the hosted runners have two cores, so extra workers
       # contend for CPU and each one pays its own compilation. Locally,
       # run_tests.sh uses -n 8.
       - name: Run tests
         run: |
-          pytest tests/ -v --tb=short -n 1
-
-      - name: Run tests with coverage
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        run: |
-          pip install pytest pytest-cov
-          pytest tests/ --cov --cov-branch --cov-report=xml -n 1
+          pytest tests/ -v --tb=short -n 1 --cov --cov-branch --cov-report=xml
 
       - name: Upload coverage reports to Codecov
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        if: matrix.os == 'macos-latest' && matrix.python-version == '3.11'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
