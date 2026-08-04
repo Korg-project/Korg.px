@@ -6,10 +6,10 @@ This is the part of Korg.px that has no counterpart in Korg.jl.
 import numpy as np, korg
 from korg.synthesis_plan import prepare_synthesis
 
-wavelengths_cm = np.arange(5000.0, 5002.0, 0.01) * 1e-8
+wavelengths = np.arange(5000.0, 5002.0, 0.01)          # Angstroms
 linelist = korg.get_VALD_solar_linelist()
 
-synth = prepare_synthesis(wavelengths_cm, linelist, geometry="plane-parallel")
+synth = prepare_synthesis(wavelengths, linelist, geometry="plane-parallel")
 flux, continuum = synth(5777.0, 4.44, 0.0)
 ```
 
@@ -50,12 +50,12 @@ once.
 ## Building a plan
 
 ```python
-prepare_synthesis(wavelengths_cm, linelist, data=None, *,
+prepare_synthesis(wavelengths, linelist, data=None, *,
                   geometry=None, cntm_step_cm=1e-8, window_safety=2.0,
                   reference=(5777.0, 4.44, 0.0), n_layers=56, n_mu=20)
 ```
 
-- **`wavelengths_cm`** — the synthesis grid, in **centimetres**, as a concrete 1-D array. This is
+- **`wavelengths_angstrom`** — the synthesis grid, in **Angstroms**, as a concrete 1-D array. This is
   host code, so it may not be a tracer. At least two points are required.
 - **`linelist`** — a list of `korg.Line`, or an already-preprocessed `LinelistData`. A list is
   trimmed to the synthesis range using `line_buffer_cm`; a `LinelistData` is used as-is, since its
@@ -304,7 +304,7 @@ atmospheric layers in Python and would have to be rewritten to trace. The plan e
 synthesis window, so you can refuse rather than quietly drop them:
 
 ```python
-synth = prepare_synthesis(wavelengths_cm, linelist)
+synth = prepare_synthesis(wavelengths, linelist)
 if synth.brackett_in_range:
     raise RuntimeError("Brackett lines fall in this window and are not modelled")
 ```
@@ -323,9 +323,9 @@ converge in ten steps at these step sizes; it is here to show the mechanics of b
 import numpy as np, korg, jax, jax.numpy as jnp
 from korg.synthesis_plan import prepare_synthesis
 
-wavelengths_cm = np.arange(5000.0, 5002.0, 0.01) * 1e-8
+wavelengths = np.arange(5000.0, 5002.0, 0.01)          # Angstroms
 lines = korg.get_VALD_solar_linelist()
-synth = prepare_synthesis(wavelengths_cm, lines, geometry="plane-parallel",
+synth = prepare_synthesis(wavelengths, lines, geometry="plane-parallel",
                           reference=(5750.0, 4.4, 0.0))
 
 def model(params):

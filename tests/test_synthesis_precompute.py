@@ -321,17 +321,22 @@ class TestPrecomputeAtmosphere:
         agree to ~1e-3 rather than to round-off.  That is the size of the
         disagreement between Korg.px's two equilibrium entry points, and it is
         recorded here rather than asserted away.
+
+        This used to reach the other solver through ``synthesize_spectrum``,
+        which has been deleted; it calls ``chemical_equilibrium_all_layers``
+        directly instead, which is the function ``synthesize_spectrum`` called
+        and is the whole of what was being compared.
         """
-        import warnings as _w
-        from korg.synthesis import synthesize_spectrum
-        with _w.catch_warnings():
-            _w.simplefilter("ignore")
-            r = synthesize_spectrum(tiny_atm, [], np.asarray(wavelengths_cm) * 1e8,
-                                    np.array(julia_ref["A_X"]),
-                                    hydrogen_lines=False, verbose=False)
+        from korg.abundances import A_X_to_absolute
+        from korg.data_loader import default_chem_eq_data, default_mol_species
+        from korg.statmech import chemical_equilibrium_all_layers
+
+        ne, _, _ = chemical_equilibrium_all_layers(
+            np.asarray(tiny_atm.T), np.asarray(tiny_atm.n_total),
+            np.asarray(tiny_atm.ne), A_X_to_absolute(np.array(julia_ref["A_X"])),
+            default_chem_eq_data, default_mol_species)
         np.testing.assert_allclose(np.asarray(precomputed.ne_all),
-                                   np.asarray(r.electron_number_density),
-                                   rtol=2e-3)
+                                   np.asarray(ne), rtol=2e-3)
 
 
 @pytest.mark.slow

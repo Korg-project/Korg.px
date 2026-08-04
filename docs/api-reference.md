@@ -11,21 +11,22 @@ is the module to import from; where it says `korg`, `import korg` is enough. See
 
 | Import from | Function |
 |---|---|
-| `korg.synthesis_plan` | `prepare_synthesis`, `Synthesizer`, `synthesize` |
+| `korg.synthesis_plan` | `prepare_synthesis`, `Synthesizer`, `synthesize`, `synth` |
 | `korg.synthesis` | `synthesize_jit`, `filter_linelist`, `blackbody`, `SynthesisResult`, `load_synthesis_data` |
 
 ### `prepare_synthesis`
 
 ```python
 korg.synthesis_plan.prepare_synthesis(
-    wavelengths_cm, linelist, data=None, *,
-    geometry=None, cntm_step_cm=1e-8, window_safety=2.0,
-    reference=(5777.0, 4.44, 0.0), n_layers=56, n_mu=20) -> Synthesizer
+    wavelengths_angstrom, linelist, data=None, *,
+    geometry=None, cntm_step_cm=1e-8, line_buffer_cm=10e-8, window_safety=2.0,
+    reference=(5777.0, 4.44, 0.0), n_layers=56, n_mu=20,
+    hydrogen_lines=True) -> Synthesizer
 ```
 
 Fixes every array shape a synthesis needs — the hydrogen transitions in range, the coarse
 continuum grid, the line-window buckets, the layer count — and returns a callable that takes
-stellar parameters. `wavelengths_cm` is in centimetres. See
+stellar parameters. `wavelengths_angstrom` is in Angstroms, as everywhere else. See
 [The synthesizer closure](the-synthesizer-closure.md).
 
 ### `Synthesizer.__call__`
@@ -75,20 +76,26 @@ One-shot synthesis: builds a `Synthesizer` and calls it once. `wavelengths_angst
 `A_X` is the 92-element `A(X)` vector; `vmic` is in km/s. `geometry=None` follows the atmosphere
 object's type. Prefer `prepare_synthesis` for more than one spectrum.
 
-### `synthesize` (deprecated, top-level)
+### `synthesize` (top-level)
+
+`korg.synthesize` **is** `korg.synthesis_plan.synthesize` above, and
+`korg.synthesis.synthesize` re-exports it. There is one implementation.
+
+The Python-orchestrated NumPy path, `korg.synthesis.synthesize_spectrum`, has been deleted along
+with the `korg.synthesize` wrapper that took **absolute number fractions** and returned a
+`SynthesisResult`. It could not be jitted, `vmap`ped or differentiated. The traced path reproduces
+the Korg.jl reference spectra in `tests/synthesis_reference_data.json` to 3.2e-3 relative, which is
+what the deleted path did, so nothing was lost by removing it. Its options that the traced path
+does not implement are listed in `differences-from-korg-jl.md`.
+
+### `synth` (top-level)
 
 ```python
-korg.synthesize(atmosphere, linelist, wavelengths_angstrom, abundances,
-                vmic=1.0, line_buffer=10.0, hydrogen_lines=True,
-                hydrogen_line_window_size=150.0, line_cutoff_threshold=3e-4,
-                return_cntm=True, mu_values=20, verbose=True, profile=False)
-    -> SynthesisResult
+korg.synth(atmosphere, linelist, wavelengths_angstrom, A_X, **kwargs)
+    -> (wavelengths, flux, continuum)
 ```
 
-The NumPy path. Takes **absolute number fractions**, not `A(X)`. Wraps
-`korg.synthesis.synthesize_spectrum`, which raises `DeprecationWarning` and cannot be traced,
-`vmap`ped or differentiated. It supports Korg.jl options the traced path does not, and it is the
-implementation the Korg.jl reference fixtures validate.
+`synthesize`, plus the wavelength grid it was called with.
 
 ### `synthesize_jit`
 
@@ -99,7 +106,7 @@ korg.synthesis.synthesize_jit(wavelengths_cm, T_layers, n_total_layers, ne_layer
     -> (flux, continuum)
 ```
 
-The jit-compatible kernel underneath the deprecated path. `log_tau_ref` is base-10 here.
+The jit-compatible kernel underneath the traced path. `log_tau_ref` is base-10 here.
 Requires you to build `data` and `linelist_data` yourself; `prepare_synthesis` is the supported
 way to do that.
 
@@ -195,7 +202,9 @@ korg.prune_linelist(atmosphere, linelist, A_X, wavelengths, threshold=0.1,
 korg.merge_close_lines(linelist, merge_distance=0.2) -> list[Line]
 ```
 
-`prune_linelist` runs on the deprecated NumPy synthesis path.
+`prune_linelist` builds its opacities directly (chemical equilibrium, continuum, line
+absorption) rather than through a synthesis; with `sort_by_EW=True` it calls `synthesize` once per
+surviving line.
 
 ### Molecular cross-sections
 
@@ -208,7 +217,8 @@ korg.save_molecular_cross_section(path, xs)
 korg.read_molecular_cross_section(path)
 ```
 
-Usable with `korg.synthesis.synthesize_spectrum` only; the traced path ignores them.
+Nothing consumes them: the only function that accepted a `molecular_cross_sections` argument was
+`korg.synthesis.synthesize_spectrum`, which has been deleted, and the traced path ignores them.
 
 ## Wavelengths and post-processing
 

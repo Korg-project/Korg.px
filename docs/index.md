@@ -45,9 +45,9 @@ The MARCS model atmosphere grid (~380 MB) is downloaded on first use of
 import numpy as np, korg
 from korg.synthesis_plan import prepare_synthesis
 
-wavelengths_cm = np.arange(5000.0, 5005.0, 0.01) * 1e-8          # note: cm, not Å
+wavelengths = np.arange(5000.0, 5005.0, 0.01)                    # Angstroms
 linelist = korg.get_VALD_solar_linelist()
-synth = prepare_synthesis(wavelengths_cm, linelist, geometry="plane-parallel")
+synth = prepare_synthesis(wavelengths, linelist, geometry="plane-parallel")
 flux, continuum = synth(5777.0, 4.44, 0.0)                       # Teff, log g, [M/H]
 ```
 

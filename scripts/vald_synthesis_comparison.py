@@ -118,7 +118,7 @@ def run_python_synthesis_jit():
 
 
 def run_python_synthesis_nonjit():
-    print("\n=== Python Korg Synthesis (synthesize, non-JIT) ===")
+    print("\n=== Python Korg Synthesis (synthesize, one-shot) ===")
     linelist = read_vald_linelist(VALD_PATH)
     print(f"  Loaded {len(linelist)} lines from VALD")
 
@@ -126,21 +126,12 @@ def run_python_synthesis_nonjit():
     # Use Asplund 2020 solar abundances to match Julia's Korg.format_A_X() default
     A_X = korg.format_A_X(solar_abundances=get_solar_abundances('asplund_2020'))
     wavelengths = np.linspace(WL_MIN, WL_MAX, N_WL)
-    abundances = np.array(A_X_to_absolute(A_X))
 
     t0 = time.perf_counter()
-    result = synthesize(
-        atmosphere=atm,
-        linelist=linelist,
-        wavelengths_angstrom=wavelengths,
-        abundances=abundances,
-        vmic=1.0,
-        verbose=False,
-    )
+    flux, continuum = synthesize(atm, linelist, wavelengths, A_X, vmic=1.0)
+    flux = np.array(flux)
+    continuum = np.array(continuum)
     elapsed = time.perf_counter() - t0
-
-    flux = np.array(result.flux)
-    continuum = np.array(result.continuum)
     cnorm = flux / continuum
 
     print(f"  Elapsed: {elapsed*1000:.1f} ms")

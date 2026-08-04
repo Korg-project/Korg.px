@@ -451,17 +451,18 @@ class TestPreprocessLinkedToSynthesize:
         assert pl.n_lines == 2
 
     def test_wl_grid_used_directly_in_synthesize(self, setup):
-        result = korg.synthesize(
+        flux, _ = korg.synthesize(
             setup["atm"], setup["lines"][:2], setup["wls_ang"], setup["A_X"],
-            hydrogen_lines=False, verbose=False
+            hydrogen_lines=False,
         )
-        assert len(result.flux) == len(setup["wls_ang"])
+        assert len(flux) == len(setup["wls_ang"])
 
     def test_preprocess_wl_matches_synthesize_output_grid(self, setup):
         # Wavelengths produced by prepare_wavelength_grid should be identical to
-        # synthesize's output wavelengths when used as input
-        result = korg.synthesize(
+        # the grid synthesize reports back through ``synth``.
+        wls, flux, _ = korg.synth(
             setup["atm"], setup["lines"][:2], setup["wls_ang"], setup["A_X"],
-            hydrogen_lines=False, verbose=False
+            hydrogen_lines=False,
         )
-        np.testing.assert_array_equal(result.wavelengths, setup["wls_ang"])
+        np.testing.assert_array_equal(wls, setup["wls_ang"])
+        assert len(flux) == len(setup["wls_ang"])

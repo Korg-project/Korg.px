@@ -11,8 +11,7 @@ import jax.numpy as jnp
 
 from korg.atmosphere import create_solar_test_atmosphere
 from korg.synthesis import (
-    precompute_synthesis_data, preprocess_linelist, synthesize_jit,
-    synthesize_spectrum
+    precompute_synthesis_data, preprocess_linelist, synthesize_jit
 )
 from korg.synthesis_preparation import (
     preprocess_linelist as prep_linelist,
@@ -186,50 +185,6 @@ class TestSynthesisJIT:
         # Results should be bit-identical
         np.testing.assert_array_equal(flux1, flux2)
         np.testing.assert_array_equal(cont1, cont2)
-
-    @pytest.mark.skip(reason="Normal synthesis not yet JIT-compatible - comparing would take too long")
-    def test_synthesize_jit_vs_normal_continuum(self, solar_atmosphere, solar_abundances,
-                                                 synthesis_data, narrow_wavelengths):
-        """Compare JIT synthesis to normal synthesis (continuum only)."""
-        # Normal synthesis
-        result_normal = synthesize_spectrum(
-            atmosphere=solar_atmosphere,
-            linelist=[],
-            wavelengths_angstrom=narrow_wavelengths,
-            abundances=solar_abundances,
-            vmic=1.0,  # km/s
-            hydrogen_lines=False,
-            return_continuum=True,
-            verbose=False
-        )
-
-        # JIT synthesis
-        wavelengths_cm = jnp.array(narrow_wavelengths * 1e-8)
-        vmic_cm_s = 1.0e5  # 1 km/s
-        linelist_data = preprocess_linelist([])
-
-        flux_jit, continuum_jit = synthesize_jit(
-            wavelengths_cm=wavelengths_cm,
-            T_layers=jnp.array(solar_atmosphere.T),
-            n_total_layers=jnp.array(solar_atmosphere.n_total),
-            ne_layers=jnp.array(solar_atmosphere.ne),
-            z_layers=jnp.array(solar_atmosphere.z),
-            log_tau_ref=jnp.array(solar_atmosphere.log_tau_ref),
-            abundances=jnp.array(solar_abundances),
-            vmic_cm_s=vmic_cm_s,
-            data=synthesis_data,
-            linelist_data=linelist_data
-        )
-
-        # Both synthesize and synthesize_jit now return erg/s/cm^2/Å — no conversion needed
-        # Should be similar (within ~5% due to different approximations)
-        # JIT uses simplified chemical equilibrium, so some difference expected
-        np.testing.assert_allclose(
-            np.array(flux_jit),
-            result_normal.flux,
-            rtol=0.05,
-            err_msg="JIT and normal synthesis should produce similar continuum"
-        )
 
     def test_synthesize_jit_via_prepared_linelist(self, solar_atmosphere, solar_abundances,
                                                    synthesis_data, narrow_wavelengths):

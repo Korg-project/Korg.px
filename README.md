@@ -51,7 +51,7 @@ Synthesizing more than once? Build a plan and reuse it — see
 
 ```python
 from korg.synthesis_plan import prepare_synthesis
-synth = prepare_synthesis(wavelengths * 1e-8, linelist, geometry="plane-parallel")
+synth = prepare_synthesis(wavelengths, linelist, geometry="plane-parallel")
 flux, continuum = synth(5777.0, 4.44, 0.0)     # jit-able, differentiable
 ```
 

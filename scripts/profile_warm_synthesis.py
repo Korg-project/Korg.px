@@ -20,15 +20,15 @@ A_X      = korg.format_A_X()
 wls      = np.linspace(5000.0, 5100.0, 2000)
 
 print("Warming up JIT...", flush=True)
-korg.synthesize(atm, linelist, wls, A_X, vmic=1.0, verbose=False)
-korg.synthesize(atm, linelist, wls, A_X, vmic=1.0, verbose=False)  # second warmup
+korg.synthesize(atm, linelist, wls, A_X, vmic=1.0)
+korg.synthesize(atm, linelist, wls, A_X, vmic=1.0)  # second warmup
 
 print(f"Profiling {N_WARM_RUNS} warm runs...", flush=True)
 from pyinstrument import Profiler
 profiler = Profiler(interval=0.0005)  # 0.5 ms sampling interval
 profiler.start()
 for _ in range(N_WARM_RUNS):
-    korg.synthesize(atm, linelist, wls, A_X, vmic=1.0, verbose=False)
+    korg.synthesize(atm, linelist, wls, A_X, vmic=1.0)
 profiler.stop()
 
 profiler.print()

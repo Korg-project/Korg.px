@@ -13,8 +13,9 @@ class MolecularCrossSection:
     """
     Precomputed molecular absorption cross-section on a (vmic, logT, wavelength) grid.
 
-    Create with MolecularCrossSection(linelist, wavelengths) and pass to synthesize_spectrum
-    via the molecular_cross_sections argument to speed up synthesis of large molecular linelists.
+    Create with MolecularCrossSection(linelist, wavelengths). Nothing consumes one yet:
+    the Python-orchestrated ``synthesize_spectrum`` that took a molecular_cross_sections
+    argument has been deleted, and the traced synthesis does not implement it.
 
     See save_molecular_cross_section / read_molecular_cross_section for persistence.
     """

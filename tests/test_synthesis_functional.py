@@ -1,12 +1,20 @@
 """
 Functional, precision, autodiff and jit tests for ``korg.synthesis``.
 
-Scope: the Python-orchestrated synthesis entry points (``synthesize_spectrum``,
-``synthesize``, ``synth``) and the module-level
-helpers (``planck_function``, ``blackbody``, ``filter_linelist``,
+Scope: the public one-shot entry points (``synthesize``, ``synth``) and the
+module-level helpers (``planck_function``, ``blackbody``, ``filter_linelist``,
 ``get_reference_wavelength_linelist``, ``compute_continuum_absorption``),
 including the spherical (``ShellAtmosphere``) path.  The JIT pipeline
-(``synthesize_jit`` and friends) is covered by ``test_synthesis_jit.py``.
+(``synthesize_jit`` and friends) is covered by ``test_synthesis_jit.py``; the
+closure itself by ``test_synthesizer_closure.py``.
+
+``synthesize_spectrum``, the Python-orchestrated NumPy path this file was
+largely written against, has been deleted, and ``korg.synthesize`` is now
+``korg.synthesis_plan.synthesize``.  Tests of behaviour that survived the
+deletion were re-pointed at it; tests of options only that function had
+(``verbose``, ``profile``, caller-supplied ``partition_funcs``, the separate
+reference linelist used to correct alpha_ref) went with the code they covered.
+Which is which is recorded in the classes below rather than left to inference.
 
 Cost control: every synthesis here runs on an 8-layer sub-sampled solar
 atmosphere over 11 wavelength points, and the expensive results are cached in
@@ -42,10 +50,8 @@ from korg.synthesis import (
     filter_linelist,
     get_reference_wavelength_linelist,
     planck_function,
-    synth,
-    synthesize,
-    synthesize_spectrum,
 )
+from korg.synthesis_plan import prepare_synthesis, synth, synthesize
 
 REFERENCE_JSON = Path(__file__).parent / "synthesis_reference_data.json"
 SUN_MOD = Path(__file__).parent / "data" / "sun.mod"
@@ -56,6 +62,12 @@ LAMBDA_REF_CM = 5e-5
 # Python and Korg.jl agree on a full synthetic spectrum to ~3e-3; see the
 # module docstring.  This is the tolerance used for whole-spectrum comparisons.
 SPECTRUM_RTOL = 5e-3
+
+# Rebuilding the equilibrium/continuum tables from the same default inputs does
+# not give bit-identical tables to the shipped ones — the shipped set carries a
+# single-knot degeneracy (H III) a fresh build does not, 201 non-finite knot
+# entries against 199.  See ``TestCustomSynthesisData``; measured below.
+CUSTOM_DATA_RTOL = 1e-10
 
 
 # ---------------------------------------------------------------------------
@@ -112,18 +124,43 @@ def fe_line(julia_ref):
                 gamma_stark=L["gamma_stark"], vdW=tuple(L["vdW"]))
 
 
-def _synth(*args, **kwargs):
-    """Call ``synthesize_spectrum`` quietly (it is deprecated on purpose)."""
-    kwargs.setdefault("verbose", False)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        return synthesize_spectrum(*args, **kwargs)
+def _synth(atmosphere, linelist, wls, A_X, **kwargs):
+    """``synthesize``, returning ``(flux, cntm)`` as NumPy arrays.
+
+    Every call in this file goes through here so that the conversion from JAX
+    arrays happens in one place.
+    """
+    f, c = synthesize(atmosphere, linelist, wls, A_X, **kwargs)
+    return np.asarray(f), np.asarray(c)
 
 
 @pytest.fixture(scope="module")
 def baseline(tiny_atm, tiny_wls, A_X):
-    """Continuum-only synthesis with all defaults — reused by many tests."""
+    """Continuum-only synthesis with all defaults — reused by many tests.
+
+    ``(flux, cntm)``, both NumPy.  It used to be a ``SynthesisResult`` carrying
+    ``alpha``, ``number_densities`` and ``electron_number_density`` as well;
+    ``synthesize`` returns fluxes only, and the tests that wanted the rest go
+    through the ``chem_eq`` fixture below.
+    """
     return _synth(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False)
+
+
+@pytest.fixture(scope="module")
+def chem_eq(tiny_atm, A_X):
+    """Chemical equilibrium on ``tiny_atm``: ``(ne, number_densities, raw_arrays)``.
+
+    This is the call ``synthesize_spectrum`` made for the number densities it
+    reported.  Reaching it directly is what replaced reading them off a
+    ``SynthesisResult``.
+    """
+    from korg.abundances import A_X_to_absolute
+    from korg.data_loader import default_chem_eq_data, default_mol_species
+    from korg.statmech import chemical_equilibrium_all_layers
+    return chemical_equilibrium_all_layers(
+        np.asarray(tiny_atm.T), np.asarray(tiny_atm.n_total),
+        np.asarray(tiny_atm.ne), A_X_to_absolute(A_X),
+        default_chem_eq_data, default_mol_species)
 
 
 # ===========================================================================
@@ -146,11 +183,18 @@ class TestSynthesisResult:
         assert r.number_densities is None
         assert r.electron_number_density is None
 
-    def test_synthesis_populates_the_korg_fields(self, baseline, tiny_atm, tiny_wls):
-        assert baseline.alpha.shape == (tiny_atm.n_layers, len(tiny_wls))
-        assert baseline.alpha_cntm.shape == baseline.alpha.shape
-        assert baseline.electron_number_density.shape == (tiny_atm.n_layers,)
-        assert Species("H_I") in baseline.number_densities
+    def test_nothing_constructs_one_any_more(self):
+        """A record, not an assertion about behaviour.
+
+        ``SynthesisResult`` was populated by ``synthesize_spectrum``, which has
+        been deleted; ``synthesize`` returns a ``(flux, continuum)`` tuple. The
+        dataclass is kept because it is exported and documented, but the test
+        that used to check a real synthesis filled in ``alpha``,
+        ``number_densities`` and ``electron_number_density`` has nothing left to
+        call. If a future entry point starts returning one, restore it.
+        """
+        import korg.synthesis as syn
+        assert not hasattr(syn, "synthesize_spectrum")
 
 
 # ===========================================================================
@@ -317,155 +361,157 @@ class TestReferenceWavelengthLinelist:
 # ===========================================================================
 
 class TestComputeContinuumAbsorption:
+    """The public helper, against the batched kernel the synthesis path uses.
+
+    Both tests used to read ``number_densities``, ``electron_number_density`` and
+    ``alpha_cntm`` off a ``SynthesisResult``.  ``synthesize`` returns fluxes, so
+    the densities now come from ``chemical_equilibrium_all_layers`` — which is
+    the function the deleted path called for them — and the comparison is
+    against ``batch_continuum_absorption`` directly.
+    """
 
     def test_species_keys_are_translated_and_the_result_is_positive(
-            self, baseline, tiny_atm):
+            self, chem_eq, tiny_atm):
         """``Species`` prints as ``'Fe II'`` but the continuum module wants ``'Fe_II'``."""
         from korg.data_loader import default_partition_funcs
-        nd = {sp: float(arr[0]) for sp, arr in baseline.number_densities.items()}
+        ne, number_densities, _ = chem_eq
+        nd = {sp: float(arr[0]) for sp, arr in number_densities.items()}
         wl = np.array([4.0e-5, 5.0e-5, 6.0e-5])
         alpha = compute_continuum_absorption(
-            wl, float(tiny_atm.T[0]),
-            float(baseline.electron_number_density[0]), nd,
-            default_partition_funcs)
+            wl, float(tiny_atm.T[0]), float(ne[0]), nd, default_partition_funcs)
         assert alpha.shape == wl.shape
         assert np.all(np.isfinite(alpha))
         assert np.all(alpha > 0)
 
-    def test_it_reproduces_the_continuum_used_inside_synthesis(
-            self, baseline, tiny_atm):
-        """The helper and the synthesis fast path must agree to round-off.
+    def test_it_reproduces_the_batched_continuum_kernel(self, chem_eq, tiny_atm,
+                                                        tiny_wls):
+        """Two independent routes to the same opacity, at the same wavelengths.
 
-        ``alpha_cntm`` from a line-free synthesis is the vmapped JIT continuum
-        evaluated on a 1 Å coarse grid and linearly interpolated onto the output
-        grid; recomputing it directly at every output wavelength through this
-        public helper is an independent route to the same numbers.  The residual
-        1e-5 is the coarse-grid interpolation error, not a physics difference —
-        it is the same approximation Korg.jl makes.
+        This helper loops over species dictionaries in NumPy; the synthesis path
+        goes through a vmapped JIT kernel over per-layer arrays.  Evaluated on
+        the identical chemistry they must agree to round-off, and do — no coarse
+        grid and no interpolation is involved on either side here, unlike the
+        1e-5 the old version of this test tolerated.
         """
+        import jax.numpy as _jnp
+        from korg.constants import c_cgs as _c
+        from korg.continuum import (batch_continuum_absorption,
+                                    prepare_continuum_batch_fast)
         from korg.data_loader import default_partition_funcs
+
+        ne, number_densities, raw_arrays = chem_eq
+        T = np.asarray(tiny_atm.T)
+        wl_cm = np.asarray(tiny_wls) * 1e-8
+        batch = prepare_continuum_batch_fast(raw_arrays, default_partition_funcs, T)
+        batched = np.asarray(batch_continuum_absorption(
+            _jnp.asarray(_c / wl_cm), _jnp.asarray(T), _jnp.asarray(ne), batch))
+
         i = tiny_atm.n_layers // 2
-        nd = {sp: float(arr[i]) for sp, arr in baseline.number_densities.items()}
-        wl_cm = np.asarray(baseline.wavelengths) * 1e-8
-        alpha = compute_continuum_absorption(
-            wl_cm, float(tiny_atm.T[i]),
-            float(baseline.electron_number_density[i]), nd,
-            default_partition_funcs)
-        np.testing.assert_allclose(alpha, np.asarray(baseline.alpha_cntm)[i],
-                                   rtol=1e-4)
+        nd = {sp: float(arr[i]) for sp, arr in number_densities.items()}
+        direct = np.asarray(compute_continuum_absorption(
+            wl_cm, float(T[i]), float(ne[i]), nd, default_partition_funcs))
+        np.testing.assert_allclose(direct, batched[i], rtol=1e-10)
 
 
 # ===========================================================================
-# 1. Functional — synthesize_spectrum options and error paths
+# 1. Functional — synthesize options and error paths
 # ===========================================================================
 
-class TestSynthesizeSpectrumOptions:
+class TestSynthesizeOptions:
+    """Options that survived the deletion of ``synthesize_spectrum``.
 
-    def test_it_warns_that_it_is_deprecated(self, tiny_atm, tiny_wls, A_X):
-        with pytest.warns(DeprecationWarning, match="synthesize_jit"):
-            synthesize_spectrum(tiny_atm, [], tiny_wls, A_X,
-                                hydrogen_lines=False, verbose=False)
+    Gone with it, because the traced path has no such thing:
+    ``verbose`` (no progress printing), ``profile`` (no host-side stage
+    timings), ``partition_funcs`` / ``ionization_energies_dict`` /
+    ``log_equilibrium_constants`` (see ``TestCustomSynthesisData`` for what
+    replaced the coverage), and the ``DeprecationWarning`` it raised.
+    """
 
-    def test_verbose_reports_progress(self, tiny_atm, tiny_wls, A_X, capsys):
-        _synth(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False, verbose=True)
-        out = capsys.readouterr().out
-        assert "Synthesizing spectrum" in out
-        assert "Layers: 8" in out
-        assert "Synthesis complete" in out
+    def test_return_cntm_false_returns_the_flux_alone(self, baseline, tiny_atm,
+                                                      tiny_wls, A_X):
+        flux = synthesize(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False,
+                          return_cntm=False)
+        assert np.asarray(flux).shape == (len(tiny_wls),)
+        np.testing.assert_allclose(np.asarray(flux), baseline[0], rtol=1e-12)
 
-    def test_profile_reports_timings(self, tiny_atm, tiny_wls, A_X, fe_line, capsys):
-        _synth(tiny_atm, [fe_line], tiny_wls, A_X, hydrogen_lines=True,
-               profile=True, verbose=False)
-        out = capsys.readouterr().out
-        assert "PROFILING RESULTS" in out
-        for label in ("Chemical equilibrium", "Continuum absorption",
-                      "Source function", "Continuum RT", "Hydrogen lines",
-                      "Line absorption", "Radiative transfer", "TOTAL"):
-            assert label in out, f"missing timing line for {label!r}"
-
-    def test_return_continuum_false_reuses_the_flux(self, tiny_atm, tiny_wls, A_X):
-        r = _synth(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False,
-                   return_continuum=False)
-        np.testing.assert_array_equal(r.continuum, r.flux)
-
-    def test_return_continuum_true_computes_a_separate_continuum(
+    def test_a_line_depresses_the_flux_below_the_continuum(
             self, baseline, tiny_atm, tiny_wls, A_X, fe_line):
-        r = _synth(tiny_atm, [fe_line], tiny_wls, A_X, hydrogen_lines=False)
-        assert np.any(r.flux < r.continuum), "the line must depress the flux"
-        np.testing.assert_allclose(r.continuum, baseline.flux, rtol=1e-12)
+        flux, cntm = _synth(tiny_atm, [fe_line], tiny_wls, A_X,
+                            hydrogen_lines=False)
+        assert np.any(flux < cntm), "the line must depress the flux"
+        np.testing.assert_allclose(cntm, baseline[1], rtol=1e-12)
 
     def test_hydrogen_lines_change_the_spectrum(self, tiny_atm, A_X):
         """Evaluated at Hβ, where switching H lines off is unmistakable."""
         wls = 4861.0 + 0.1 * np.arange(5)
-        without = _synth(tiny_atm, [], wls, A_X, hydrogen_lines=False)
-        with_h = _synth(tiny_atm, [], wls, A_X, hydrogen_lines=True)
-        assert np.all(np.asarray(with_h.flux) < np.asarray(without.flux))
-        assert np.max(np.asarray(with_h.alpha)) > np.max(np.asarray(without.alpha))
+        without, _ = _synth(tiny_atm, [], wls, A_X, hydrogen_lines=False)
+        with_h, _ = _synth(tiny_atm, [], wls, A_X, hydrogen_lines=True)
+        assert np.all(with_h < without)
 
-    def test_the_infrared_brackett_branch_runs_but_contributes_nothing(
-            self, tiny_atm, A_X):
-        """Covers the Brackett branch and pins a bug it exposes.
+    def test_the_infrared_brackett_series_is_not_modelled(self, tiny_atm, A_X):
+        """Pins a known gap rather than skipping it.
 
-        16,400 Å is Brackett (n=4 -> 12), so ``brackett_in_range`` is true and
-        the per-layer loop runs.  ``korg.hydrogen_line_absorption`` returns
-        *exactly zero* for every Brackett wavelength, while Korg.jl 1.2.1
-        returns ~1e-13 cm^-1 at these conditions.  That defect lives in
-        ``hydrogen_line_absorption.py``, not in this module, so it is pinned
-        here rather than fixed: if the Brackett series is ever implemented,
-        this test fails and should be replaced with a real comparison.
+        16,400 Å is Brackett (n=4 -> 12), so ``brackett_in_range`` is true, but
+        the traced path models no Brackett lines at all and Korg.jl 1.2.1
+        returns ~1e-13 cm^-1 at these conditions.  Switching hydrogen lines on
+        therefore changes nothing here.  If the series is ever implemented this
+        test fails and should be replaced with a real comparison.
         """
         wls = 16400.0 + 1.0 * np.arange(5)
-        without = _synth(tiny_atm, [], wls, A_X, hydrogen_lines=False)
-        with_h = _synth(tiny_atm, [], wls, A_X, hydrogen_lines=True)
-        assert np.all(np.isfinite(np.asarray(with_h.flux)))
-        np.testing.assert_array_equal(
-            np.asarray(with_h.alpha), np.asarray(without.alpha))
+        plan = prepare_synthesis(wls, [])
+        assert plan.brackett_in_range
+        without, _ = _synth(tiny_atm, [], wls, A_X, hydrogen_lines=False)
+        with_h, _ = _synth(tiny_atm, [], wls, A_X, hydrogen_lines=True)
+        assert np.all(np.isfinite(with_h))
+        np.testing.assert_array_equal(with_h, without)
 
     def test_an_empty_linelist_gives_flux_equal_to_the_continuum(self, baseline):
-        np.testing.assert_allclose(baseline.flux, baseline.continuum, rtol=1e-14)
+        np.testing.assert_allclose(baseline[0], baseline[1], rtol=1e-14)
 
     def test_a_linelist_with_no_lines_in_range_behaves_like_an_empty_one(
             self, baseline, tiny_atm, tiny_wls, A_X):
         far = [_line_at(3000.0), _line_at(9000.0)]
-        r = _synth(tiny_atm, far, tiny_wls, A_X, hydrogen_lines=False)
-        np.testing.assert_allclose(r.flux, baseline.flux, rtol=1e-14)
+        flux, _ = _synth(tiny_atm, far, tiny_wls, A_X, hydrogen_lines=False)
+        np.testing.assert_allclose(flux, baseline[0], rtol=1e-12)
 
     def test_an_unsorted_linelist_is_sorted_before_use(self, tiny_atm, tiny_wls,
                                                        A_X, fe_line):
         extra = Line(wl=5000.2e-8, log_gf=-1.5, species=Species("Fe I"),
                      E_lower=3.0, gamma_rad=fe_line.gamma_rad,
                      gamma_stark=fe_line.gamma_stark, vdW=fe_line.vdW)
-        ordered = _synth(tiny_atm, [extra, fe_line], tiny_wls, A_X,
-                         hydrogen_lines=False)
-        reversed_ = _synth(tiny_atm, [fe_line, extra], tiny_wls, A_X,
-                           hydrogen_lines=False)
-        np.testing.assert_allclose(ordered.flux, reversed_.flux, rtol=1e-14)
+        ordered, _ = _synth(tiny_atm, [extra, fe_line], tiny_wls, A_X,
+                            hydrogen_lines=False)
+        reversed_, _ = _synth(tiny_atm, [fe_line, extra], tiny_wls, A_X,
+                              hydrogen_lines=False)
+        # Not assert_array_equal: the two orderings put the lines in different
+        # bucket slots, so the sum runs in a different order. 1e-12 is far below
+        # anything physical and far above float64 reassociation.
+        np.testing.assert_allclose(ordered, reversed_, rtol=1e-12)
 
-    def test_absolute_number_fractions_are_accepted_as_well_as_A_X(
-            self, baseline, tiny_atm, tiny_wls, A_X):
-        """``synthesize`` detects the A(X) convention from A(H) > 1."""
-        from korg.abundances import A_X_to_absolute
-        linear = A_X_to_absolute(A_X)
-        assert linear[0] <= 1.0
-        r = _synth(tiny_atm, [], tiny_wls, linear, hydrogen_lines=False)
-        np.testing.assert_allclose(r.flux, baseline.flux, rtol=1e-14)
+    def test_n_mu_is_ignored_for_a_planar_atmosphere(self, baseline, tiny_atm,
+                                                     tiny_wls, A_X):
+        """Planar transfer takes the exponential-integral shortcut, as in Korg.jl.
 
-    def test_mu_values_is_ignored_for_a_planar_atmosphere(
-            self, baseline, tiny_atm, tiny_wls, A_X):
-        """Planar transfer takes the exponential-integral shortcut, as in Korg.jl."""
-        r = _synth(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False, mu_values=3)
-        np.testing.assert_array_equal(r.flux, baseline.flux)
+        ``mu_values`` on the deleted function; ``n_mu`` on the plan.
+        """
+        flux, _ = _synth(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False, n_mu=3)
+        np.testing.assert_array_equal(flux, baseline[0])
 
 
-class TestSynthesizeSpectrumErrorPaths:
+class TestSynthesizeErrorPaths:
+    """Bad input is rejected, with the same coverage the deleted path had.
+
+    ``synthesize`` checks the abundances and the atmosphere; ``prepare_synthesis``
+    checks the wavelength grid, which is where the grid is fixed.
+    """
 
     def test_abundances_of_the_wrong_length_are_rejected(self, tiny_atm, tiny_wls):
         with pytest.raises(ValueError, match="92-element"):
-            _synth(tiny_atm, [], tiny_wls, np.full(50, 0.01))
+            synthesize(tiny_atm, [], tiny_wls, np.full(50, 0.01))
 
     def test_a_2d_abundance_array_is_rejected(self, tiny_atm, tiny_wls, A_X):
         with pytest.raises(ValueError, match="92-element"):
-            _synth(tiny_atm, [], tiny_wls, np.tile(A_X, (2, 1)))
+            synthesize(tiny_atm, [], tiny_wls, np.tile(A_X, (2, 1)))
 
     def test_A_X_with_the_wrong_hydrogen_anchor_is_rejected(self, tiny_atm,
                                                             tiny_wls, A_X):
@@ -473,24 +519,42 @@ class TestSynthesizeSpectrumErrorPaths:
         bad = A_X.copy()
         bad[0] = 11.5
         with pytest.raises(ValueError, match="A\\(H\\)"):
-            _synth(tiny_atm, [], tiny_wls, bad)
+            synthesize(tiny_atm, [], tiny_wls, bad)
+
+    def test_absolute_number_fractions_are_rejected(self, tiny_atm, tiny_wls, A_X):
+        """A deliberate behaviour change, not an oversight.
+
+        ``synthesize_spectrum`` accepted either convention and told them apart
+        by ``A(H) <= 1``.  Sniffing the convention from the data means a caller
+        who passes the wrong one gets a plausible spectrum instead of an error,
+        so the traced path takes A(X) only — Korg.jl's rule.
+        """
+        from korg.abundances import A_X_to_absolute
+        linear = A_X_to_absolute(A_X)
+        assert linear[0] <= 1.0
+        with pytest.raises(ValueError, match="A\\(H\\)"):
+            synthesize(tiny_atm, [], tiny_wls, linear)
 
     def test_an_empty_wavelength_grid_is_rejected(self, tiny_atm, A_X):
-        with pytest.raises(ValueError, match="non-empty 1-D array"):
-            _synth(tiny_atm, [], np.array([]), A_X)
+        with pytest.raises(ValueError, match="two wavelength points"):
+            synthesize(tiny_atm, [], np.array([]), A_X)
+
+    def test_a_single_wavelength_point_is_rejected(self, tiny_atm, A_X):
+        with pytest.raises(ValueError, match="two wavelength points"):
+            synthesize(tiny_atm, [], np.array([5000.0]), A_X)
 
     def test_a_2d_wavelength_grid_is_rejected(self, tiny_atm, A_X):
         with pytest.raises(ValueError, match="non-empty 1-D array"):
-            _synth(tiny_atm, [], np.zeros((2, 5)) + 5000.0, A_X)
+            synthesize(tiny_atm, [], np.zeros((2, 5)) + 5000.0, A_X)
 
     def test_wavelengths_blueward_of_1300_angstrom_are_rejected(self, tiny_atm, A_X):
         """Korg.jl's lower bound; the Rayleigh cross-sections are invalid below it."""
         with pytest.raises(ValueError, match="1300"):
-            _synth(tiny_atm, [], np.linspace(1200.0, 1250.0, 5), A_X)
+            synthesize(tiny_atm, [], np.linspace(1200.0, 1250.0, 5), A_X)
 
     def test_an_atmosphere_with_no_layers_is_rejected(self, tiny_wls, A_X):
         with pytest.raises(ValueError, match="no layers"):
-            _synth(PlanarAtmosphere([]), [], tiny_wls, A_X)
+            synthesize(PlanarAtmosphere([]), [], tiny_wls, A_X)
 
 
 class TestReferenceOpacityAwayFrom5000Angstrom:
@@ -504,7 +568,7 @@ class TestReferenceOpacityAwayFrom5000Angstrom:
     hundreds of Å, and it goes **negative** — 42 of 56 solar layers at Hβ —
     which makes tau negative and the emergent flux NaN.  Korg.jl instead
     evaluates ``total_continuum_absorption`` directly at the reference
-    wavelength, which is what this module now does.
+    wavelength, which is what ``traced_synthesis._synthesize_traced`` does.
 
     Nothing caught it because every existing synthesis comparison happened to
     span 5000 Å.
@@ -513,111 +577,116 @@ class TestReferenceOpacityAwayFrom5000Angstrom:
     @pytest.mark.parametrize("start", [4861.0, 6000.0, 8000.0, 3500.0])
     def test_alpha_ref_stays_positive_far_from_5000_angstrom(
             self, tiny_atm, A_X, start):
-        r = _synth(tiny_atm, [], start + 0.1 * np.arange(5), A_X,
-                   hydrogen_lines=False)
-        assert np.all(np.isfinite(np.asarray(r.flux)))
-        assert np.all(np.asarray(r.flux) > 0)
+        flux, _ = _synth(tiny_atm, [], start + 0.1 * np.arange(5), A_X,
+                         hydrogen_lines=False)
+        assert np.all(np.isfinite(flux))
+        assert np.all(flux > 0)
 
     def test_hydrogen_beta_no_longer_produces_nan_flux(self, tiny_atm, A_X):
         """The originally observed failure: Hβ with hydrogen lines on."""
-        r = _synth(tiny_atm, [], 4861.0 + 0.1 * np.arange(5), A_X,
-                   hydrogen_lines=True)
-        assert np.all(np.isfinite(np.asarray(r.flux)))
-        assert np.all(np.asarray(r.flux) > 0)
+        flux, _ = _synth(tiny_atm, [], 4861.0 + 0.1 * np.arange(5), A_X,
+                         hydrogen_lines=True)
+        assert np.all(np.isfinite(flux))
+        assert np.all(flux > 0)
 
     @staticmethod
     def _capture_alpha_ref(monkeypatch, atm, wls, A_X):
-        """Intercept the alpha_ref actually handed to the transfer solver."""
-        import korg.synthesis as syn
+        """Intercept the alpha_ref actually handed to the transfer solver.
+
+        ``traced_synthesis`` imports ``radiative_transfer_jit`` inside the
+        planar branch, at call time, so patching it on the package is enough.
+        """
+        import korg.radiative_transfer as rt_mod
         seen = {}
-        original = syn.radiative_transfer_jit
+        original = rt_mod.radiative_transfer_jit
 
         def spy(alpha_T, S, z, log_tau, alpha_ref):
             seen["alpha_ref"] = np.asarray(alpha_ref)
             return original(alpha_T, S, z, log_tau, alpha_ref)
 
-        monkeypatch.setattr(syn, "radiative_transfer_jit", spy)
-        result = _synth(atm, [], wls, A_X, hydrogen_lines=False)
-        return seen["alpha_ref"], result
+        monkeypatch.setattr(rt_mod, "radiative_transfer_jit", spy)
+        flux, cntm = _synth(atm, [], wls, A_X, hydrogen_lines=False)
+        return seen["alpha_ref"], (flux, cntm)
 
     def test_alpha_ref_matches_korgs_definition_at_5000_angstrom(
-            self, monkeypatch, tiny_atm, A_X):
+            self, monkeypatch, chem_eq, tiny_atm, A_X):
         """Pin the fix to Korg.jl's definition.
 
         Synthesised at 8000 Å, where the old extrapolation produced negative
-        values, alpha_ref must be the *continuum evaluated at exactly 5000 Å*
-        plus the reference linelist's contribution — so strictly greater than
-        the pure continuum value, and of the same order.
+        values, alpha_ref must be the continuum evaluated at *exactly* 5000 Å.
+        The independent value here comes from ``compute_continuum_absorption``
+        on ``chemical_equilibrium_all_layers``' densities, while the synthesis
+        solves its own chemistry in JAX; those two equilibrium solvers agree to
+        ~2e-3 (see ``test_synthesis_precompute.py``), so this compares at 5e-2
+        rather than to round-off.  The bug it guards against was a sign error
+        and orders of magnitude, not a percent.
         """
         from korg.data_loader import default_partition_funcs
+        ne, number_densities, _ = chem_eq
         wls = 8000.0 + 0.1 * np.arange(5)
-        alpha_ref, r = self._capture_alpha_ref(monkeypatch, tiny_atm, wls, A_X)
+        alpha_ref, _ = self._capture_alpha_ref(monkeypatch, tiny_atm, wls, A_X)
 
         assert np.all(alpha_ref > 0), "alpha_ref went negative — the old bug"
         for i in range(tiny_atm.n_layers):
-            nd = {sp: float(arr[i]) for sp, arr in r.number_densities.items()}
+            nd = {sp: float(arr[i]) for sp, arr in number_densities.items()}
             direct = float(compute_continuum_absorption(
-                np.array([LAMBDA_REF_CM]), float(tiny_atm.T[i]),
-                float(r.electron_number_density[i]), nd,
-                default_partition_funcs)[0])
-            # equal to within one ulp where the reference lines contribute
-            # nothing, and above it where they do — never below.
-            assert alpha_ref[i] >= direct * (1.0 - 1e-12), \
-                f"layer {i}: alpha_ref below the continuum-only value"
-            assert alpha_ref[i] < 100.0 * direct, \
-                f"layer {i}: alpha_ref implausibly far above the continuum"
+                np.array([LAMBDA_REF_CM]), float(tiny_atm.T[i]), float(ne[i]),
+                nd, default_partition_funcs)[0])
+            assert alpha_ref[i] == pytest.approx(direct, rel=5e-2), \
+                f"layer {i}: alpha_ref is not the 5000 A continuum"
 
     def test_alpha_ref_is_independent_of_the_synthesis_window(
             self, monkeypatch, tiny_atm, A_X):
         """The reference opacity is a property of the model, not of the window.
 
         Under the old extrapolation it varied by orders of magnitude (and
-        changed sign) with the window; it must not.
+        changed sign) with the window; it must not.  5000 Å is deliberately
+        excluded from both windows here — where the grid *does* contain it the
+        traced path anchors on continuum + synthesis lines at that pixel
+        instead, which is a different (also correct) quantity.
         """
         a_near, _ = self._capture_alpha_ref(
-            monkeypatch, tiny_atm, 5000.0 + 0.1 * np.arange(5), A_X)
+            monkeypatch, tiny_atm, 5100.0 + 0.1 * np.arange(5), A_X)
         a_far, _ = self._capture_alpha_ref(
             monkeypatch, tiny_atm, 8000.0 + 0.1 * np.arange(5), A_X)
         np.testing.assert_allclose(a_far, a_near, rtol=1e-12)
 
     def test_a_window_containing_5000_is_unaffected_in_sign(self, baseline):
-        assert np.all(np.asarray(baseline.flux) > 0)
+        assert np.all(baseline[0] > 0)
 
 
-class TestCustomDataPath:
-    """The ``using_defaults=False`` branch, which rebuilds all the tables."""
+class TestCustomSynthesisData:
+    """Rebuilding the tables from the default inputs reproduces the shipped ones.
+
+    ``synthesize_spectrum`` took ``partition_funcs``, ``ionization_energies_dict``
+    and ``log_equilibrium_constants`` and rebuilt its equilibrium tables from
+    them; ``TestCustomDataPath`` checked that passing the defaults explicitly
+    reproduced the fast path.  The traced path takes a whole ``SynthesisData``
+    instead — ``prepare_synthesis(..., data=...)`` — so the equivalent check is
+    that a table set built here from the same default inputs gives the same
+    spectrum as the shipped one.
+    """
 
     @pytest.fixture(scope="class")
-    def custom(self, tiny_atm, tiny_wls, A_X):
+    def rebuilt(self):
         from korg.data_loader import (default_log_equilibrium_constants,
                                       default_partition_funcs, ionization_energies)
-        return _synth(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False,
-                      partition_funcs=default_partition_funcs,
-                      ionization_energies_dict=ionization_energies,
-                      log_equilibrium_constants=default_log_equilibrium_constants)
+        from korg.synthesis import precompute_synthesis_data
+        return precompute_synthesis_data(ionization_energies,
+                                         default_partition_funcs,
+                                         default_log_equilibrium_constants)
 
-    def test_passing_the_defaults_explicitly_reproduces_the_fast_path(
-            self, custom, baseline):
-        """A high-precision check: same physics, two entirely different code paths.
-
-        The fast path batches chemical equilibrium and continuum through vmapped
-        JIT kernels; the slow path rebuilds the equilibrium tables and loops over
-        layers in Python calling ``compute_continuum_absorption``.  They must
-        agree to round-off, and they do.
-        """
-        np.testing.assert_allclose(custom.flux, baseline.flux, rtol=1e-12)
-        np.testing.assert_allclose(custom.continuum, baseline.continuum, rtol=1e-12)
-
-    def test_the_number_density_dict_is_assembled_per_layer(self, custom, tiny_atm):
-        assert Species("H_I") in custom.number_densities
-        assert custom.number_densities[Species("H_I")].shape == (tiny_atm.n_layers,)
-
-    def test_one_custom_table_is_enough_to_leave_the_fast_path(
-            self, tiny_atm, tiny_wls, A_X, baseline):
-        from korg.data_loader import default_partition_funcs
-        r = _synth(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False,
-                   partition_funcs=default_partition_funcs)
-        np.testing.assert_allclose(r.flux, baseline.flux, rtol=1e-12)
+    def test_a_rebuilt_table_set_reproduces_the_shipped_spectrum(
+            self, rebuilt, baseline, tiny_atm, tiny_wls, A_X):
+        from korg.abundances import A_X_to_absolute
+        plan = prepare_synthesis(np.asarray(tiny_wls), [], data=rebuilt,
+                                 geometry="plane-parallel",
+                                 n_layers=tiny_atm.n_layers, hydrogen_lines=False)
+        flux, _ = plan.from_atmosphere(
+            jnp.asarray(tiny_atm.T), jnp.asarray(tiny_atm.n_total),
+            jnp.asarray(tiny_atm.ne), jnp.asarray(tiny_atm.z),
+            jnp.asarray(tiny_atm.log_tau_ref), jnp.asarray(A_X_to_absolute(A_X)))
+        np.testing.assert_allclose(np.asarray(flux), baseline[0], rtol=CUSTOM_DATA_RTOL)
 
 
 # ===========================================================================
@@ -625,7 +694,14 @@ class TestCustomDataPath:
 # ===========================================================================
 
 class TestFallbackAndRarePaths:
-    """Branches that only fire when the built-in data are unavailable."""
+    """Branches that only fire when the built-in data are unavailable.
+
+    Only the ``get_reference_wavelength_linelist`` ones are left.  The rest of
+    this class exercised ``synthesize_spectrum``'s reference-linelist correction
+    to alpha_ref and its caller-supplied partition-function branch, neither of
+    which exists on the traced path — it anchors on continuum plus the synthesis
+    linelist at 5000 Å and builds no separate reference list.
+    """
 
     @pytest.fixture
     def no_builtin_linelist(self, monkeypatch):
@@ -649,136 +725,47 @@ class TestFallbackAndRarePaths:
             [_line_at(5010.0)], 5e-5, use_internal_reference_linelist=False)
         assert [round(l.wl * 1e8) for l in out] == [5010]
 
-    def test_an_empty_reference_linelist_skips_the_line_correction(
-            self, no_builtin_linelist, full_sun, tiny_wls, A_X):
-        """With no reference lines at all, alpha_ref is continuum-only.
-
-        This is the ``if ref_ll_for_ref:`` false branch, otherwise unreachable
-        because the built-in list is always non-empty.  Dropping those lines
-        lowers alpha_ref and so shifts the whole optical-depth scale.
-        """
-        r = _synth(full_sun, [], tiny_wls, A_X, hydrogen_lines=False)
-        assert np.all(np.isfinite(np.asarray(r.flux)))
-        assert np.all(np.asarray(r.flux) > 0)
-
-    def test_the_reference_linelist_contributes_nothing_at_5000_angstrom(
-            self, monkeypatch, full_sun, tiny_wls, A_X):
-        """Records a measured fact about the built-in reference linelist.
-
-        Korg keeps a built-in ±21 Å linelist so that alpha_5000 includes line
-        opacity.  Evaluated at *exactly* 5000 Å on the solar model, every one
-        of those lines falls below the 3e-4 cutoff, so removing the list leaves
-        the emergent flux bit-identical.  If the reference list or the cutoff
-        ever changes, this test fails and the assumption gets revisited.
-        """
-        with_lines = _synth(full_sun, [], tiny_wls, A_X, hydrogen_lines=False)
-
-        import korg.data_loader as dl
-        monkeypatch.setattr(dl, "load_default_linelist",
-                            lambda *a, **k: (_ for _ in ()).throw(
-                                FileNotFoundError("simulated")))
-        without = _synth(full_sun, [], tiny_wls, A_X, hydrogen_lines=False)
-        np.testing.assert_array_equal(np.asarray(without.flux),
-                                      np.asarray(with_lines.flux))
-
-    def test_a_partition_function_without_numpy_eval_is_still_usable(
-            self, tiny_atm, A_X):
-        """The H I partition function is normally a spline with a fast path.
-
-        A caller-supplied callable without ``numpy_eval`` must work too — it is
-        then evaluated scalar-by-scalar.
-        """
-        from korg.data_loader import (default_log_equilibrium_constants,
-                                      default_partition_funcs, ionization_energies)
-
-        class PlainCallable:
-            """Identical to the wrapped spline except that ``numpy_eval`` is hidden."""
-
-            def __init__(self, inner):
-                object.__setattr__(self, "_inner", inner)
-
-            def __call__(self, log_T):
-                return self._inner(log_T)
-
-            def __getattr__(self, name):
-                if name == "numpy_eval":
-                    raise AttributeError(name)
-                return getattr(object.__getattribute__(self, "_inner"), name)
-
-        pf = dict(default_partition_funcs)
-        pf[Species("H_I")] = PlainCallable(pf[Species("H_I")])
-        assert not hasattr(pf[Species("H_I")], "numpy_eval")
-        r = _synth(tiny_atm, [], 4861.0 + 0.1 * np.arange(5), A_X,
-                   hydrogen_lines=True, partition_funcs=pf,
-                   ionization_energies_dict=ionization_energies,
-                   log_equilibrium_constants=default_log_equilibrium_constants)
-        assert np.all(np.isfinite(np.asarray(r.flux)))
-        assert np.all(np.asarray(r.flux) > 0)
-
-    def test_verbose_reports_hydrogen_and_line_stages(self, tiny_atm, A_X,
-                                                      fe_line, tiny_wls, capsys):
-        _synth(tiny_atm, [fe_line], tiny_wls, A_X, hydrogen_lines=True,
-               verbose=True)
-        out = capsys.readouterr().out
-        assert "Adding hydrogen line absorption" in out
-        assert "Adding line absorption for 1 lines" in out
-        assert "Computing continuum spectrum" in out
-
-    def test_profile_omits_the_stages_that_did_not_run(self, tiny_atm, tiny_wls,
-                                                       A_X, capsys):
-        """No hydrogen lines and no linelist — those timing lines are absent.
-
-        ``Continuum RT`` is always printed: the key is seeded to 0.0 whenever
-        ``profile=True``, so its guard can never be false.
-        """
-        _synth(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False,
-               return_continuum=False, profile=True)
-        out = capsys.readouterr().out
-        assert "PROFILING RESULTS" in out
-        assert "Hydrogen lines" not in out
-        assert "Line absorption" not in out
-
 
 class TestPublicWrappers:
 
-    def test_synthesize_matches_synthesize_spectrum(self, baseline, tiny_atm,
-                                                    tiny_wls, A_X):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            r = synthesize(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False,
-                           verbose=False)
-        np.testing.assert_array_equal(r.flux, baseline.flux)
+    def test_there_is_exactly_one_synthesize(self):
+        """The point of deleting ``synthesize_spectrum``.
+
+        ``korg.synthesize`` used to be a different function from
+        ``korg.synthesis_plan.synthesize``: different fourth argument (absolute
+        number fractions against A(X)), different return type (SynthesisResult
+        against a tuple), one traceable and one not.  All three names are now
+        the same object.
+        """
+        import korg
+        import korg.synthesis as syn
+        import korg.synthesis_plan as plan
+        assert korg.synthesize is plan.synthesize
+        assert syn.synthesize is plan.synthesize
+        assert korg.synth is plan.synth
 
     def test_synthesize_accepts_a_list_of_wavelengths(self, baseline, tiny_atm,
                                                       tiny_wls, A_X):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            r = synthesize(tiny_atm, [], list(tiny_wls), A_X,
-                           hydrogen_lines=False, verbose=False)
-        np.testing.assert_array_equal(r.flux, baseline.flux)
+        flux, _ = _synth(tiny_atm, [], list(tiny_wls), A_X, hydrogen_lines=False)
+        np.testing.assert_array_equal(flux, baseline[0])
 
     def test_synth_returns_wavelengths_flux_continuum(self, baseline, tiny_atm,
                                                       tiny_wls, A_X):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            wl, flux, cont = synth(tiny_atm, [], tiny_wls, A_X,
-                                   hydrogen_lines=False, verbose=False)
+        wl, flux, cont = synth(tiny_atm, [], tiny_wls, A_X, hydrogen_lines=False)
         np.testing.assert_array_equal(wl, tiny_wls)
-        np.testing.assert_array_equal(flux, baseline.flux)
-        np.testing.assert_array_equal(cont, baseline.continuum)
+        np.testing.assert_array_equal(np.asarray(flux), baseline[0])
+        np.testing.assert_array_equal(np.asarray(cont), baseline[1])
 
     def test_a_line_free_plan_returns_the_continuum(self, tiny_atm, tiny_wls, A_X):
-        """Replaces test_synthesize_continuum_returns_the_line_free_flux.
+        """``prepare_synthesis(wls, [])`` is the continuum-only synthesis.
 
-        ``synthesize_continuum`` was ``synthesize_spectrum`` with an empty
-        linelist, used by nothing in src/. ``prepare_synthesis(wls, [])`` says
-        the same thing and stays traceable.
+        ``synthesize_continuum`` used to be ``synthesize_spectrum`` with an
+        empty linelist; this says the same thing and stays traceable.
         """
-        from korg.synthesis_plan import prepare_synthesis
         # No n_layers override: calling with stellar parameters goes through the
         # MARCS interpolation, which always yields 56 layers regardless of what
         # tiny_atm has.
-        _s = prepare_synthesis(np.asarray(tiny_wls) * 1e-8, [])
+        _s = prepare_synthesis(np.asarray(tiny_wls), [])
         flux, cntm = _s(5777.0, 4.44, 0.0)
         flux, cntm = np.asarray(flux), np.asarray(cntm)
         assert np.all(np.isfinite(flux)) and np.all(flux > 0)
@@ -809,8 +796,7 @@ def spherical_results(full_sun, julia_ref, A_X, fe_line):
                             ("shell_extended_cntm", ext, []),
                             ("shell_extended_line", ext, [fe_line]),
                             ("shell_thin_cntm", thin, [])):
-        r = _synth(model, ll, wls, A_X, hydrogen_lines=False)
-        out[name] = (np.asarray(r.flux), np.asarray(r.continuum))
+        out[name] = _synth(model, ll, wls, A_X, hydrogen_lines=False)
     out["extended"] = ext
     out["thin"] = thin
     return out
@@ -820,7 +806,10 @@ class TestSphericalSynthesisRuns:
     """Before this change a ``ShellAtmosphere`` could not be synthesised at all.
 
     ``synthesis.py`` read ``atmosphere.r``, which did not exist, so every
-    spherical synthesis died with ``AttributeError``.
+    spherical synthesis died with ``AttributeError``.  That module is gone; the
+    traced path builds the radii as ``R_photosphere + z`` inside the traced
+    region, and ``synthesize`` selects the spherical branch from the atmosphere
+    type it was handed.
     """
 
     def test_a_shell_atmosphere_synthesises(self, spherical_results):
@@ -854,29 +843,19 @@ class TestSphericalSynthesisRuns:
 
 
 class TestPhotosphereCorrectionIsApplied:
+    """Korg quotes the flux at the photospheric radius, not the outermost one.
 
-    def test_the_flux_is_the_ray_solver_result_times_the_correction(
-            self, spherical_results, julia_ref):
-        """Exact internal check, to 1e-14.
+    The exact internal check that used to stand here reproduced the transfer
+    call ``synthesize_spectrum`` made, from the ``alpha`` it returned, and
+    asserted the reported flux was that times ``(r[0]/R)²`` to 1e-12.  The
+    traced path returns no ``alpha``, so that reconstruction is not available.
 
-        Reproduce the transfer call ``synthesize_spectrum`` makes, without the
-        rescaling, and confirm the returned flux is exactly that times
-        ``(r[0]/R)²``.
-        """
-        from korg.radiative_transfer import radiative_transfer_spherical
-        S = julia_ref["synthesis"]
-        wls = np.array(julia_ref["wavelengths"])
-        ext = spherical_results["extended"]
-        flux, _ = spherical_results["shell_extended_cntm"]
-
-        r = _synth(ext, [], wls, np.array(julia_ref["A_X"]), hydrogen_lines=False)
-        source = np.array([blackbody(T, wls * 1e-8) for T in ext.T]).T
-        raw, _ = radiative_transfer_spherical(
-            np.asarray(r.alpha).T, source, ext.r, ext.log_tau_ref,
-            _alpha_ref_of(r, ext, wls), n_mu=20, tau_scheme="anchored",
-            intensity_scheme="linear_flux_only", R_photosphere=None)
-        np.testing.assert_allclose(
-            flux, np.asarray(raw) * 1e-8 * ext.photosphere_correction, rtol=1e-12)
+    What replaced it is stronger, not weaker: the correction is 1.69 for this
+    shell, so dropping it puts the flux 41% below Korg.jl's — which the test
+    below measures directly against the Julia fixture, and which
+    ``TestAgreementWithKorgJl.test_flux_matches_julia`` would also catch at
+    5e-3 for both shell cases.
+    """
 
     def test_dropping_the_correction_would_be_a_69_percent_error(
             self, spherical_results, julia_ref):
@@ -893,15 +872,20 @@ class TestPhotosphereCorrectionIsApplied:
         uncorrected = flux / ext.photosphere_correction
         assert np.min(np.abs(uncorrected / jl - 1.0)) > 0.3
 
+    def test_the_corrected_flux_is_the_one_reported(self, spherical_results,
+                                                    julia_ref):
+        """And the correction is applied once, not twice or not at all.
 
-def _alpha_ref_of(result, atm, wls_angstrom):
-    """Recover the alpha_ref that ``synthesize_spectrum`` used.
-
-    The synthesis grid straddles 5000 Å, so alpha_ref is just alpha at the
-    reference pixel (continuum only here, since the linelist is empty).
-    """
-    i = int(np.argmin(np.abs(wls_angstrom * 1e-8 - LAMBDA_REF_CM)))
-    return np.asarray(result.alpha)[:, i]
+        Julia's flux divided by ours is within 5e-3 of 1; divided by the
+        correction, or multiplied by it again, it would be 0.59 or 1.69.
+        """
+        ext = spherical_results["extended"]
+        flux, _ = spherical_results["shell_extended_cntm"]
+        jl = np.array(julia_ref["synthesis"]["shell_extended_cntm"]["flux"])
+        ratio = np.median(flux / jl)
+        assert ratio == pytest.approx(1.0, abs=5e-3)
+        assert abs(ratio / ext.photosphere_correction - 1.0) > 0.3
+        assert abs(ratio * ext.photosphere_correction - 1.0) > 0.3
 
 
 class TestAgreementWithKorgJl:
@@ -1022,21 +1006,32 @@ class TestAutodiff:
         g = jax.vmap(lambda t: jax.grad(lambda tt: jnp.sum(blackbody(tt, wl)))(t))(T)
         assert np.all(np.isfinite(np.asarray(g)))
 
-    def test_synthesize_spectrum_is_not_differentiable(self, tiny_atm, tiny_wls,
-                                                       A_X):
-        """Pinned, not skipped.
+    def test_synthesize_is_differentiable_end_to_end(self, tiny_atm, tiny_wls, A_X):
+        """The inverse of the test that stood here.
 
-        ``synthesize_spectrum`` drops to host NumPy in several places (SciPy
-        ``interp1d`` for the continuum, the bucketed Voigt loop, the H-line
-        loop), so a traced input hits ``np.asarray`` on a tracer.  Use
-        ``synthesize_jit`` for gradients.
+        It used to pin that ``synthesize_spectrum`` raised
+        ``TracerArrayConversionError`` under ``jax.grad`` — it dropped to host
+        NumPy in several places (SciPy ``interp1d``, the bucketed Voigt loop,
+        the H-line loop) — and directed the reader to ``synthesize_jit``.  That
+        function is gone and ``synthesize`` is the traced path, so the property
+        worth pinning is the opposite one.
+
+        Differentiated with respect to vmic, which only ``synthesize`` exposes.
+        The closure's gradients with respect to stellar parameters and all 92
+        abundances are covered in ``test_synthesizer_closure.py``.
         """
-        def f(v):
-            return _synth(tiny_atm, [], tiny_wls, A_X, vmic=v,
-                          hydrogen_lines=False).flux.sum()
+        from korg.abundances import A_X_to_absolute
 
-        with pytest.raises(jax.errors.TracerArrayConversionError):
-            jax.grad(f)(1.0)
+        plan = prepare_synthesis(np.asarray(tiny_wls), [],
+                                 geometry="plane-parallel",
+                                 n_layers=tiny_atm.n_layers, hydrogen_lines=False)
+        args = (jnp.asarray(tiny_atm.T), jnp.asarray(tiny_atm.n_total),
+                jnp.asarray(tiny_atm.ne), jnp.asarray(tiny_atm.z),
+                jnp.asarray(tiny_atm.log_tau_ref),
+                jnp.asarray(A_X_to_absolute(A_X)))
+        g = float(jax.grad(lambda v: jnp.sum(
+            plan.from_atmosphere(*args, vmic_cm_s=v)[0]))(1e5))
+        assert np.isfinite(g)
 
 
 class TestWhereMaskedCotangents:
@@ -1127,18 +1122,28 @@ class TestJit:
             np.testing.assert_allclose(np.asarray(out[i]),
                                        np.asarray(blackbody(t, wl)), rtol=0)
 
-    def test_synthesize_spectrum_cannot_be_jitted(self, tiny_atm, tiny_wls, A_X):
-        """Pinned, with the reason: the same host-NumPy drop-out as above.
+    def test_synthesis_jits(self, tiny_atm, tiny_wls, A_X):
+        """Also the inverse of what stood here.
 
-        It also branches on Python-level values (``len(linelist)``,
-        ``hydrogen_lines``), which a tracer cannot supply.
+        ``synthesize_spectrum`` could not be jitted — it branched on Python-level
+        values (``len(linelist)``, ``hydrogen_lines``) and dropped to host NumPy
+        — and this test pinned the ``TracerArrayConversionError``.  The traced
+        closure jits, and the flux is the eager one to the float32 Voigt floor
+        (~1e-8), not bitwise: XLA fuses the line kernel differently under jit.
         """
-        @jax.jit
-        def f(wls):
-            return _synth(tiny_atm, [], wls, A_X, hydrogen_lines=False).flux.sum()
+        from korg.abundances import A_X_to_absolute
 
-        with pytest.raises(jax.errors.TracerArrayConversionError):
-            f(jnp.asarray(tiny_wls))
+        plan = prepare_synthesis(np.asarray(tiny_wls), [],
+                                 geometry="plane-parallel",
+                                 n_layers=tiny_atm.n_layers, hydrogen_lines=False)
+        args = (jnp.asarray(tiny_atm.T), jnp.asarray(tiny_atm.n_total),
+                jnp.asarray(tiny_atm.ne), jnp.asarray(tiny_atm.z),
+                jnp.asarray(tiny_atm.log_tau_ref))
+        ab = jnp.asarray(A_X_to_absolute(A_X))
+        eager = np.asarray(plan.from_atmosphere(*args, ab)[0])
+        jitted = np.asarray(jax.jit(lambda a: plan.from_atmosphere(*args, a)[0])(ab))
+        assert np.all(np.isfinite(jitted))
+        np.testing.assert_allclose(jitted, eager, rtol=1e-7)
 
     def test_filter_linelist_cannot_be_jitted(self):
         """It slices a Python list by a data-dependent bisect index."""

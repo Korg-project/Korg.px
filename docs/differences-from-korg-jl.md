@@ -51,35 +51,35 @@ by construction.
 
 ## Interface
 
-### There is no `synth`
+### `synth` is not Korg.jl's `synth`
 
-Korg.jl's one-stop `synth(; Teff, logg, wavelengths, M_H, ...)` has no Python equivalent. The
+`korg.synth(atmosphere, linelist, wavelengths_angstrom, A_X)` returns
+`(wavelengths, flux, continuum)` — `synthesize` plus the grid. Korg.jl's one-stop
+`synth(; Teff, logg, wavelengths, M_H, ...)`, which takes stellar parameters rather than an
+atmosphere, has no Python equivalent. The
 closest thing is `prepare_synthesis(...)` followed by calling the result, which takes `Teff`,
 `logg`, `m_H`, `alpha_m` and `C_m` as positional arguments. Post-processing that `synth` folds in
 (`R`, `vsini`) has to be applied separately with `korg.utils.apply_LSF` and
 `korg.utils.apply_rotation`.
 
-### Two functions named `synthesize`
+### One function named `synthesize`
 
-There are two, and the one exported at the top level is not the one you want:
+There used to be two. `korg.synthesize` was a wrapper around
+`korg.synthesis.synthesize_spectrum`, the Python-orchestrated NumPy path: it took **absolute
+number fractions** as its fourth argument, returned a `SynthesisResult`, and could not be jitted,
+`vmap`ped or differentiated. `korg.synthesis_plan.synthesize` took `A(X)` and returned a tuple.
+Two functions of the same name with different abundance conventions and different return types is
+a trap, and the NumPy one had no remaining advantage: measured against the Korg.jl fixtures in
+`tests/synthesis_reference_data.json`, the traced path agrees to 3.2e-3 relative and the deleted
+one agreed to 3.0e-3.
 
-| | `korg.synthesize` | `korg.synthesis_plan.synthesize` |
-|---|---|---|
-| defined in | `korg/synthesis.py` | `korg/synthesis_plan.py` |
-| signature | `(atmosphere, linelist, wavelengths_angstrom, abundances, ...)` | `(atmosphere, linelist, wavelengths_angstrom, A_X, ...)` |
-| fourth argument | **absolute number fractions** `n_X/n_total` | **`A(X)`**, as in Korg.jl |
-| returns | `SynthesisResult` | `(flux, continuum)` tuple |
-| traceable | no | yes |
-| status | wraps the deprecated `synthesize_spectrum` and raises `DeprecationWarning` | current |
+`synthesize_spectrum` has therefore been deleted. `korg.synthesize`,
+`korg.synthesis.synthesize` and `korg.synthesis_plan.synthesize` are now all the same function:
+`(atmosphere, linelist, wavelengths_angstrom, A_X, ...)` returning `(flux, continuum)`. `A(X)` is
+required — absolute number fractions are rejected with an error rather than sniffed for.
 
-`korg.synthesize` delegates to `korg.synthesis.synthesize_spectrum`, which is deprecated: it
-orchestrates jitted kernels from Python and drops to host NumPy in places, so it cannot be placed
-on a GPU as one kernel, `vmap`ped, or differentiated. It is retained because it still covers
-options the traced path does not, and because it is the implementation that the Korg.jl reference
-fixtures validate.
-
-Note the argument-order difference from Korg.jl as well: Korg.jl is
-`synthesize(atm, linelist, A_X, wavelengths)`; both Python versions put wavelengths before
+Note the argument-order difference from Korg.jl: Korg.jl is
+`synthesize(atm, linelist, A_X, wavelengths)`; the Python version puts wavelengths before
 abundances.
 
 ### Most public functions are not exported at the top level
@@ -106,7 +106,7 @@ Korg.jl v1.2.1 takes wavelengths as `(start, stop)`, `(start, stop, step)`, or a
 tuples, everywhere, and turns them into a `Korg.Wavelengths`. Korg.px is inconsistent:
 
 - `synthesis_plan.synthesize` takes a 1-D array in **Å**.
-- `synthesis_plan.prepare_synthesis` takes a 1-D array in **cm**.
+- `synthesis_plan.prepare_synthesis` takes a 1-D array in **Å**, as `synthesize` and `synth` do.
 - `korg.utils.apply_LSF`, `apply_rotation` and `compute_LSF_matrix` accept anything
   `korg.wavelengths.Wavelengths` accepts, including Korg.jl's tuples.
 - `korg.synthesis.filter_linelist` takes cm, with the buffer in cm.
@@ -127,8 +127,10 @@ Korg.jl's `synthesize` returns a `SynthesisResult` carrying `flux`, `cntm`, `int
 traced path returns a bare `(flux, continuum)` tuple. The absorption coefficient, the per-species
 number densities, the electron number density and the μ grid are computed but not exposed.
 
-`korg.synthesis.SynthesisResult` (from the deprecated path) does carry `alpha`, `alpha_cntm`,
-`number_densities` and `electron_number_density`, and has a `cntm` property aliasing `continuum`.
+`korg.synthesis.SynthesisResult` still exists and does carry `alpha`, `alpha_cntm`,
+`number_densities` and `electron_number_density`, with a `cntm` property aliasing `continuum`, but
+nothing constructs one any more: the path that did was `synthesize_spectrum`, which has been
+deleted.
 
 `korg.fit_spectrum` returns a `dict`, not a struct.
 
@@ -162,17 +164,17 @@ Korg.jl's `synthesize` keyword arguments and their status in Korg.px's traced pa
 | `vmic` | `vmic` (km/s) on `synthesize`, `vmic_cm_s` on the closure; scalar only |
 | `line_buffer` | `line_buffer` (Å) on `synthesize`, `line_buffer_cm` (cm) on `prepare_synthesis`; same 10 Å default. `None` disables it |
 | `cntm_step` | `cntm_step_cm` on `prepare_synthesis` (cm, default 1e-8 = 1 Å) |
-| `hydrogen_lines` | **not implemented** — hydrogen lines are always on |
+| `hydrogen_lines` | `hydrogen_lines` on `synthesize` and `prepare_synthesis`. It is a plan-time choice, because which transitions are in range decides array shapes |
 | `use_MHD_for_hydrogen_lines` | **not implemented** — MHD occupation probabilities are always used. Korg.jl defaults this to *off* above 13 000 Å, so infrared syntheses will differ |
 | `hydrogen_line_window_size` | **not implemented** — fixed at 150 Å |
 | `mu_values` | `n_mu` on `prepare_synthesis` (integer only; an explicit μ vector is not accepted) |
 | `line_cutoff_threshold` | **not implemented** — fixed at 3e-4 |
 | `electron_number_density_warn_threshold` / `_min_value` | **not implemented** |
 | `return_cntm` | `return_cntm` on `synthesize`; the closure always returns both |
-| `use_internal_reference_linelist` | applied unconditionally when the deprecated path builds its reference linelist; not part of the traced path |
+| `use_internal_reference_linelist` | **not implemented** — the traced path anchors the optical-depth scale on continuum + synthesis lines at 5000 Å and never builds a separate reference linelist |
 | `I_scheme`, `tau_scheme` | **not implemented** — `linear_flux_only` and `anchored`, as in Korg.jl's defaults |
-| `ionization_energies`, `partition_funcs`, `log_equilibrium_constants` | **not implemented** on the traced path; the deprecated `synthesize_spectrum` accepts them |
-| `molecular_cross_sections` | **not implemented** on the traced path. `korg.MolecularCrossSection` exists and works with the deprecated path |
+| `ionization_energies`, `partition_funcs`, `log_equilibrium_constants` | **not implemented**. `synthesize_spectrum` accepted them and has been deleted; `precompute_chemical_equilibrium_data` still builds the tables from custom inputs |
+| `molecular_cross_sections` | **not implemented**. `korg.MolecularCrossSection` exists but nothing consumes one now that `synthesize_spectrum` is gone |
 | `use_chemical_equilibrium_from` | **not implemented** |
 
 The traced path also adds `geometry`, `window_safety`, `reference`, `n_layers` and `data`, which

@@ -3,6 +3,7 @@ Atomic data: symbols, masses, and solar abundances.
 """
 
 import jax.numpy as jnp
+import numpy as np
 from .constants import amu_cgs
 
 # Atomic symbols for elements H through U
@@ -25,7 +26,13 @@ MAX_ATOMIC_NUMBER = len(atomic_symbols)
 atomic_numbers = {symbol: i+1 for i, symbol in enumerate(atomic_symbols)}
 
 # Atomic masses in grams (already multiplied by amu_cgs in Julia)
-atomic_masses = jnp.array([
+#
+# NumPy, not JAX. This is a constants table indexed by concrete integers
+# everywhere it is used (`atomic_masses[0]`, `atomic_masses[Z - 1]`); nothing
+# indexes it with a tracer. As a `jnp.array` each of those lookups was an eager
+# XLA gather, and `Formula.get_mass` alone drove 94 of them during import.
+# Traced callers that need a device array should `jnp.asarray` at the use site.
+atomic_masses = np.array([
     1.008, 4.003, 6.941, 9.012, 10.81, 12.01, 14.01, 16.00, 19.00, 20.18,
     22.99, 24.31, 26.98, 28.08, 30.97, 32.06, 35.45, 39.95, 39.10, 40.08,
     44.96, 47.90, 50.94, 52.00, 54.94, 55.85, 58.93, 58.71, 63.55, 65.37,

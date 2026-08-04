@@ -5,34 +5,55 @@ Port of Korg.jl Fit/fit_via_synthesis.jl.
 
 Performance note
 ----------------
-Each synthesis call currently takes ~120 s in Python (chemical equilibrium
-dominates).  A BFGS fit with ~100 function evaluations will take hours.
-Julia's native-compiled code does the same synthesis in ~0.1 s, so consider
-using the Julia package directly for large-scale fitting.  This module is
-provided for correctness testing, single-star analyses, and as a foundation
-for future optimisation.
+A synthesis is no longer the ~120 s this note used to quote.  Measured on a
+5 A window with 174 lines: 3.3 s per objective evaluation through the numerical
+path on GPU and 2.5 s on CPU (the first call is far slower -- it loads the
+648 MB MARCS grid), against 0.35 s through a compiled traced synthesis on GPU.
+A BFGS fit over three stellar parameters is therefore a few minutes rather than
+hours for a window of that size, though the cost still scales with the linelist
+and the wavelength range.  Julia's native-compiled code does the same synthesis
+in ~0.1 s, so the Julia package remains the better tool for survey-scale
+fitting.
 
 Gradients
 ---------
-Korg.jl differentiates its fitting objective with ForwardDiff.  Here the
-picture is split:
+Korg.jl differentiates its fitting objective with ForwardDiff.  Here there are
+three paths, in decreasing order of preference:
 
-* ``vsini``, ``epsilon``, ``cntm_offset`` and ``cntm_slope``
-  (:data:`_POSTPROCESSING_PARAMS`) act *only* through
-  :func:`_postprocess_flux`, which is pure JAX -- ``apply_rotation`` and the
-  LSF matrix were rewritten in JAX earlier in this project.  When every free
-  parameter is one of these, :func:`fit_spectrum` synthesises once and hands
-  BFGS exact ``jax.grad`` derivatives, instead of re-synthesising the spectrum
-  once per parameter per gradient.
-* ``Teff``, ``logg``, ``M_H``, ``vmic`` and per-element abundances act through
-  ``interpolate_marcs`` and ``synthesize``.  ``synthesize`` dispatches to
-  ``synthesize_spectrum``, which orchestrates jitted kernels from Python and
-  drops to host NumPy, and ``interpolate_marcs`` calls ``float()`` on its
-  arguments; both raise under a JAX trace.  Those parameters therefore still
-  use numerical differentiation (BFGS's own finite differences in
-  :func:`fit_spectrum`, an explicit finite-difference Jacobian in
-  :func:`ews_to_stellar_parameters`), and will until ``synthesize_jit``
-  replaces ``synthesize_spectrum``.
+* **Traced synthesis** (:func:`_make_traced_chi2`), opt-in via
+  ``fit_spectrum(..., exact_gradients=True)``.
+  :func:`korg.synthesis_plan.prepare_synthesis` returns a closure that runs the
+  MARCS interpolation, the chemical equilibrium, the opacities and the transfer
+  as one traced JAX program, so ``Teff``, ``logg``, ``M_H``, ``alpha_H``,
+  ``vmic`` and the per-element abundances are differentiable too.  When every
+  free parameter is one JAX can see, :func:`fit_spectrum` builds one plan for
+  the whole fit and hands BFGS exact ``jax.value_and_grad`` derivatives.  A
+  reverse-mode gradient costs about what one synthesis costs, whatever the
+  number of parameters, where a forward difference costs one synthesis *per
+  parameter* on top of the value.  It is not yet the default; see
+  ``fit_spectrum``'s ``exact_gradients`` documentation for the measurement.
+* **Post-processing only** (:func:`_make_autodiff_chi2`).  ``vsini``,
+  ``epsilon``, ``cntm_offset`` and ``cntm_slope``
+  (:data:`_POSTPROCESSING_PARAMS`) act only through
+  :func:`_postprocess_flux`.  If those are the only free parameters the raw
+  synthesis is a *constant* of the fit, so it is computed once — cheaper still
+  than the traced path, which resynthesises at every step.
+* **Numerical** (:func:`_chi2`).  The fallback: BFGS's own forward differences
+  over :func:`_synthetic_spectrum`.  It is what runs when a ``postprocess``
+  callback is supplied (it mutates a NumPy buffer in place), when
+  ``synthesis_kwargs`` carry options the plan does not accept, or when building
+  the plan fails.  :func:`ews_to_stellar_parameters` is still wholly numerical:
+  its residuals come from ``ews_to_abundances``, a per-line bisection, not from
+  a single traced spectrum.
+
+One behavioural difference between the traced and numerical paths is worth
+knowing.  ``interpolate_marcs`` raises ``AtmosphereInterpolationError`` outside
+the MARCS grid, which the numerical objective turns into a large chi-squared
+and the optimiser walks away from.  The traced kernel has no such check: it
+clamps its bracket indices and *linearly extrapolates* instead.  A fit that
+strays outside the grid therefore gets a smooth, plausible-looking, wrong
+answer rather than a rejection, so :func:`fit_spectrum` checks the best-fit
+point against the grid and warns.
 """
 
 import warnings
@@ -45,7 +66,12 @@ from scipy.optimize import minimize
 
 from .abundances import format_A_X
 from .atomic_data import atomic_symbols
-from .synthesis import synthesize
+# From ``synthesis_plan``, not ``synthesis``.  ``synthesis`` re-exports the name,
+# so the old import resolved to whichever ``synthesize`` happened to be there --
+# at one point a legacy host-orchestrated one whose spectra differed from the
+# plan's by ~1e-3, which made the numerical and traced fitting paths disagree
+# for a reason that had nothing to do with either.
+from .synthesis_plan import synthesize
 from .marcs_interpolation import interpolate_marcs
 from .utils import apply_rotation, compute_LSF_matrix
 from .wavelengths import Wavelengths
@@ -251,18 +277,29 @@ def _raw_synthesis(synthesis_wls, linelist, params, synthesis_kwargs):
     else:
         wl_angstrom = np.asarray(synthesis_wls)
 
-    # synthesize signature: (atmosphere, linelist, wavelengths_angstrom, abundances, ...)
-    # Strip keys that _synthetic_spectrum controls so callers can safely pass them.
+    # ``synthesize`` is ``synthesis_plan.synthesize``: it takes
+    # (atmosphere, linelist, wavelengths_angstrom, A_X, ...) and returns a plain
+    # ``(flux, continuum)`` pair.  It has no ``verbose`` keyword -- anything it
+    # does not recognise is forwarded to ``prepare_synthesis``, so passing one
+    # raised ``TypeError`` and made every real (unmocked) call to this function
+    # fail.  ``line_buffer=0`` because the synthesis grid already carries
+    # ``wl_buffer`` around each window, as in Korg.jl's ``fit_spectrum``.
     _synth_kw = {k: v for k, v in synthesis_kwargs.items()
                  if k not in ("verbose", "line_buffer")}
-    sol = synthesize(atm, linelist, wl_angstrom, A_X,
-                     vmic=params.get("vmic", 1.0),
-                     line_buffer=0,
-                     verbose=False,
-                     **_synth_kw)
+    result = synthesize(atm, linelist, wl_angstrom, A_X,
+                        vmic=params.get("vmic", 1.0),
+                        line_buffer=0,
+                        **_synth_kw)
 
-    return (np.asarray(sol.flux), np.asarray(sol.continuum),
-            np.asarray(sol.wavelengths))
+    # A tuple from ``synthesis_plan.synthesize``; an object with ``.flux`` from
+    # the fakes the tests install and from any older result type.
+    if isinstance(result, tuple):
+        flux, cntm = result
+        wls = wl_angstrom
+    else:
+        flux, cntm, wls = result.flux, result.continuum, result.wavelengths
+
+    return np.asarray(flux), np.asarray(cntm), np.asarray(wls)
 
 
 def _synthetic_spectrum(synthesis_wls, linelist, LSF_matrix, params, synthesis_kwargs):
@@ -403,14 +440,15 @@ def _make_autodiff_chi2(raw, LSF_matrix, params_to_fit, fixed_params, obs_wls,
     return chi2
 
 
-def _make_autodiff_objective(raw, LSF_matrix, params_to_fit, fixed_params, obs_wls,
-                             obs_flux, obs_err, windows, adjust_continuum, trace,
-                             start_time, time_limit):
-    """Wrap :func:`_make_autodiff_chi2` for scipy's ``minimize(..., jac=True)``."""
+def _objective_from_chi2(chi2, params_to_fit, trace, start_time, time_limit):
+    """Wrap a pure-JAX ``chi2(scaled_p)`` for scipy's ``minimize(..., jac=True)``.
+
+    Shared by both exact-gradient paths.  ``jax.value_and_grad`` is reverse
+    mode, so the gradient costs roughly one extra evaluation *in total* rather
+    than one per parameter.
+    """
     from datetime import datetime
 
-    chi2 = _make_autodiff_chi2(raw, LSF_matrix, params_to_fit, fixed_params, obs_wls,
-                               obs_flux, obs_err, windows, adjust_continuum)
     value_and_grad = jax.value_and_grad(chi2)
 
     def objective(scaled_p):
@@ -425,6 +463,243 @@ def _make_autodiff_objective(raw, LSF_matrix, params_to_fit, fixed_params, obs_w
         return total, np.asarray(grad, dtype=float)
 
     return objective
+
+
+def _make_autodiff_objective(raw, LSF_matrix, params_to_fit, fixed_params, obs_wls,
+                             obs_flux, obs_err, windows, adjust_continuum, trace,
+                             start_time, time_limit):
+    """Wrap :func:`_make_autodiff_chi2` for scipy's ``minimize(..., jac=True)``."""
+    chi2 = _make_autodiff_chi2(raw, LSF_matrix, params_to_fit, fixed_params, obs_wls,
+                               obs_flux, obs_err, windows, adjust_continuum)
+    return _objective_from_chi2(chi2, params_to_fit, trace, start_time, time_limit)
+
+
+# ---------------------------------------------------------------------------
+# Exact gradients through the synthesis itself (the traced closure)
+# ---------------------------------------------------------------------------
+
+#: Every parameter this module fits, all of which the traced closure can see.
+#: The set is written out rather than derived from ``_ALLOWED_PARAMS`` so that a
+#: parameter added later has to be classified deliberately.
+_TRACEABLE_PARAMS = frozenset(
+    {"Teff", "logg", "M_H", "alpha_H", "vmic"} | _POSTPROCESSING_PARAMS
+    | set(atomic_symbols)
+)
+
+def _plan_kwarg_names():
+    """``synthesis_kwargs`` the traced path can honour, read from the signature.
+
+    They are forwarded to ``prepare_synthesis``, not to ``synthesize``; anything
+    else means the caller wants something the plan does not model, and the
+    numerical path runs instead.  Read from the signature rather than listed,
+    because the plan keeps growing options (``hydrogen_lines`` arrived after
+    this path was written) and a stale list would silently push a fit onto the
+    numerical path the first time someone passed a new one.
+    """
+    import inspect
+    from .synthesis_plan import prepare_synthesis
+
+    return frozenset(
+        name for name, p in inspect.signature(prepare_synthesis).parameters.items()
+        if p.kind is inspect.Parameter.KEYWORD_ONLY)
+
+
+def _traced_A_X(params, element_names):
+    """A(X) as a JAX vector, mirroring :func:`korg.abundances.format_A_X`.
+
+    ``format_A_X`` builds the vector with a Python loop over ``Z`` and indexes a
+    dict, so it cannot consume a tracer.  This is the same three rules —
+    hydrogen is 12 by definition, alpha elements get ``[alpha/H]``, other metals
+    get ``[M/H]``, explicit elements override both — written as masked
+    arithmetic on constants that are fixed before the fit starts.
+
+    ``element_names`` is the (static) list of element symbols that appear in the
+    parameter dict; its values may be traced.
+    """
+    from .abundances import DEFAULT_SOLAR_ABUNDANCES, DEFAULT_ALPHA_ELEMENTS
+    from .atomic_data import MAX_ATOMIC_NUMBER, atomic_numbers
+
+    Z = np.arange(1, MAX_ATOMIC_NUMBER + 1)
+    solar = jnp.asarray(DEFAULT_SOLAR_ABUNDANCES, dtype=float)
+    metal_mask = jnp.asarray((Z >= 3).astype(float))
+    alpha_mask = jnp.asarray(np.isin(Z, DEFAULT_ALPHA_ELEMENTS).astype(float))
+
+    M_H = params["M_H"]
+    alpha_H = params.get("alpha_H", M_H)
+
+    A_X = solar + metal_mask * M_H + alpha_mask * (alpha_H - M_H)
+    A_X = A_X.at[0].set(12.0)      # A(H) = 12 by definition, as in format_A_X
+    for el in element_names:
+        i = atomic_numbers[el] - 1
+        A_X = A_X.at[i].set(solar[i] + params[el])
+    return A_X
+
+
+def _marcs_grid_params_traced(A_X):
+    """``(M_H, alpha_M, C_M)`` for the MARCS grid, from a traced ``A(X)``.
+
+    ``interpolate_marcs`` given an ``A_X`` vector derives the three grid axes
+    from it with :func:`korg.abundances.get_metals_H` / ``get_alpha_H`` against
+    the **Grevesse 2007** solar scale, which is not the scale ``format_A_X``
+    used to build the vector.  The difference is a fixed offset of order 0.05
+    dex, so reproducing the convention here rather than passing ``[M/H]``
+    straight through is what keeps the traced path on the same atmosphere as the
+    numerical one; getting it wrong would show up as a systematic shift in
+    fitted parameters between the two.
+    """
+    from .abundances import GREVESSE_2007_SOLAR_ABUNDANCES, DEFAULT_ALPHA_ELEMENTS
+    from .atomic_data import MAX_ATOMIC_NUMBER
+
+    Z = np.arange(1, MAX_ATOMIC_NUMBER + 1)
+    solar = np.asarray(GREVESSE_2007_SOLAR_ABUNDANCES, dtype=float)
+    alpha = np.asarray(DEFAULT_ALPHA_ELEMENTS)
+    alpha_and_C = np.append(alpha, 6)
+
+    metals = ((Z >= 3) & ~np.isin(Z, alpha_and_C)).astype(float)
+    alphas = np.isin(Z, alpha).astype(float)
+
+    def multi_X_H(mask):
+        # Korg's _get_multi_X_H: log10 sum of 10**A(X) over a set of elements,
+        # minus the same sum over the solar scale.  The 12s cancel.
+        #
+        # ``mask`` stays NumPy: under an enclosing ``jit`` a ``jnp`` constant is
+        # staged out as a tracer, and the solar half of this expression is a
+        # host constant that must not become one.
+        num = jnp.log10(jnp.sum(jnp.asarray(mask) * 10.0 ** A_X))
+        den = float(np.log10(np.sum(mask * 10.0 ** solar)))
+        return num - den
+
+    M_H = multi_X_H(metals)
+    alpha_H = multi_X_H(alphas)
+    C_H = A_X[5] - float(solar[5])
+    return M_H, alpha_H - M_H, C_H - M_H
+
+
+def _plan_for_fit(synthesis_wls, linelist, synthesis_kwargs):
+    """Build the :class:`~korg.synthesis_plan.Synthesizer` a traced fit needs.
+
+    ``line_buffer_cm=0`` matches :func:`_raw_synthesis` and Korg.jl's
+    ``fit_spectrum``: the synthesis grid already carries ``wl_buffer`` around
+    every window, so a second buffer would only widen the linelist.
+    """
+    from .synthesis_plan import prepare_synthesis
+
+    # prepare_synthesis takes Angstroms, as synthesize and synth do. A
+    # `Wavelengths` object stores `all_wls` in cm, so that branch converts up.
+    if hasattr(synthesis_wls, "all_wls"):
+        wl_a = np.asarray(synthesis_wls.all_wls, dtype=float) * 1e8
+    else:
+        wl_a = np.asarray(synthesis_wls, dtype=float)
+
+    # A preprocessed ``LinelistData`` passes through untouched; anything else is
+    # materialised, since ``prepare_synthesis`` indexes it.  ``line_buffer_cm``
+    # is a default rather than a fixed argument so a caller can still widen it.
+    lines = linelist if hasattr(linelist, "wl") else list(linelist)
+    return prepare_synthesis(wl_a, lines,
+                             **{"line_buffer_cm": 0.0, **synthesis_kwargs})
+
+
+def _make_traced_model(synth, LSF_matrix, params_to_fit, fixed_params):
+    """Build ``model(scaled_p) -> flux`` with the synthesis inside the JAX graph.
+
+    Unlike :func:`_make_autodiff_chi2`'s model, the raw spectrum is recomputed at
+    every step — it depends on the parameters — but it is recomputed by one
+    compiled XLA program, and one reverse-mode sweep through that program yields
+    the derivative with respect to every free parameter at once.
+
+    Only the synthesis is wrapped in :func:`jax.jit`.  The post-processing stage
+    is deliberately left eager because ``apply_rotation`` sizes its convolution
+    window from a *concrete* ``vsini``: under ``jax.grad`` alone the primal is
+    concrete and that works, but a ``jit`` spanning it would make ``vsini`` a
+    dynamic tracer and abort.  ``jit`` composes with autodiff either way, so the
+    synthesis is still compiled when its gradient is taken.
+    """
+    from .synthesis_plan import _A_X_to_absolute_traced
+
+    wls_ang = np.asarray(synth.wavelengths_cm, dtype=float) * 1e8
+    LSF_matrix = jnp.asarray(LSF_matrix)
+
+    all_names = set(params_to_fit) | set(fixed_params)
+    element_names = [el for el in atomic_symbols if el in all_names]
+
+    @jax.jit
+    def _synthesize(stellar, abundances):
+        return synth(stellar[0], stellar[1], stellar[2], stellar[3], stellar[4],
+                     abundances=abundances, vmic_cm_s=stellar[5])
+
+    def model(scaled_p):
+        params = dict(fixed_params)
+        for name, value in zip(params_to_fit, scaled_p):
+            params[name] = _unscale_param_jax(name, value)
+
+        A_X = _traced_A_X(params, element_names)
+        m_H, alpha_m, C_m = _marcs_grid_params_traced(A_X)
+        stellar = jnp.stack([
+            jnp.asarray(params["Teff"], dtype=float),
+            jnp.asarray(params["logg"], dtype=float),
+            m_H, alpha_m, C_m,
+            jnp.asarray(params.get("vmic", 1.0), dtype=float) * 1e5,
+        ])
+        raw_flux, raw_cntm = _synthesize(stellar, _A_X_to_absolute_traced(A_X))
+
+        return _postprocess_flux(
+            raw_flux, raw_cntm, wls_ang, LSF_matrix,
+            params.get("cntm_offset", 0.0), params.get("cntm_slope", 0.0),
+            params.get("vsini", 0.0), params.get("epsilon", 0.6),
+        )
+
+    return model
+
+
+def _make_traced_chi2(model, obs_wls, obs_flux, obs_err, windows, adjust_continuum):
+    """``chi2(scaled_p)`` around a :func:`_make_traced_model` model.
+
+    The model is passed in rather than built here so that a caller which also
+    needs the best-fit spectrum reuses the *same* jitted synthesis: a second
+    ``jax.jit`` over the same closure is a second compilation, and the synthesis
+    program takes a minute or two to compile.
+    """
+    obs_flux = jnp.asarray(obs_flux)
+    obs_err = jnp.asarray(obs_err)
+
+    def chi2(scaled_p):
+        # Weak Gaussian prior in scaled space to regularise (matches Julia)
+        neg_log_prior = jnp.sum(scaled_p ** 2 / 100.0 ** 2)
+        flux = model(scaled_p)
+        if adjust_continuum:
+            flux = _linear_continuum_adjustment_jax(obs_wls, windows, flux,
+                                                    obs_flux, obs_err)
+        return jnp.sum(((flux - obs_flux) / obs_err) ** 2) + neg_log_prior
+
+    return chi2
+
+
+def _warn_outside_marcs_grid(params):
+    """Warn if ``params`` sits outside the MARCS grid the traced kernel extrapolates.
+
+    ``interpolate_marcs`` raises there; ``_interpolate_marcs_jit`` clamps its
+    bracket indices and extrapolates linearly, silently.  The traced objective
+    therefore has no barrier at the grid edge, and the tan-scaled bounds do not
+    supply one either -- ``[M/H]`` is scaled into [-5, 1] while the grid stops
+    at -2.5.
+    """
+    try:
+        from .marcs_interpolation import load_marcs_grid
+        nodes, _ = load_marcs_grid()
+        A_X = np.asarray(_traced_A_X({k: float(v) for k, v in params.items()},
+                                     [el for el in atomic_symbols if el in params]))
+        m_H, alpha_m, C_m = (float(x) for x in _marcs_grid_params_traced(jnp.asarray(A_X)))
+        values = [float(params["Teff"]), float(params["logg"]), m_H, alpha_m, C_m]
+    except Exception:
+        return
+    names = ["Teff", "log(g)", "[M/H]", "[alpha/M]", "[C/metals]"]
+    for value, name, node in zip(values, names, nodes):
+        lo, hi = float(node[0]), float(node[-1])
+        if not (lo <= value <= hi):
+            warnings.warn(
+                f"{name} = {value:g} is outside the MARCS grid [{lo:g}, {hi:g}]. "
+                "The traced synthesis extrapolates rather than raising, so this "
+                "fit is not constrained by a model atmosphere.")
 
 
 # ---------------------------------------------------------------------------
@@ -571,18 +846,17 @@ def _setup_wavelengths_and_LSF(obs_wls, synthesis_wls_arg, LSF_matrix_arg, R, wi
 def fit_spectrum(obs_wls, obs_flux, obs_err, linelist, initial_guesses, fixed_params=None,
                  *, windows=None, R=None, LSF_matrix=None, synthesis_wls=None,
                  wl_buffer=1.0, precision=1e-4, postprocess=None, time_limit=10_000,
-                 adjust_continuum=False, **synthesis_kwargs):
+                 adjust_continuum=False, exact_gradients=None, **synthesis_kwargs):
     """
     Find the stellar parameters and abundances that best fit an observed spectrum.
 
     Uses BFGS optimisation with a tan-based parameter scaling so that bounded
     parameters can be optimised without constraints.
 
-    If every free parameter is a post-processing parameter (``vsini``,
-    ``epsilon``, ``cntm_offset``, ``cntm_slope``) and no ``postprocess``
-    callback is supplied, the spectrum is synthesised once and BFGS is driven
-    with exact ``jax.grad`` gradients; otherwise BFGS's numerical gradient is
-    used.  See the module docstring for why the split exists.
+    BFGS is driven with exact gradients wherever they are available, which is
+    now the case for ``Teff``, ``logg``, ``M_H``, ``alpha_H``, ``vmic`` and the
+    per-element abundances as well as for the post-processing parameters -- see
+    the module docstring, and ``exact_gradients`` below.
 
     Parameters
     ----------
@@ -622,8 +896,54 @@ def fit_spectrum(obs_wls, obs_flux, obs_err, linelist, initial_guesses, fixed_pa
     adjust_continuum : bool, optional
         If True, apply a linear continuum correction within each window at
         every optimiser step.  Default False.
+    exact_gradients : bool or None, optional
+        Whether to differentiate the *synthesis* as well as the post-processing.
+
+        ``None`` (the default) leaves the historical behaviour alone: a fit over
+        post-processing parameters alone gets exact gradients, and a fit that
+        touches the stellar parameters gets BFGS's forward differences.
+
+        ``True`` puts the synthesis inside the differentiated graph, so BFGS
+        gets exact derivatives with respect to ``Teff``, ``logg``, ``M_H``,
+        ``alpha_H``, ``vmic`` and the abundances.  It raises rather than falling
+        back if the fit rules that out (a ``postprocess`` callback, or
+        ``synthesis_kwargs`` the synthesis plan cannot take).
+
+        ``False`` forces the numerical path throughout, which is what to use to
+        compare the two.
+
+        It is opt-in rather than the default because the answer depends on the
+        backend.  Measured on one machine, fitting ``Teff``, ``logg`` and
+        ``M_H`` from a noiseless spectrum over a 5 A window (501 pixels, 174
+        lines), starting 200 K, 0.25 dex and 0.3 dex away:
+
+        ===========================  =====  ======  =========  =========
+        path                         evals  iters   GPU total  CPU total
+        ===========================  =====  ======  =========  =========
+        numerical + forward diffs       88      16      297 s     1438 s
+        traced + forward diffs          88      14       27 s      671 s
+        traced + exact gradients        21      13      148 s      630 s
+        ===========================  =====  ======  =========  =========
+
+        All three land on the same answer -- within 0.001 K in ``Teff`` and 1e-6
+        dex in ``M_H`` -- so this is purely about cost.  On the GPU the exact
+        path halves the wall clock against the status quo *including* the ~130 s
+        it spends compiling the backward pass; on CPU that compile is 356 s and
+        one traced evaluation costs 7.3 s against 2.5 s for a numerical one, so
+        it loses.  (The CPU column was measured under load and is not comparable
+        row-to-row in absolute terms; the evaluation counts are exact.)
+
+        The evaluation count is the durable part: 21 against 88, because a
+        forward difference costs one synthesis *per parameter* on top of the
+        value while a reverse-mode gradient costs about 1.1 in total.  That
+        ratio grows with every parameter added, so the more you fit -- and
+        abundances are parameters too -- the better this gets.
     **synthesis_kwargs
-        Additional keyword arguments forwarded to synthesize().
+        Additional keyword arguments forwarded to synthesize().  On the exact
+        path they are forwarded to
+        :func:`~korg.synthesis_plan.prepare_synthesis` instead, so only plan
+        options (``geometry``, ``window_safety``, ``n_mu``, ...) are accepted
+        there; anything else falls back to the numerical path.
 
     Returns
     -------
@@ -711,15 +1031,35 @@ def fit_spectrum(obs_wls, obs_flux, obs_err, linelist, initial_guesses, fixed_pa
     # derivatives instead of a numerical gradient costing one extra
     # synthesis per free parameter per iteration.
     # ------------------------------------------------------------------
-    use_autodiff = (
-        set(params_to_fit) <= _POSTPROCESSING_PARAMS
-        and postprocess is None      # postprocess mutates a NumPy buffer in place
-    )
-    objective, jac = _chi2, None
+    # postprocess mutates a NumPy buffer in place, which no JAX path can do.
+    exact_possible = postprocess is None and exact_gradients is not False
+    use_autodiff = exact_possible and set(params_to_fit) <= _POSTPROCESSING_PARAMS
+    # ...and, failing that, the traced synthesis: exact in the stellar
+    # parameters too, at the cost of resynthesising (once, not once per
+    # parameter) at every step.  Opt-in for now -- see the ``exact_gradients``
+    # documentation for the measurement behind that choice.
+    plan_kwargs = _plan_kwarg_names()
+    params_ok = set(params_to_fit) <= _TRACEABLE_PARAMS
+    kwargs_ok = set(synthesis_kwargs) <= plan_kwargs
+    use_traced = (exact_gradients is True and postprocess is None
+                  and not use_autodiff and params_ok and kwargs_ok)
+    if exact_gradients and not (use_autodiff or use_traced):
+        raise ValueError(
+            "exact_gradients=True, but this fit cannot use them: "
+            + ("a postprocess callback mutates a NumPy buffer in place. "
+               if postprocess is not None else "")
+            + (f"parameters {sorted(set(params_to_fit) - _TRACEABLE_PARAMS)} are "
+               "not traceable. " if not params_ok else "")
+            + (f"synthesis_kwargs {sorted(set(synthesis_kwargs) - plan_kwargs)} are "
+               "not synthesis-plan options. " if not kwargs_ok else ""))
+
+    objective, jac, traced_model = _chi2, None, None
     if use_autodiff:
         try:
             raw = _raw_synthesis(synthesis_wls, linelist, fixed_params, synthesis_kwargs)
         except Exception as e:  # fall back to the numerical path
+            if exact_gradients:
+                raise
             warnings.warn(f"Falling back to numerical gradients: {e}")
             use_autodiff = False
         else:
@@ -727,6 +1067,22 @@ def fit_spectrum(obs_wls, obs_flux, obs_err, linelist, initial_guesses, fixed_pa
                 raw, LSF_mat, params_to_fit, fixed_params, _obs_wls, _obs_flux,
                 _obs_err, windows, adjust_continuum, trace, start_time, time_limit,
             )
+            jac = True
+    elif use_traced:
+        try:
+            synth = _plan_for_fit(synthesis_wls, linelist, synthesis_kwargs)
+            traced_model = _make_traced_model(synth, LSF_mat, params_to_fit,
+                                              fixed_params)
+            chi2 = _make_traced_chi2(traced_model, _obs_wls, _obs_flux, _obs_err,
+                                     windows, adjust_continuum)
+        except Exception as e:
+            if exact_gradients:
+                raise
+            warnings.warn(f"Falling back to numerical gradients: {e}")
+            use_traced = False
+        else:
+            objective = _objective_from_chi2(chi2, params_to_fit, trace, start_time,
+                                             time_limit)
             jac = True
 
     try:
@@ -753,9 +1109,16 @@ def fit_spectrum(obs_wls, obs_flux, obs_err, linelist, initial_guesses, fixed_pa
     best_fit_params = _unscale_params(dict(zip(params_to_fit, res.x)))
 
     full_params = {**fixed_params, **best_fit_params}
+    if use_traced:
+        _warn_outside_marcs_grid(full_params)
     try:
-        best_fit_flux = _synthetic_spectrum(synthesis_wls, linelist, LSF_mat, full_params,
-                                             synthesis_kwargs)
+        if traced_model is not None:
+            # Reuse the compiled synthesis rather than building a second plan.
+            # np.array, not np.asarray: _linear_continuum_adjustment writes in place.
+            best_fit_flux = np.array(traced_model(jnp.asarray(res.x, dtype=float)))
+        else:
+            best_fit_flux = _synthetic_spectrum(synthesis_wls, linelist, LSF_mat,
+                                                full_params, synthesis_kwargs)
         if adjust_continuum:
             _linear_continuum_adjustment(_obs_wls, windows, best_fit_flux, _obs_flux, _obs_err)
     except Exception as e:
@@ -856,12 +1219,16 @@ def calculate_EWs(atm, linelist, A_X, ew_window_size=2.0, wl_step=0.01,
 
     # Synthesize all windows in one call (shares chemical equilibrium)
     all_wls = np.concatenate(wl_ranges)
-    sol = synthesize(atm, lines, all_wls, A_X,
-                     line_buffer=0.0, hydrogen_lines=False, verbose=False,
-                     **synthesize_kwargs)
+    # `synthesize` is the traced closure now: it takes no `verbose`, and it
+    # returns a (flux, continuum) tuple rather than a SynthesisResult. Passing
+    # `verbose` reaches `prepare_synthesis` through **plan_kwargs and raises.
+    flux, continuum = synthesize(
+        atm, lines, all_wls, A_X,
+        line_buffer=0.0, hydrogen_lines=False,
+        **{k: v for k, v in synthesize_kwargs.items() if k != "verbose"})
 
-    flux = np.asarray(sol.flux)
-    continuum = np.asarray(sol.continuum)
+    flux = np.asarray(flux)
+    continuum = np.asarray(continuum)
     depth = 1.0 - flux / continuum
 
     EWs = np.zeros(len(lines))
@@ -875,7 +1242,7 @@ def calculate_EWs(atm, linelist, A_X, ew_window_size=2.0, wl_step=0.01,
 
         i0 = cumulative[win_idx]
         i1 = cumulative[win_idx + 1]
-        wl_range = np.asarray(sol.wavelengths[i0:i1])
+        wl_range = np.asarray(all_wls[i0:i1])
         absorption = depth[i0:i1]
         n_local = len(line_indices)
 

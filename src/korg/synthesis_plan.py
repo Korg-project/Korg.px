@@ -157,7 +157,7 @@ class Synthesizer:
 
     Examples
     --------
-    >>> synth = prepare_synthesis(wavelengths_cm, linelist, data)
+    >>> synth = prepare_synthesis(wavelengths_angstrom, linelist, data)
     >>> flux, cntm = synth(5777.0, 4.44, 0.0)
     >>> dflux_dTeff = jax.grad(lambda t: synth(t, 4.44, 0.0)[0].sum())(5777.0)
     >>> dflux_dA    = jax.grad(lambda a: synth(5777.0, 4.44, abundances=a)[0].sum())(A)
@@ -242,7 +242,7 @@ class Synthesizer:
 
 
 def prepare_synthesis(
-    wavelengths_cm,
+    wavelengths_angstrom,
     linelist,
     data=None,
     *,
@@ -253,13 +253,15 @@ def prepare_synthesis(
     reference: Tuple[float, float, float] = (5777.0, 4.44, 0.0),
     n_layers: int = N_MARCS_LAYERS,
     n_mu: int = 20,
+    hydrogen_lines: bool = True,
 ) -> Synthesizer:
     """Fix every shape a synthesis needs, and return a callable that does the rest.
 
     Parameters
     ----------
-    wavelengths_cm : (n_wl,) array
-        Synthesis grid. Concrete — this is host code.
+    wavelengths_angstrom : (n_wl,) array
+        Synthesis grid in Angstroms, matching ``synthesize`` and ``synth``.
+        Concrete — this is host code.
     linelist : list of Line, or LinelistData
         The lines to synthesize.
     data : SynthesisData, optional
@@ -295,6 +297,13 @@ def prepare_synthesis(
     n_layers : int
         Layers in the atmosphere. 56 for the MARCS grid, which is the count at
         every grid point checked.
+    hydrogen_lines : bool
+        Include the Stark-broadened hydrogen lines. ``False`` selects no
+        transitions at all, so the hydrogen opacity is identically zero — the
+        same switch as Korg.jl's ``hydrogen_lines=false``, and the setting the
+        Julia reference spectra in ``tests/synthesis_reference_data.json`` were
+        generated with. It is a plan-time choice because *which* transitions are
+        in range decides shapes, not values.
 
     Returns
     -------
@@ -307,10 +316,34 @@ def prepare_synthesis(
     from .abundances import format_A_X, A_X_to_absolute, DEFAULT_ALPHA_ELEMENTS
     from .atomic_data import MAX_ATOMIC_NUMBER
 
-    wl_np = np.asarray(wavelengths_cm, dtype=np.float64)
+    wl_a = np.asarray(wavelengths_angstrom, dtype=np.float64)
+    # This argument used to be centimetres, and every other public entry point
+    # took Angstroms. A caller who still passes cm would hand over ~5e-5, which
+    # is a physically meaningless wavelength but not an obviously wrong number,
+    # and the plan would be built from it in silence. Refuse instead: there is
+    # no legitimate synthesis blueward of 1 A.
+    if wl_a.size and np.nanmax(wl_a) < 1.0:
+        raise ValueError(
+            "wavelengths_angstrom must be in Angstroms, but the largest value is "
+            f"{np.nanmax(wl_a):.3e}. This argument took centimetres in earlier "
+            "versions; multiply by 1e8, or drop the `* 1e-8` at the call site."
+        )
+    wl_np = wl_a * 1e-8
+    if wl_np.ndim != 1:
+        raise ValueError(
+            "wavelengths_angstrom must be a non-empty 1-D array, got shape "
+            f"{wl_np.shape}"
+        )
     n_wl = int(wl_np.shape[0])
     if n_wl < 2:
         raise ValueError("need at least two wavelength points")
+    # Korg.jl: the Rayleigh scattering cross-sections are not valid below 1300 A.
+    if wl_np[0] < 1300e-8:
+        raise ValueError(
+            f"Requested wavelength range starts at {wl_np[0] * 1e8:.1f} A, "
+            "blueward of 1300 A, the lowest allowed wavelength (a limitation of "
+            "the Rayleigh scattering calculation)."
+        )
     wl_spacing = float(np.median(np.diff(wl_np)))
     wl_min_cm, wl_max_cm = float(wl_np[0]), float(wl_np[-1])
 
@@ -367,8 +400,10 @@ def prepare_synthesis(
         data=data,
         bucket_line_idx=bucket_line_idx,
         bucket_widths=bucket_widths,
-        stark_keys=_stark_transitions_in_range(wl_min_cm, wl_max_cm),
-        brackett_in_range=_brackett_in_range(wl_min_cm, wl_max_cm),
+        stark_keys=(_stark_transitions_in_range(wl_min_cm, wl_max_cm)
+                    if hydrogen_lines else ()),
+        brackett_in_range=(_brackett_in_range(wl_min_cm, wl_max_cm)
+                           if hydrogen_lines else False),
         ref_pixel=ref_pixel,
         geometry=geometry,
         wl_spacing=wl_spacing,
@@ -385,11 +420,25 @@ def prepare_synthesis(
 def synthesize(atmosphere, linelist, wavelengths_angstrom, A_X, *,
                vmic=1.0, line_buffer=10.0, geometry=None, return_cntm=True,
                **plan_kwargs):
-    """Korg.jl-compatible one-shot synthesis.
+    """Korg.jl-compatible one-shot synthesis. **The** public ``synthesize``.
 
     Matches Korg.jl's ``synthesize(atm, linelist, A_X, wavelengths)`` ordering and
     semantics so ported scripts read the same. It builds a
     :class:`Synthesizer` and calls it once.
+
+    This replaced ``korg.synthesis.synthesize_spectrum``, the Python-orchestrated
+    NumPy path, which was deleted. That path could not be jitted, vmapped or
+    differentiated — the properties this package exists to provide — and having
+    two functions called ``synthesize`` with different argument conventions and
+    different return types was a standing trap. ``korg.synthesize`` is now this
+    function and nothing else.
+
+    Two deliberate differences from the deleted function: ``A_X`` means A(X) and
+    only A(X) (Korg.jl's convention; absolute number fractions are rejected
+    rather than sniffed for), and the return is a plain ``(flux, continuum)``
+    tuple rather than a ``SynthesisResult``. The traced pass computes no
+    per-layer opacity array to hand back — see :func:`prepare_synthesis` and
+    :meth:`Synthesizer.from_atmosphere` if you need the pieces.
 
     **Prefer** :func:`prepare_synthesis` whenever you synthesize more than once.
     The plan is the expensive half --- filtering the linelist, sizing the line
@@ -405,7 +454,7 @@ def synthesize(atmosphere, linelist, wavelengths_angstrom, A_X, *,
     wavelengths_angstrom : (n_wl,) array
         Synthesis grid in Angstroms.
     A_X : (92,) array
-        Abundances as A(X) = log10(N_X/N_H) + 12.
+        Abundances as A(X) = log10(N_X/N_H) + 12, with ``A_X[0] == 12``.
     vmic : float
         Microturbulence in km/s (Korg's unit), converted to cm/s internally.
     line_buffer : float
@@ -415,16 +464,36 @@ def synthesize(atmosphere, linelist, wavelengths_angstrom, A_X, *,
         ``None`` follows the atmosphere type: a ShellAtmosphere is spherical.
     return_cntm : bool
         Return ``(flux, continuum)`` if True, else just ``flux``.
+    **plan_kwargs
+        Forwarded to :func:`prepare_synthesis` — ``hydrogen_lines``,
+        ``cntm_step_cm``, ``window_safety``, ``n_mu`` and the rest.
 
     Returns
     -------
     flux, continuum : (n_wl,) arrays, or flux alone if ``return_cntm`` is False.
+        Units are erg cm^-2 s^-1 A^-1, as in Korg.jl.
     """
     from .abundances import A_X_to_absolute
 
-    wl_cm = np.asarray(wavelengths_angstrom, dtype=np.float64) * 1e-8
+    A_X = np.asarray(A_X, dtype=np.float64)
+    if A_X.ndim != 1 or A_X.shape[0] != 92:
+        raise ValueError(
+            "A_X must be a 92-element 1-D array (one entry per element H..U), "
+            f"got shape {A_X.shape}"
+        )
+    # Korg.jl: "A(H) must be a 92-element vector with A[1] == 12."
+    if A_X[0] != 12.0:
+        raise ValueError(
+            f"A_X is A(X) = log10(N_X/N_H) + 12, so A(H) must be 12.0, not {A_X[0]}. "
+            "Absolute number fractions are not accepted; convert them with "
+            "korg.abundances.format_A_X or pass A(X) directly."
+        )
+
+    wl_a = np.asarray(wavelengths_angstrom, dtype=np.float64)
     layers = atmosphere.layers
     n_layers = len(layers)
+    if n_layers == 0:
+        raise ValueError("atmosphere has no layers")
 
     if geometry is None:
         # Follow the atmosphere the caller actually handed us rather than
@@ -432,7 +501,7 @@ def synthesize(atmosphere, linelist, wavelengths_angstrom, A_X, *,
         # ShellAtmosphere or a PlanarAtmosphere.
         geometry = "spherical" if hasattr(atmosphere, "R_photosphere") else "plane-parallel"
 
-    synth = prepare_synthesis(wl_cm, linelist, geometry=geometry,
+    synth = prepare_synthesis(wl_a, linelist, geometry=geometry,
                               n_layers=n_layers,
                               line_buffer_cm=(None if line_buffer is None
                                               else line_buffer * 1e-8),
@@ -443,9 +512,25 @@ def synthesize(atmosphere, linelist, wavelengths_angstrom, A_X, *,
     ne = jnp.asarray([l.electron_number_density for l in layers])
     z = jnp.asarray([l.z for l in layers])
     log_tau = jnp.asarray(atmosphere.log_tau_ref)  # base-10, as the RT kernels expect
-    abundances = jnp.asarray(A_X_to_absolute(np.asarray(A_X)))
+    abundances = jnp.asarray(A_X_to_absolute(A_X))
 
     R = getattr(atmosphere, "R_photosphere", None)
     flux, cntm = synth.from_atmosphere(T, n_total, ne, z, log_tau, abundances,
                                        vmic_cm_s=vmic * 1e5, R_photosphere=R)
     return (flux, cntm) if return_cntm else flux
+
+
+def synth(atmosphere, linelist, wavelengths_angstrom, A_X, **kwargs):
+    """:func:`synthesize`, plus the wavelength grid it was called with.
+
+    Korg.jl keeps the same pair: ``synthesize`` for the spectrum, ``synth`` for
+    the three arrays most callers plot.
+
+    Returns
+    -------
+    wavelengths : (n_wl,) array in Angstroms — exactly what was passed in.
+    flux, continuum : (n_wl,) arrays.
+    """
+    wls = np.asarray(wavelengths_angstrom, dtype=np.float64)
+    flux, cntm = synthesize(atmosphere, linelist, wls, A_X, **kwargs)
+    return wls, flux, cntm

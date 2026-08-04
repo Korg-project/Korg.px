@@ -294,24 +294,27 @@ class TestPruneLinelistFunctional:
         line-centre opacity is zero and it can never pass the threshold.
 
         Korg's default network happens to cover every molecule we can name, so
-        the fallback is triggered by removing one species from the synthesis
-        result — that is exactly the state the guard exists for.
+        the fallback is triggered by removing one species from the number
+        densities — that is exactly the state the guard exists for.
+
+        This used to intercept ``korg.synthesis.synthesize_spectrum``, which is
+        gone; the densities now come from ``_photosphere_opacities``, so that is
+        what is intercepted instead.
         """
-        from korg import synthesis
+        from korg import prune_linelist as pl
         from korg.prune_linelist import prune_linelist
         from korg.species import Species
 
-        real = synthesis.synthesize_spectrum
+        real = pl._photosphere_opacities
         target = Species("FeH")
 
         def without_FeH(*args, **kwargs):
-            sol = real(*args, **kwargs)
-            if sol.number_densities is not None:
-                sol.number_densities.pop(target, None)
-                sol.number_densities.pop(str(target), None)
-            return sol
+            alpha, cntm, nds = real(*args, **kwargs)
+            nds.pop(target, None)
+            nds.pop(str(target), None)
+            return alpha, cntm, nds
 
-        monkeypatch.setattr(synthesis, "synthesize_spectrum", without_FeH)
+        monkeypatch.setattr(pl, "_photosphere_opacities", without_FeH)
 
         lines = make_lines([(5000.0, -1.5, "Fe I", 1.0), (5000.7, 0.0, "FeH", 0.2)])
         got = prune_linelist(solar_atm, lines, solar_A_X, (4999.0, 5002.0),
@@ -320,7 +323,7 @@ class TestPruneLinelistFunctional:
         assert [round(l.wl * 1e8, 6) for l in got] == [5000.0]
 
     def test_synthesis_kwargs_are_forwarded(self, solar_atm, solar_A_X, prune_lines):
-        """``hydrogen_lines=False`` must reach ``synthesize_spectrum``."""
+        """``hydrogen_lines=False`` must reach the opacity calculation."""
         from korg.prune_linelist import prune_linelist
 
         got = prune_linelist(solar_atm, prune_lines, solar_A_X, (4999.0, 5002.0),
