@@ -187,26 +187,35 @@ def compute_continuum_absorption(
     return np.array(alpha_continuum)
 
 
-def filter_linelist(linelist: List[Line], wavelengths_cm: np.ndarray,
-                    line_buffer_cm: float, warn_empty: bool = True) -> List[Line]:
+def filter_linelist(linelist: List[Line], wavelengths_angstrom: np.ndarray,
+                    line_buffer: float, warn_empty: bool = True) -> List[Line]:
     """
     Filter a sorted linelist to only lines that affect the given wavelength range.
 
     Parameters
     ----------
     linelist : list of Line
-        Lines sorted by wavelength (cm)
-    wavelengths_cm : array
-        Synthesis wavelength grid (cm)
-    line_buffer_cm : float
-        Extra wavelength margin beyond the grid edges (cm)
+        Lines sorted by wavelength. ``Line.wl`` is in cm, which is the internal
+        storage unit and is not what this function's own arguments use.
+    wavelengths_angstrom : array
+        Synthesis wavelength grid in Angstroms, matching ``synthesize``.
+    line_buffer : float
+        Extra wavelength margin beyond the grid edges, in Angstroms.
     warn_empty : bool, optional
         Warn if the original linelist was non-empty but the result is empty (default: True)
 
     Returns
     -------
     filtered : list of Line
-        Lines with wl in [wavelengths_cm[0] - line_buffer_cm, wavelengths_cm[-1] + line_buffer_cm]
+        Lines with wl in
+        ``[wavelengths_angstrom[0] - line_buffer, wavelengths_angstrom[-1] + line_buffer]``
+
+    Raises
+    ------
+    ValueError
+        If the grid looks like it is still in cm. Angstrom and cm differ by 1e8,
+        and passing cm would otherwise filter everything away and return an
+        empty list with only a warning.
     """
     import warnings
     import bisect
@@ -215,8 +224,16 @@ def filter_linelist(linelist: List[Line], wavelengths_cm: np.ndarray,
     if n_before == 0:
         return linelist
 
-    lo = wavelengths_cm[0] - line_buffer_cm
-    hi = wavelengths_cm[-1] + line_buffer_cm
+    wl_ang = np.asarray(wavelengths_angstrom, dtype=float)
+    if wl_ang.size and np.nanmax(np.abs(wl_ang)) < 1.0:
+        raise ValueError(
+            "wavelengths_angstrom looks like cm "
+            f"(max |wl| = {np.nanmax(np.abs(wl_ang)):g} < 1 Angstrom). "
+            "This function takes Angstroms; multiply by 1e8."
+        )
+
+    lo = (wl_ang[0] - line_buffer) * 1e-8
+    hi = (wl_ang[-1] + line_buffer) * 1e-8
 
     # Binary search for range limits in sorted list
     wls = [l.wl for l in linelist]
@@ -268,9 +285,8 @@ def get_reference_wavelength_linelist(linelist: List[Line],
             pass
 
     # For non-5000 Å references (or when built-in is disabled), use the user's linelist.
-    window_cm = np.array([reference_wavelength_cm, reference_wavelength_cm])
-    buffer_cm = 21e-8  # 21 Å in cm
-    filtered = filter_linelist(linelist, window_cm, buffer_cm, warn_empty=False)
+    window_ang = np.array([reference_wavelength_cm, reference_wavelength_cm]) * 1e8
+    filtered = filter_linelist(linelist, window_ang, 21.0, warn_empty=False)
 
     if reference_wavelength_cm != 5e-5:
         if len(filtered) == 0:

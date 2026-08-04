@@ -100,7 +100,7 @@ There are two entry points, both traced and both differentiable in every argumen
 ### From stellar parameters
 
 ```python
-synth(Teff, logg, m_H=0.0, alpha_m=0.0, C_m=0.0, abundances=None, vmic_cm_s=1e5)
+synth(Teff, logg, M_H=0.0, alpha_M=0.0, C_M=0.0, abundances=None, vmic=1.0)
 ```
 
 The MARCS interpolation runs *inside* the traced region, so `jax.grad(..., argnums=0)` is
@@ -108,13 +108,16 @@ d(flux)/d(Teff) through interpolation, chemical equilibrium, opacity and radiati
 one pass.
 
 `abundances` is a 92-element vector of number fractions (`n_X / n_total`), not `A(X)`. Convert
-with `korg.abundances.A_X_to_absolute`. If you leave it `None`, it is built from `(m_H, alpha_m,
-C_m)` inside the traced region, so `d/d[M/H]` picks up both the change in atmospheric structure
-and the change in composition. Passing `abundances` explicitly overrides that and leaves `m_H`
+with `korg.abundances.A_X_to_absolute`. If you leave it `None`, it is built from `(M_H, alpha_M,
+C_M)` inside the traced region, so `d/d[M/H]` picks up both the change in atmospheric structure
+and the change in composition. Passing `abundances` explicitly overrides that and leaves `M_H`
 acting on structure alone — which is what you want when differentiating with respect to
 individual element abundances.
 
-`vmic_cm_s` is microturbulence in **cm/s** (1e5 cm/s = 1 km/s), a scalar.
+`vmic` is microturbulence in **km/s**, a scalar — the same unit `synthesize` takes. It was
+`vmic_cm_s`, in cm/s; that name now raises rather than being silently reinterpreted, because the
+two differ by 1e5 and nothing downstream would catch the mix-up. `from_atmosphere` below still
+takes `vmic_cm_s`.
 
 ### From an atmosphere you already have
 
@@ -143,7 +146,7 @@ The closure traces, so `jit` works with no `static_argnames`:
 ```python
 import jax
 
-fast = jax.jit(lambda Teff, logg, m_H: synth(Teff, logg, m_H))
+fast = jax.jit(lambda Teff, logg, M_H: synth(Teff, logg, M_H))
 flux, cntm = fast(5777.0, 4.44, 0.0)     # compiles
 flux, cntm = fast(5800.0, 4.40, -0.5)    # does not
 ```
@@ -170,8 +173,8 @@ Over several parameters at once:
 ```python
 Teff  = jnp.array([5600.0, 5777.0, 6100.0])
 logg  = jnp.array([4.20,   4.44,   4.10])
-m_H   = jnp.array([-0.5,   0.0,    0.2])
-fluxes = jax.vmap(lambda t, g, m: synth(t, g, m)[0])(Teff, logg, m_H)
+M_H   = jnp.array([-0.5,   0.0,    0.2])
+fluxes = jax.vmap(lambda t, g, m: synth(t, g, m)[0])(Teff, logg, M_H)
 ```
 
 Over abundance vectors:
@@ -191,13 +194,13 @@ into a `select` and evaluates **both** branches — see [Geometry](#geometry).
 Reverse-mode differentiation of a scalar function of the spectrum:
 
 ```python
-def rectified_sum(Teff, logg, m_H):
-    flux, cntm = synth(Teff, logg, m_H)
+def rectified_sum(Teff, logg, M_H):
+    flux, cntm = synth(Teff, logg, M_H)
     return jnp.sum(flux / cntm)
 
 dTeff = jax.grad(rectified_sum, argnums=0)(5777.0, 4.44, 0.0)
 dlogg = jax.grad(rectified_sum, argnums=1)(5777.0, 4.44, 0.0)
-dm_H  = jax.grad(rectified_sum, argnums=2)(5777.0, 4.44, 0.0)
+dM_H  = jax.grad(rectified_sum, argnums=2)(5777.0, 4.44, 0.0)
 ```
 
 With respect to all 92 abundances in one reverse pass:
@@ -233,8 +236,8 @@ J = jax.jacfwd(lambda p: synth(p[0], p[1], p[2])[0])(jnp.array([5777.0, 4.44, 0.
 ### What the gradients are, and are not
 
 **Finite differences are not a reliable check for the stellar parameters.** The MARCS
-interpolation is *multilinear*, so the model is only piecewise smooth in `(Teff, logg, m_H,
-alpha_m, C_m)`, and a central difference does not converge under step refinement — the measured
+interpolation is *multilinear*, so the model is only piecewise smooth in `(Teff, logg, M_H,
+alpha_M, C_M)`, and a central difference does not converge under step refinement — the measured
 relative difference between AD and FD wanders in the region of a few times 1e-3 as the step
 shrinks, instead of decreasing. The test suite therefore asserts sign and order of magnitude
 (agreement to 5%) rather than many digits. The AD value is the derivative of the model that is

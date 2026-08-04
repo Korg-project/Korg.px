@@ -408,7 +408,7 @@ class TestAutodiff:
         flux, cntm = synth(*a, **kw)
         return jnp.sum(flux / cntm)
 
-    @pytest.mark.parametrize("argnum,name", [(0, "Teff"), (1, "logg"), (2, "m_H")])
+    @pytest.mark.parametrize("argnum,name", [(0, "Teff"), (1, "logg"), (2, "M_H")])
     def test_stellar_parameter_gradients_are_finite(self, synth, argnum, name):
         g = float(jax.grad(lambda *p: self._rect_sum(synth, *p),
                            argnums=argnum)(TEFF, LOGG, M_H))
@@ -702,8 +702,8 @@ class TestLinelistFiltering:
 
     def test_out_of_range_lines_are_dropped(self, wavelengths, linelist):
         from korg.synthesis import filter_linelist
-        expected = len(filter_linelist(list(linelist), np.asarray(wavelengths) * 1e-8,
-                                       10.0e-8, warn_empty=False))
+        expected = len(filter_linelist(list(linelist), np.asarray(wavelengths),
+                                       10.0, warn_empty=False))
         s = prepare_synthesis(wavelengths, linelist, geometry="planar")
         assert s.n_lines == expected
         assert s.n_lines < len(linelist), "the fixture must have out-of-range lines"
@@ -737,7 +737,7 @@ class TestLinelistFiltering:
         this repository already record; 1e-12 is 20x the observed spread.
         """
         from korg.synthesis import filter_linelist
-        pre = filter_linelist(list(linelist), np.asarray(wavelengths) * 1e-8, 10.0e-8,
+        pre = filter_linelist(list(linelist), np.asarray(wavelengths), 10.0,
                               warn_empty=False)
         auto = prepare_synthesis(wavelengths, linelist, geometry="planar")
         manual = prepare_synthesis(wavelengths, pre, geometry="planar",

@@ -76,7 +76,9 @@ def _trim_linelist(linelist, wl_np, line_buffer_cm):
     if not all(linelist[i].wl <= linelist[i + 1].wl
                for i in range(len(linelist) - 1)):
         linelist = sorted(linelist, key=lambda l: l.wl)
-    return filter_linelist(linelist, wl_np, line_buffer_cm)
+    # filter_linelist takes Angstroms; the plan works in cm throughout.
+    return filter_linelist(linelist, np.asarray(wl_np) * 1e8,
+                           line_buffer_cm * 1e8)
 
 
 def _normalise_geometry(geometry):
@@ -137,7 +139,7 @@ def _A_X_to_absolute_traced(A_X):
     return rel_to_H / jnp.sum(rel_to_H)
 
 
-def _format_A_X_traced(m_H, alpha_m, C_m, solar_A_X, alpha_mask, c_mask, metal_mask):
+def _format_A_X_traced(M_H, alpha_M, C_M, solar_A_X, alpha_mask, c_mask, metal_mask):
     """A(X) from ``[M/H]``, ``[alpha/M]`` and ``[C/M]``, in JAX.
 
     The element masks are host constants (which Z is an alpha element, which is
@@ -145,7 +147,7 @@ def _format_A_X_traced(m_H, alpha_m, C_m, solar_A_X, alpha_mask, c_mask, metal_m
     lets ``d/d[M/H]`` pick up the composition change as well as the atmosphere
     change — the two paths that ``[M/H]`` drives.
     """
-    return solar_A_X + metal_mask * m_H + alpha_mask * alpha_m + c_mask * C_m
+    return solar_A_X + metal_mask * M_H + alpha_mask * alpha_M + c_mask * C_M
 
 
 class Synthesizer:
@@ -208,31 +210,43 @@ class Synthesizer:
                                   abundances, vmic_cm_s,
                                   R_photosphere=R_photosphere, logg=logg)
 
-    def __call__(self, Teff, logg, m_H=0.0, alpha_m=0.0, C_m=0.0,
-                 abundances=None, vmic_cm_s=1e5):
+    def __call__(self, Teff, logg, M_H=0.0, alpha_M=0.0, C_M=0.0,
+                 abundances=None, vmic=1.0, vmic_cm_s=None):
         """Synthesize from stellar parameters. Traced; differentiable in all of them.
 
         The MARCS interpolation runs *inside* the traced region, so
         ``jax.grad(..., argnums=0)`` is d(flux)/d(Teff) through interpolation,
         chemical equilibrium, opacity and radiative transfer in one pass.
 
-        ``abundances`` defaults to the composition implied by ``(m_H, alpha_m,
-        C_m)``, so differentiating with respect to ``m_H`` picks up both the
+        ``abundances`` defaults to the composition implied by ``(M_H, alpha_M,
+        C_M)``, so differentiating with respect to ``M_H`` picks up both the
         atmospheric structure change and the composition change. Passing it
-        explicitly overrides that and leaves ``m_H`` acting on structure alone.
+        explicitly overrides that and leaves ``M_H`` acting on structure alone.
+
+        ``vmic`` is microturbulence in **km/s**, Korg.jl's unit and the same one
+        :func:`synthesize` takes. It used to be ``vmic_cm_s``, in cm/s; that
+        name is still accepted only so it can raise, because the two differ by a
+        factor of 1e5 and nothing downstream would flag a silent mix-up.
         """
         from .traced_synthesis import _interpolate_marcs_traced, _synthesize_traced
 
+        if vmic_cm_s is not None:
+            raise TypeError(
+                "vmic_cm_s was removed; the closure now takes vmic in km/s, "
+                f"matching synthesize. Pass vmic={vmic_cm_s / 1e5!r} rather "
+                f"than vmic_cm_s={vmic_cm_s!r}."
+            )
+
         if abundances is None:
-            A_X = _format_A_X_traced(m_H, alpha_m, C_m, self._solar_A_X,
+            A_X = _format_A_X_traced(M_H, alpha_M, C_M, self._solar_A_X,
                                      self._alpha_mask, self._c_mask,
                                      self._metal_mask)
             abundances = _A_X_to_absolute_traced(A_X)
 
         T, n_total, ne, z, log_tau_ref, R_phot = _interpolate_marcs_traced(
-            self, Teff, logg, m_H, alpha_m, C_m)
+            self, Teff, logg, M_H, alpha_M, C_M)
         return _synthesize_traced(self, T, n_total, ne, z, log_tau_ref,
-                                  abundances, vmic_cm_s,
+                                  abundances, vmic * 1e5,
                                   R_photosphere=R_phot, logg=logg)
 
     def __repr__(self):

@@ -229,8 +229,8 @@ class TestFilterLinelist:
         from korg.synthesis import filter_linelist
 
         lines = self.make_lines([4990, 4995, 5000, 5005, 5010])
-        wls = np.array([4997e-8, 5003e-8])
-        filtered = filter_linelist(lines, wls, 3e-8)
+        wls = np.array([4997.0, 5003.0])
+        filtered = filter_linelist(lines, wls, 3.0)
         wl_angstrom = [l.wl * 1e8 for l in filtered]
         assert all(4994 <= w <= 5006 for w in wl_angstrom), \
             f"Expected lines in [4994, 5006] Å, got {wl_angstrom}"
@@ -239,7 +239,7 @@ class TestFilterLinelist:
     def test_filter_empty_linelist(self):
         """filter_linelist handles empty linelist."""
         from korg.synthesis import filter_linelist
-        result = filter_linelist([], np.array([5000e-8, 5010e-8]), 10e-8)
+        result = filter_linelist([], np.array([5000.0, 5010.0]), 10.0)
         assert result == []
 
     def test_filter_no_warn_on_empty_input(self):
@@ -248,14 +248,14 @@ class TestFilterLinelist:
         from korg.synthesis import filter_linelist
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            filter_linelist([], np.array([5000e-8]), 10e-8)
+            filter_linelist([], np.array([5000.0]), 10.0)
 
     def test_filter_sorted_result(self):
         """filter_linelist result should preserve sort order."""
         from korg.synthesis import filter_linelist
         lines = self.make_lines([4980, 4990, 5000, 5010, 5020])
-        wls = np.array([4985e-8, 5015e-8])
-        filtered = filter_linelist(lines, wls, 5e-8)
+        wls = np.array([4985.0, 5015.0])
+        filtered = filter_linelist(lines, wls, 5.0)
         wl_vals = [l.wl for l in filtered]
         assert wl_vals == sorted(wl_vals)
 

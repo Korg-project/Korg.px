@@ -36,7 +36,7 @@ def photosphere_radius(logg):
     return jnp.sqrt(G_CGS * M_SUN_CGS / 10.0 ** jnp.asarray(logg, dtype=jnp.float64))
 
 
-def _interpolate_marcs_traced(synth, Teff, logg, m_H, alpha_m, C_m):
+def _interpolate_marcs_traced(synth, Teff, logg, M_H, alpha_M, C_M):
     """MARCS interpolation with a fixed layer count, differentiable throughout.
 
     ``interpolate_marcs`` breaks the chain three times after the kernel: it calls
@@ -60,9 +60,9 @@ def _interpolate_marcs_traced(synth, Teff, logg, m_H, alpha_m, C_m):
     nodes_padded, nodes_lengths, grid = synth._marcs
     params = jnp.stack([jnp.asarray(Teff, dtype=jnp.float64),
                         jnp.asarray(logg, dtype=jnp.float64),
-                        jnp.asarray(m_H, dtype=jnp.float64),
-                        jnp.asarray(alpha_m, dtype=jnp.float64),
-                        jnp.asarray(C_m, dtype=jnp.float64)])
+                        jnp.asarray(M_H, dtype=jnp.float64),
+                        jnp.asarray(alpha_M, dtype=jnp.float64),
+                        jnp.asarray(C_M, dtype=jnp.float64)])
     q = _interpolate_marcs_jit(params, nodes_padded, nodes_lengths, grid)
 
     # Columns, in grid order: T, log(ne), log(n_total), tau_ref, asinh(z).

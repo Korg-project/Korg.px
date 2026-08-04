@@ -151,10 +151,10 @@ class TestParameterMapping:
                          solar_relative=True)
         solar = GREVESSE_2007_SOLAR_ABUNDANCES
         alpha_and_C = list(DEFAULT_ALPHA_ELEMENTS) + [6]
-        m_H = get_metals_H(A_X, solar_abundances=solar, ignore_alpha=True,
+        M_H = get_metals_H(A_X, solar_abundances=solar, ignore_alpha=True,
                            alpha_elements=alpha_and_C)
         alpha_H = get_alpha_H(A_X, solar_abundances=solar)
-        expected = np.array([m_H, alpha_H - m_H, (A_X[5] - solar[5]) - m_H])
+        expected = np.array([M_H, alpha_H - M_H, (A_X[5] - solar[5]) - M_H])
 
         got = np.array([float(x) for x in
                         _marcs_grid_params_traced(jnp.asarray(A_X))])
@@ -163,8 +163,8 @@ class TestParameterMapping:
     def test_the_grid_metallicity_is_not_the_fitted_metallicity(self):
         """Pins the offset above as a *fact*, so removing the conversion fails."""
         A_X = format_A_X(0.0)
-        m_H = float(_marcs_grid_params_traced(jnp.asarray(A_X))[0])
-        assert abs(m_H - 0.0) > 0.1, (
+        M_H = float(_marcs_grid_params_traced(jnp.asarray(A_X))[0])
+        assert abs(M_H - 0.0) > 0.1, (
             "the Bergemann/Grevesse offset has vanished; if the solar scales "
             "were unified, this test and the conversion it guards can go")
 

@@ -32,13 +32,13 @@ stellar parameters. `wavelengths_angstrom` is in Angstroms, as everywhere else. 
 ### `Synthesizer.__call__`
 
 ```python
-synth(Teff, logg, m_H=0.0, alpha_m=0.0, C_m=0.0,
-      abundances=None, vmic_cm_s=1e5) -> (flux, continuum)
+synth(Teff, logg, M_H=0.0, alpha_M=0.0, C_M=0.0,
+      abundances=None, vmic=1.0) -> (flux, continuum)
 ```
 
 Synthesize from stellar parameters, interpolating the MARCS grid inside the traced region.
 Traced and differentiable in every argument. `abundances`, if given, is 92 number fractions
-(`n_X/n_total`), not `A(X)`; if omitted it is derived from `(m_H, alpha_m, C_m)`.
+(`n_X/n_total`), not `A(X)`; if omitted it is derived from `(M_H, alpha_M, C_M)`. `vmic` is in km/s, as on `synthesize`.
 
 ### `Synthesizer.from_atmosphere`
 
@@ -173,11 +173,15 @@ Atmosphere objects expose `layers`, `n_layers`, and array properties `T`, `ne`, 
 All from `korg` unless noted.
 
 ```python
-korg.read_linelist(filename, format=None, iso_abundances=None) -> list[Line]
-    # format in {"vald", "moog", "moog_air", "turbospectrum", "turbospectrum_vac", "korg"}
-    # default: "korg" if the filename ends in .h5, else "vald".  No Kurucz support.
+korg.read_linelist(filename, format=None,
+                   isotopic_abundances=korg.isotopic_abundances) -> list[Line]
+    # format in {"vald", "kurucz", "kurucz_vac", "moog", "moog_air",
+    #            "turbospectrum", "turbospectrum_vac", "korg"}
+    # default: "korg" if the filename ends in .h5, else "vald".
+    # isotopic_abundances=None means "use the adjustments a Kurucz file embeds".
 korg.read_vald_linelist(filename) -> list[Line]
 korg.read_korg_linelist(filename) -> list[Line]
+korg.parse_kurucz_linelist(f, isotopic_abundances=None, vacuum=False, verbose=False)
 korg.parse_moog_linelist(...), korg.parse_turbospectrum_linelist(...)
 korg.linelist.load_ExoMol_linelist(spec, states_file, transitions_file, ...) -> list[Line]
 korg.save_linelist(path, linelist) -> None

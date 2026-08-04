@@ -58,7 +58,7 @@ by construction.
 `synth(; Teff, logg, wavelengths, M_H, ...)`, which takes stellar parameters rather than an
 atmosphere, has no Python equivalent. The
 closest thing is `prepare_synthesis(...)` followed by calling the result, which takes `Teff`,
-`logg`, `m_H`, `alpha_m` and `C_m` as positional arguments. Post-processing that `synth` folds in
+`logg`, `M_H`, `alpha_M` and `C_M` as positional arguments. Post-processing that `synth` folds in
 (`R`, `vsini`) has to be applied separately with `korg.utils.apply_LSF` and
 `korg.utils.apply_rotation`.
 
@@ -134,25 +134,16 @@ deleted.
 
 `korg.fit_spectrum` returns a `dict`, not a struct.
 
-### `vmic` is km/s in `synthesize` and cm/s in the closure
+### `vmic` is a scalar, not a per-layer vector
 
-`synthesis_plan.synthesize(..., vmic=1.0)` is in km/s, Korg.jl's convention, and is multiplied by
-1e5 internally. `Synthesizer.__call__` and `Synthesizer.from_atmosphere` take `vmic_cm_s`, in
-cm/s, defaulting to `1e5` — the same 1 km/s, spelled differently. The name carries the unit, but
-the discrepancy is easy to trip over when moving between the two.
+`vmic` is in km/s everywhere it is user-facing — `synthesize`, `synth` and `Synthesizer.__call__`
+alike — and is converted to cm/s internally. The closure used to take `vmic_cm_s` in cm/s; that
+name now raises rather than being reinterpreted, because the two differ by a factor of 1e5 and
+nothing downstream would flag a silent mix-up. The low-level `Synthesizer.from_atmosphere` still
+takes `vmic_cm_s`, since it deals in the internal units throughout.
 
 Korg.jl accepts either a scalar or a per-layer vector for `vmic`. Korg.px's traced path takes a
 scalar.
-
-### Metallicity is spelled `m_H` in one place and `M_H` in another
-
-Korg.jl v1.0 renamed its `m_H` keyword arguments to `M_H` throughout. Korg.px is inconsistent:
-
-- `Synthesizer.__call__` takes `m_H`, `alpha_m`, `C_m` (lower case, and `alpha`/`C` relative to
-  metals, matching the MARCS grid axes).
-- `korg.interpolate_marcs` takes `M_H_or_A_X`, `alpha_M`, `C_M`.
-- `korg.fit_spectrum` recognises `M_H` and `alpha_H` and rejects `m_H` with
-  `ValueError: Unknown parameter`.
 - `korg.format_A_X`'s positional arguments are `default_metals_H` and `default_alpha_H`.
 
 ### Keyword arguments that do not exist
@@ -161,7 +152,7 @@ Korg.jl's `synthesize` keyword arguments and their status in Korg.px's traced pa
 
 | Korg.jl | Korg.px traced path |
 |---|---|
-| `vmic` | `vmic` (km/s) on `synthesize`, `vmic_cm_s` on the closure; scalar only |
+| `vmic` | `vmic` (km/s) on `synthesize` and on the closure; `vmic_cm_s` on `from_atmosphere`; scalar only |
 | `line_buffer` | `line_buffer` (Å) on `synthesize`, `line_buffer_cm` (cm) on `prepare_synthesis`; same 10 Å default. `None` disables it |
 | `cntm_step` | `cntm_step_cm` on `prepare_synthesis` (cm, default 1e-8 = 1 Å) |
 | `hydrogen_lines` | `hydrogen_lines` on `synthesize` and `prepare_synthesis`. It is a plan-time choice, because which transitions are in range decides array shapes |
@@ -190,10 +181,15 @@ the infrared.
 
 ### Linelist formats
 
-`korg.read_linelist` supports `"vald"`, `"moog"`, `"moog_air"`, `"turbospectrum"`,
-`"turbospectrum_vac"` and `"korg"`. Korg.jl additionally supports `"kurucz"` and `"kurucz_vac"`;
-**Korg.px does not**. The isotopic-abundance keyword is `iso_abundances`, not Korg.jl's
-`isotopic_abundances`.
+`korg.read_linelist` supports the same formats Korg.jl does — `"vald"`, `"kurucz"`,
+`"kurucz_vac"`, `"moog"`, `"moog_air"`, `"turbospectrum"`, `"turbospectrum_vac"` and `"korg"` —
+under the same keyword, `isotopic_abundances`. Molecular Kurucz linelists raise, as they do in
+Korg.jl v1.2.1.
+
+One difference remains inside `read_linelist`: Korg.jl drops triply-and-higher ionized species
+and H I from *every* format, and Korg.px only does so for `"kurucz"`. The other Korg.px parsers
+predate the filter and their reference data was generated without it; gfall is the only one of
+the supported formats whose files routinely contain such lines.
 
 ### `Korg.species` string macro
 

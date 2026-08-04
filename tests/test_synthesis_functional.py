@@ -269,36 +269,36 @@ def _line_at(wl_angstrom, species="Fe I"):
 class TestFilterLinelist:
 
     def test_empty_linelist_is_returned_unchanged(self):
-        out = filter_linelist([], np.array([5e-5, 5.01e-5]), 1e-8)
+        out = filter_linelist([], np.array([5000.0, 5010.0]), 1.0)
         assert out == []
 
     def test_lines_inside_the_buffer_are_kept(self):
         lines = [_line_at(w) for w in (4990.0, 5000.0, 5010.0)]
-        out = filter_linelist(lines, np.array([5.0e-5, 5.0005e-5]), 10e-8)
+        out = filter_linelist(lines, np.array([5000.0, 5000.05]), 10.0)
         assert len(out) == 3
 
     def test_lines_outside_the_buffer_are_dropped(self):
         lines = [_line_at(w) for w in (4000.0, 5000.0, 6000.0)]
-        out = filter_linelist(lines, np.array([5.0e-5, 5.0005e-5]), 1e-8)
+        out = filter_linelist(lines, np.array([5000.0, 5000.05]), 1.0)
         assert [round(l.wl * 1e8) for l in out] == [5000]
 
     def test_a_non_empty_linelist_filtered_to_nothing_warns(self):
         lines = [_line_at(4000.0)]
         with pytest.warns(UserWarning, match="none of the lines were within"):
-            out = filter_linelist(lines, np.array([5.0e-5, 5.0005e-5]), 1e-8)
+            out = filter_linelist(lines, np.array([5000.0, 5000.05]), 1.0)
         assert out == []
 
     def test_the_warning_can_be_suppressed(self):
         lines = [_line_at(4000.0)]
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            assert filter_linelist(lines, np.array([5.0e-5, 5.0005e-5]), 1e-8,
+            assert filter_linelist(lines, np.array([5000.0, 5000.05]), 1.0,
                                    warn_empty=False) == []
 
     def test_boundaries_are_inclusive(self):
         lo, hi = 4990.0, 5010.0
         lines = [_line_at(lo), _line_at(hi)]
-        out = filter_linelist(lines, np.array([5.0e-5, 5.0e-5]), 10e-8)
+        out = filter_linelist(lines, np.array([5000.0, 5000.0]), 10.0)
         assert len(out) == 2
 
 
@@ -1167,7 +1167,7 @@ class TestJit:
 
         @jax.jit
         def f(lo):
-            return len(filter_linelist(lines, jnp.array([lo, lo]), 1e-8))
+            return len(filter_linelist(lines, jnp.array([lo, lo]), 1.0))
 
         with pytest.raises(Exception):
-            f(5e-5)
+            f(5000.0)

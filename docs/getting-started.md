@@ -28,7 +28,7 @@ from korg.synthesis import filter_linelist, blackbody
 ```
 
 Note in particular that `korg.synthesize` is **not** the function used on this page. See
-[Differences from Korg.jl](differences-from-korg-jl.md#two-functions-named-synthesize) for the
+[Differences from Korg.jl](differences-from-korg-jl.md#one-function-named-synthesize) for the
 full story.
 
 ## Abundances
@@ -113,10 +113,12 @@ linelist = korg.read_linelist("path/to/lines.moog", format="moog")
 from korg.linelist import load_ExoMol_linelist
 ```
 
-`format` is one of `"vald"`, `"moog"`, `"moog_air"`, `"turbospectrum"`,
-`"turbospectrum_vac"`, `"korg"`. It is not sniffed from the file contents: the default is
-`"korg"` for a `.h5` filename and `"vald"` otherwise. **Kurucz linelists are not supported**,
-unlike Korg.jl.
+`format` is one of `"vald"`, `"kurucz"`, `"kurucz_vac"`, `"moog"`, `"moog_air"`,
+`"turbospectrum"`, `"turbospectrum_vac"`, `"korg"`. It is not sniffed from the file contents: the
+default is `"korg"` for a `.h5` filename and `"vald"` otherwise. `"kurucz"` reads air
+wavelengths and `"kurucz_vac"` vacuum ones — Kurucz publishes vacuum wavelengths below 2000 Å
+and air above it, and Korg will not guess which file you have. Molecular Kurucz linelists are
+not supported, as in Korg.jl v1.2.1.
 
 Each entry is a `korg.Line`; you rarely need to look inside one.
 
@@ -166,9 +168,9 @@ lines = korg.get_VALD_solar_linelist()
 flux, continuum = synthesize(atm, lines, wavelengths, A_X, vmic=1.0)
 ```
 
-`vmic` here is in **km/s**, matching Korg.jl. (The closure's `vmic_cm_s` is in cm/s — this is a
-real inconsistency, documented in
-[Differences](differences-from-korg-jl.md#vmic-is-kms-in-synthesize-and-cms-in-the-closure).)
+`vmic` is in **km/s**, matching Korg.jl, and is the same unit on the synthesizer closure. Korg.jl
+also accepts a per-layer vector; Korg.px takes a scalar, noted in
+[Differences](differences-from-korg-jl.md#vmic-is-a-scalar-not-a-per-layer-vector).
 
 The return value is a plain `(flux, continuum)` tuple of JAX arrays, not a `SynthesisResult`.
 Pass `return_cntm=False` to get the flux alone. The flux is *not* continuum-normalized; divide:
@@ -251,9 +253,8 @@ result["best_fit_params"]
 ```
 
 The recognised parameter names are `Teff`, `logg`, `M_H`, `alpha_H`, `vmic`, `vsini`, `epsilon`,
-`cntm_offset`, `cntm_slope` and any atomic symbol (as `[X/H]`). Note the capital `M_H` here, and
-the lower-case `m_H` on the synthesizer closure — see
-[Differences](differences-from-korg-jl.md#metallicity-is-spelled-m_h-in-one-place-and-m_h-in-another).
+`cntm_offset`, `cntm_slope` and any atomic symbol (as `[X/H]`). `M_H` is spelled the same way on
+the synthesizer closure and on `korg.interpolate_marcs`.
 
 It returns a `dict` (keys `best_fit_params`, `best_fit_flux`, `obs_wl_mask`, `solver_result`,
 `trace`, `covariance`), not a named struct. Equivalent-width workflows are

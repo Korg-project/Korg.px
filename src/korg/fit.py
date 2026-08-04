@@ -625,7 +625,7 @@ def _make_traced_model(synth, LSF_matrix, params_to_fit, fixed_params):
     @jax.jit
     def _synthesize(stellar, abundances):
         return synth(stellar[0], stellar[1], stellar[2], stellar[3], stellar[4],
-                     abundances=abundances, vmic_cm_s=stellar[5])
+                     abundances=abundances, vmic=stellar[5])
 
     def model(scaled_p):
         params = dict(fixed_params)
@@ -633,12 +633,14 @@ def _make_traced_model(synth, LSF_matrix, params_to_fit, fixed_params):
             params[name] = _unscale_param_jax(name, value)
 
         A_X = _traced_A_X(params, element_names)
-        m_H, alpha_m, C_m = _marcs_grid_params_traced(A_X)
+        M_H, alpha_M, C_M = _marcs_grid_params_traced(A_X)
         stellar = jnp.stack([
             jnp.asarray(params["Teff"], dtype=float),
             jnp.asarray(params["logg"], dtype=float),
-            m_H, alpha_m, C_m,
-            jnp.asarray(params.get("vmic", 1.0), dtype=float) * 1e5,
+            M_H, alpha_M, C_M,
+            # km/s: the closure takes the same unit as synthesize now, so the
+            # 1e5 that used to be applied here has moved inside it.
+            jnp.asarray(params.get("vmic", 1.0), dtype=float),
         ])
         raw_flux, raw_cntm = _synthesize(stellar, _A_X_to_absolute_traced(A_X))
 
@@ -688,8 +690,8 @@ def _warn_outside_marcs_grid(params):
         nodes, _ = load_marcs_grid()
         A_X = np.asarray(_traced_A_X({k: float(v) for k, v in params.items()},
                                      [el for el in atomic_symbols if el in params]))
-        m_H, alpha_m, C_m = (float(x) for x in _marcs_grid_params_traced(jnp.asarray(A_X)))
-        values = [float(params["Teff"]), float(params["logg"]), m_H, alpha_m, C_m]
+        M_H, alpha_M, C_M = (float(x) for x in _marcs_grid_params_traced(jnp.asarray(A_X)))
+        values = [float(params["Teff"]), float(params["logg"]), M_H, alpha_M, C_M]
     except Exception:
         return
     names = ["Teff", "log(g)", "[M/H]", "[alpha/M]", "[C/metals]"]
