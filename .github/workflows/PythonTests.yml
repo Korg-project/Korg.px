@@ -44,7 +44,7 @@ jobs:
           julia --project=. tests/generate_solar_synthesis_reference.jl
 
       - name: Upload reference data
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: julia-reference-data
           path: tests/julia_reference_data.json
